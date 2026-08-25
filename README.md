@@ -2,7 +2,7 @@
 
 Reverse host for *Street Legal Racing: Redline* (Invictus `StreetLegal_Redline.exe`).
 
-C++ rewrite that boots stock / typical-mod Java via a TREE + VA-backed native table — not a greenfield engine.
+C++ rewrite that boots stock / typical-mod Java via a TREE + VA-backed native table.
 
 ## Layout
 
@@ -10,8 +10,6 @@ C++ rewrite that boots stock / typical-mod Java via a TREE + VA-backed native ta
 |------|---------|
 | `engine/` | MSVC / CMake host (`Core/`, `Runtime/`, `include/`, `data/`) |
 | `tools/` | Inventory / stub codegen / IDA registry apply helpers |
-
-No game install dump, no IDA session docs, no Cursor rules in this repo.
 
 ## Build (MSVC Win32)
 
