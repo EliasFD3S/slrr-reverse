@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 INC = ROOT / "native" / "engine" / "include" / "natives_table.inc"
-# Legacy monolith path — Runtime/ now owns split domain files. Pass --force to emit.
+# Legacy monolith path — runtime/ now owns split domain files. Pass --force to emit.
 OUT = ROOT / "native" / "engine" / "Runtime" / "_legacy_generated_world.cpp"
 
 FQNS = {
@@ -20,7 +20,7 @@ FQNS = {
     "java.render.Viewport",
     "java.render.Camera",
     "java.render.Text",
-    # Controller.user_* live in Runtime/IO/IO.cpp (mapAxis table)
+    # Controller.user_* live in runtime/IO/IO.cpp (mapAxis table)
     "java.io.MouseCursor",
     "java.lang.GameType",
     # game layer — host no-ops until reverse deepens
@@ -30,7 +30,7 @@ FQNS = {
     "java.game.parts.DynoData",
     "java.game.parts.SfxTable",
     "java.game.Painter",
-    # Vehicle.getSpeedSquare/getHorn/hasCrime live in Runtime/Resources/GameRef.cpp
+    # Vehicle.getSpeedSquare/getHorn/hasCrime live in runtime/Resources/GameRef.cpp
     "java.game.GameLogic",
     "java.game.Navigator",
 }
@@ -43,7 +43,7 @@ DECL_RE = re.compile(
 def main() -> int:
     if "--force" not in sys.argv:
         print(
-            "gen_world_stubs: domain natives live under engine/Runtime/** "
+            "gen_world_stubs: domain natives live under engine/runtime/** "
             "(Parts, Render, …).\n"
             "Refusing to emit a monolith. Pass --force to write",
             OUT,
@@ -67,7 +67,7 @@ def main() -> int:
         name = m.group("name")
         if not any(name.startswith(p) for p in prefixes):
             continue
-        # Hand-implemented in Runtime/Resources/GameRef.cpp / Runtime/System/GameType.cpp.
+        # Hand-implemented in runtime/Resources/GameRef.cpp / runtime/System/GameType.cpp.
         if name in {
             "java_util_resource_GroundRef_addTrafficCar",
             "java_util_resource_GroundRef_remTrafficCar",

@@ -96,13 +96,12 @@ bool read_file(const std::string& path, std::vector<uint8_t>* out) {
   return static_cast<bool>(in) || in.eof();
 }
 
-bool read_name(const std::vector<uint8_t>& data, size_t* off, std::string* name) {
-  if (*off >= data.size()) return false;
-  const uint8_t nsz = data[*off];
-  *off += 1;
-  if (nsz < 1 || *off + nsz > data.size()) return false;
-  const char* raw = reinterpret_cast<const char*>(data.data() + *off);
-  *off += nsz;
+// PE ResPack_ParseChildRecord @ 0x544010 — namelen @ +22; name @ +23;
+// if (+9 & 1) skip 12 floats (48B) after name. Returns record byte length.
+bool read_pe_name(const std::vector<uint8_t>& data, size_t name_off,
+                  uint8_t nsz, std::string* name) {
+  if (nsz < 1 || name_off + nsz > data.size()) return false;
+  const char* raw = reinterpret_cast<const char*>(data.data() + name_off);
   size_t len = 0;
   while (len < nsz && raw[len] != '\0') {
     const unsigned char c = static_cast<unsigned char>(raw[len]);
@@ -115,61 +114,32 @@ bool read_name(const std::vector<uint8_t>& data, size_t* off, std::string* name)
   return true;
 }
 
-enum class ParseMode { Strict, Map, Frontend };
-
-bool parse_entries(const std::vector<uint8_t>& data, size_t off, uint32_t nentries,
-                   ParseMode mode, std::vector<RpakEntry>* out) {
+// Soft PE TOC walk — EnsureIndex @ 0x54431C..0x544341 + ParseChildRecord size.
+// Layout per record (a2 in ParseChildRecord):
+//   +0  kind/parent u32   +4  type_id u32
+//   +8  restype u8        +9  flags u8 (bit0 → 12f transform)
+//   +10 pad u16+u32       +14 file_off u32  +18 file_sz u32
+//   +22 namelen u8        +23 name[namelen]  [+48 if flags&1]
+bool parse_entries_pe(const std::vector<uint8_t>& data, size_t off,
+                      uint32_t nentries, size_t toc_end,
+                      std::vector<RpakEntry>* out) {
   out->clear();
-  std::string cur_dir;
   try {
-    for (uint32_t idx = 0; idx < nentries; ++idx) {
-      if (off + 4 > data.size()) return false;
-      uint32_t kind = 0;
+    for (uint32_t nleft = nentries; nleft > 0; --nleft) {
+      if (off + 23 > data.size() || off + 23 > toc_end) return false;
+      uint32_t kind = 0, type_id = 0;
       std::memcpy(&kind, data.data() + off, 4);
-
-      bool is_dir = false;
-      size_t transform = 0;
-      if (kind == 0) {
-        is_dir = true;
-      } else if (mode == ParseMode::Map && kind == 1 && idx == 0) {
-        is_dir = true;
-        transform = 48;
-      } else if (mode == ParseMode::Frontend && (kind == 1 || kind == 2) &&
-                 idx == 0) {
-        is_dir = true;
-        transform = (kind == 1) ? 48 : 0;
-      }
-
-      if (is_dir) {
-        size_t p = off + 4;
-        p += 4 + 10 + 4 + 8;
-        std::string name;
-        if (!read_name(data, &p, &name)) return false;
-        p += transform;
-        if (p > data.size()) return false;
-        cur_dir = name;
-        RpakEntry e;
-        e.is_dir = true;
-        e.kind = static_cast<int32_t>(kind);
-        e.name = name;
-        e.path = name;
-        out->push_back(std::move(e));
-        off = p;
-        continue;
-      }
-
-      // kind(4) + type_id(4) + flags(2) + unk(4) + offset(4) + size(4) + name
-      if (off + 4 + 4 + 2 + 4 + 8 > data.size()) return false;
-      uint32_t type_id = 0;
       std::memcpy(&type_id, data.data() + off + 4, 4);
-      size_t p = off + 4 + 4 + 2 + 4;
+      const uint8_t flags = data[off + 9];
       uint32_t file_off = 0, file_sz = 0;
-      std::memcpy(&file_off, data.data() + p, 4);
-      std::memcpy(&file_sz, data.data() + p + 4, 4);
-      p += 8;
+      std::memcpy(&file_off, data.data() + off + 14, 4);
+      std::memcpy(&file_sz, data.data() + off + 18, 4);
+      const uint8_t nsz = data[off + 22];
       std::string name;
-      if (!read_name(data, &p, &name)) return false;
-      if (kind == 0x10004) p += 48;
+      if (!read_pe_name(data, off + 23, nsz, &name)) return false;
+      size_t end = off + 23 + nsz;
+      if ((flags & 1u) != 0) end += 12 * sizeof(float);  // @ 0x5440BB
+      if (end > data.size() || end > toc_end) return false;
       // Type-tree stubs often have bogus offset/size — keep name/ids.
       if (file_off > data.size() ||
           static_cast<uint64_t>(file_off) + file_sz > data.size()) {
@@ -177,62 +147,99 @@ bool parse_entries(const std::vector<uint8_t>& data, size_t off, uint32_t nentri
         file_sz = 0;
       }
       RpakEntry e;
-      e.is_dir = false;
+      e.is_dir = false;  // PE CreateNodeUnder — kind is parent, not a dir bit
       e.kind = static_cast<int32_t>(kind);
       e.type_id = static_cast<int32_t>(type_id);
       e.name = name;
-      e.path = cur_dir.empty() ? name : (cur_dir + "/" + name);
+      e.path = name;
       e.offset = file_off;
       e.size = file_sz;
       out->push_back(std::move(e));
-      off = p;
+      off = end;
     }
   } catch (...) {
     return false;
   }
-  return true;
+  return off == toc_end;
 }
 
-float entry_quality(const std::vector<RpakEntry>& ents,
-                    const std::vector<uint8_t>& data) {
-  size_t files = 0, good = 0;
-  for (const auto& e : ents) {
+void link_entry_hierarchy(RpakPack* pack) {
+  // Hierarchy: children of R are entries with parent_key(kind) == R.type_id.
+  // Scripted nodes (kind hi=0x2) parent via kind&0xFFFF (Baiern_VT → 0x1000).
+  std::unordered_map<int32_t, size_t> by_type;
+  std::unordered_map<int32_t, std::vector<size_t>> kids;
+  for (size_t i = 0; i < pack->entries.size(); ++i) {
+    auto& e = pack->entries[i];
+    e.parent_local = -1;
+    e.first_child_local = -1;
+    e.next_sibling_local = -1;
     if (e.is_dir) continue;
-    ++files;
-    if (e.name.empty()) continue;
-    // Named node counts even if blob is empty (type-tree stubs).
-    if (e.size == 0 ||
-        (e.offset <= data.size() &&
-         static_cast<uint64_t>(e.offset) + e.size <= data.size())) {
-      ++good;
+    by_type[e.type_id] = i;
+    kids[rpak_parent_key(e.kind)].push_back(i);
+  }
+  for (size_t i = 0; i < pack->entries.size(); ++i) {
+    auto& e = pack->entries[i];
+    if (e.is_dir) continue;
+    const int32_t pk = rpak_parent_key(e.kind);
+    auto pit = by_type.find(pk);
+    if (pit != by_type.end()) e.parent_local = pk;
+    else if ((static_cast<uint32_t>(e.kind) >> 16) == 0x2u)
+      e.parent_local = pk;  // cross-pack parent (cars:0x1000)
+  }
+  for (auto& kv : kids) {
+    const int32_t parent_tid = kv.first;
+    auto& idxs = kv.second;
+    if (idxs.empty()) continue;
+    auto pit = by_type.find(parent_tid);
+    if (pit != by_type.end()) {
+      pack->entries[pit->second].first_child_local =
+          pack->entries[idxs[0]].type_id;
+    }
+    for (size_t s = 0; s + 1 < idxs.size(); ++s) {
+      pack->entries[idxs[s]].next_sibling_local =
+          pack->entries[idxs[s + 1]].type_id;
     }
   }
-  if (files == 0) return -1.f;
-  return static_cast<float>(good) / static_cast<float>(files);
 }
 
+// Soft PE ResourcePack_EnsureIndex @ 0x544170 — PathExists + SlotRead RPAK
+// magic/ver + dep table (0x40) + TOC header + ParseChildRecord blob.
+// Remap TOC@+0x5C produced in rpak_open_unlocked after LoadPack deps.
 bool load_pack_file(const std::string& path, RpakPack* pack) {
   std::vector<uint8_t> data;
   if (!read_file(path, &data) || data.size() < 16) return false;
   if (std::memcmp(data.data(), "RPAK", 4) != 0) return false;
 
-  uint32_t ver = 0, packs = 0, zero = 0;
+  uint32_t ver = 0;
   std::memcpy(&ver, data.data() + 4, 4);
-  std::memcpy(&packs, data.data() + 8, 4);
-  std::memcpy(&zero, data.data() + 12, 4);
-  (void)zero;
+  // PE SlotRead → pack+0x54 / +0x58 @ 0x5441F3..0x5441FF (file +8/+0xC).
+  std::memcpy(&pack->toc_lim_a, data.data() + 8, 4);
+  std::memcpy(&pack->toc_lim_b, data.data() + 12, 4);
   pack->version = ver;
 
+  // PE malloc count = (+0x54)+(+0x58)+1; dep loop = count-1 @ 0x54420A..0x544255.
+  const uint32_t ndeps = pack->toc_lim_a + pack->toc_lim_b;
   size_t off = 16;
   pack->deps.clear();
-  for (uint32_t i = 0; i < packs; ++i) {
-    if (off + 4 + 0x3C > data.size()) return false;
-    off += 4;  // id/slot
-    char namebuf[0x3C];
-    std::memcpy(namebuf, data.data() + off, 0x3C);
-    off += 0x3C;
-    namebuf[0x3B] = '\0';
-    pack->deps.emplace_back(namebuf);
+  pack->deps.reserve(ndeps);
+  for (uint32_t i = 0; i < ndeps; ++i) {
+    // PE @ 0x54425E: SlotRead 0x40 = id u32 + name[56] + trailer u32.
+    if (off + 0x40 > data.size()) return false;
+    uint32_t id_dword = 0;
+    std::memcpy(&id_dword, data.data() + off, 4);
+    off += 4;
+    char namebuf[56];
+    std::memcpy(namebuf, data.data() + off, 56);
+    off += 56;
+    uint32_t trailer = 0;
+    std::memcpy(&trailer, data.data() + off, 4);
+    off += 4;
+    namebuf[55] = '\0';
+    RpakDep dep;
+    dep.id_hi = static_cast<uint16_t>(id_dword >> 16);  // @ 0x54426A
+    dep.trailer = trailer;
+    dep.name.assign(namebuf);
+    pack->deps.push_back(std::move(dep));
   }
 
   if (off + 8 > data.size()) {
@@ -241,96 +248,56 @@ bool load_pack_file(const std::string& path, RpakPack* pack) {
     return true;
   }
 
+  // PE @ 0x5442C2..0x5442E9: info_size, nentries, then two unused u32
+  // (stack v15/v16 — discarded; must skip before TOC blob).
   uint32_t info_size = 0, nentries = 0;
   std::memcpy(&info_size, data.data() + off, 4);
   std::memcpy(&nentries, data.data() + off + 4, 4);
-  (void)info_size;
   off += 8;
+  if (off + 8 > data.size()) {
+    pack->is_registry = true;
+    return true;
+  }
+  off += 8;  // skip PE unused dword pair (W40)
 
-  // system.rpk: packs==0 and entry parse usually fails → registry.
-  if (packs == 0 && nentries == 0) {
+  if (ndeps == 0 && nentries == 0) {
     pack->is_registry = true;
     return true;
   }
 
-  std::vector<RpakEntry> best;
-  float best_q = -1.f;
-  for (ParseMode mode :
-       {ParseMode::Strict, ParseMode::Map, ParseMode::Frontend}) {
-    std::vector<RpakEntry> ents;
-    if (!parse_entries(data, off, nentries, mode, &ents)) continue;
-    const float q = entry_quality(ents, data);
-    if (q > best_q) {
-      best_q = q;
-      best = std::move(ents);
-    }
+  if (info_size == 0 || nentries == 0) {
+    pack->is_registry = true;
+    pack->parsed_entries = false;
+    return true;
+  }
+  if (off + info_size > data.size()) {
+    pack->is_registry = true;
+    pack->parsed_entries = false;
+    return true;
   }
 
-  if (best_q >= 0.5f) {
-    pack->entries = std::move(best);
+  const size_t toc_end = off + info_size;
+  std::vector<RpakEntry> ents;
+  if (parse_entries_pe(data, off, nentries, toc_end, &ents)) {
+    pack->entries = std::move(ents);
     pack->parsed_entries = true;
     pack->is_registry = false;
-    // Hierarchy: children of R are entries with parent_key(kind) == R.type_id.
-    // Scripted nodes (kind hi=0x2) parent via kind&0xFFFF (Baiern_VT → 0x1000).
-    std::unordered_map<int32_t, size_t> by_type;
-    std::unordered_map<int32_t, std::vector<size_t>> kids;
-    for (size_t i = 0; i < pack->entries.size(); ++i) {
-      auto& e = pack->entries[i];
-      e.parent_local = -1;
-      e.first_child_local = -1;
-      e.next_sibling_local = -1;
-      if (e.is_dir) continue;
-      by_type[e.type_id] = i;
-      kids[rpak_parent_key(e.kind)].push_back(i);
-    }
-    for (size_t i = 0; i < pack->entries.size(); ++i) {
-      auto& e = pack->entries[i];
-      if (e.is_dir) continue;
-      const int32_t pk = rpak_parent_key(e.kind);
-      auto pit = by_type.find(pk);
-      if (pit != by_type.end()) e.parent_local = pk;
-      else if ((static_cast<uint32_t>(e.kind) >> 16) == 0x2u)
-        e.parent_local = pk;  // cross-pack parent (cars:0x1000)
-    }
-    for (auto& kv : kids) {
-      const int32_t parent_tid = kv.first;
-      auto& idxs = kv.second;
-      if (idxs.empty()) continue;
-      auto pit = by_type.find(parent_tid);
-      if (pit != by_type.end()) {
-        pack->entries[pit->second].first_child_local =
-            pack->entries[idxs[0]].type_id;
-      }
-      for (size_t s = 0; s + 1 < idxs.size(); ++s) {
-        pack->entries[idxs[s]].next_sibling_local =
-            pack->entries[idxs[s + 1]].type_id;
-      }
-    }
+    link_entry_hierarchy(pack);
   } else {
-    // Header OK but no file index (type trees / system registry).
+    // Header OK but TOC walk failed (corrupt / unknown variant).
     pack->is_registry = true;
     pack->parsed_entries = false;
   }
   return true;
 }
 
-}  // namespace
-
-void rpak_set_game_root(const char* root) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  g_root = root ? norm_path(root) : std::string();
-}
-
-std::string rpak_resolve_path(const char* path) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  return resolve_path(path);
-}
-
-int32_t rpak_open(const char* lib_path) {
+// Soft PE ResourceEngine_LoadPack @ 0x538380 + EnsureIndex dep loop
+// @ 0x5442AF — register path, parse TOC, then LoadPack each dep name.
+// Assumes g_mu held. Idempotent via g_by_path.
+int32_t rpak_open_unlocked(const char* lib_path) {
   const std::string resolved = resolve_path(lib_path);
   if (resolved.empty()) return 0;
 
-  std::lock_guard<std::mutex> lock(g_mu);
   auto it = g_by_path.find(resolved);
   if (it != g_by_path.end()) return it->second;
 
@@ -347,7 +314,49 @@ int32_t rpak_open(const char* lib_path) {
   pack.pack_id = id;
   g_packs.push_back(std::move(pack));
   g_by_path[resolved] = id;
+  const size_t self_idx = g_packs.size() - 1;
+
+  // Soft PE EnsureIndex TOC@+0x5C @ 0x544221..0x5442AF:
+  // malloc((+0x54)+(+0x58)+1)*66; slot0 pack_hi=own; deps LoadPack → +2.
+  // Re-index after each dep open — recursive push may reallocate g_packs.
+  {
+    RpakPack& self0 = g_packs[self_idx];
+    const uint32_t lim = self0.toc_lim_a + self0.toc_lim_b;
+    const size_t ndeps = self0.deps.size();
+    self0.remap_toc.assign(static_cast<size_t>(lim) + 1u, RpakRemapSlot{});
+    self0.remap_toc[0].pack_hi = static_cast<uint16_t>(id);  // @ 0x544231
+    for (uint32_t i = 0; i < ndeps && i < lim; ++i) {
+      const uint16_t id_hi = g_packs[self_idx].deps[i].id_hi;
+      const uint32_t trailer = g_packs[self_idx].deps[i].trailer;
+      const std::string dep_name = g_packs[self_idx].deps[i].name;
+      int32_t dep_id = 0;
+      if (!dep_name.empty())
+        dep_id = rpak_open_unlocked(dep_name.c_str());  // @ 0x5442A7
+      RpakRemapSlot& slot =
+          g_packs[self_idx].remap_toc[static_cast<size_t>(i) + 1u];
+      slot.id_hi = id_hi;
+      slot.trailer = trailer;
+      slot.pack_hi = static_cast<uint16_t>(dep_id);  // @ 0x5442AF
+    }
+  }
   return id;
+}
+
+}  // namespace
+
+void rpak_set_game_root(const char* root) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_root = root ? norm_path(root) : std::string();
+}
+
+std::string rpak_resolve_path(const char* path) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return resolve_path(path);
+}
+
+int32_t rpak_open(const char* lib_path) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return rpak_open_unlocked(lib_path);
 }
 
 const RpakPack* rpak_get(int32_t pack_id) {
@@ -397,6 +406,37 @@ const RpakEntry* rpak_find_entry(int32_t res_id) {
   return nullptr;
 }
 
+// Soft PE ResPack_RemapLocalId @ 0x544590 (ASM stride 66 @ 0x5445DB..E2).
+uint32_t rpak_remap_local_id(int32_t pack_id, uint32_t local_id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (static_cast<uint32_t>(pack_id) == 0xFFFFu) return local_id;  // @ 0x54459D
+  const uint32_t lo = local_id & 0xFFFFu;                          // @ 0x5445A5
+  const uint32_t hi = local_id >> 16;                              // @ 0x5445AB
+  if (lo == 0) return 0;                                           // @ 0x5445B0
+  // Soft stand-in for eng+0xFFE20 pack_count (@ 0x5445C0).
+  const uint32_t eng_count = static_cast<uint32_t>(g_packs.size()) + 1u;
+  if (hi >= eng_count) return 0;                                   // @ 0x5445C6
+  if (hi == 0) return lo | (static_cast<uint32_t>(pack_id) << 16); // @ 0x5445F6
+
+  const RpakPack* pack = nullptr;
+  for (const auto& p : g_packs) {
+    if (p.pack_id == pack_id) {
+      pack = &p;
+      break;
+    }
+  }
+  if (!pack) return 0;
+  const uint32_t lim = pack->toc_lim_a + pack->toc_lim_b;  // @ 0x5445CC
+  if (hi > lim) return 0;                                 // @ 0x5445D4 ja
+  if (hi >= pack->remap_toc.size()) return 0;
+  const uint32_t ext_hi = pack->remap_toc[hi].pack_hi;     // table+66*hi+2
+  return lo | (ext_hi << 16);                             // @ 0x5445EA
+}
+
+// Soft PE sourcefile load path: entry blob is often text
+// "sourcefile <path>\r\n..." (EnsureIndex TOC off/size → File_SlotRead of
+// pack; consumers like sub_538840 / ResourceRef.load parse the lines).
+// Host returns the raw TOC payload — offsets now PE-accurate.
 bool rpak_read_entry(int32_t res_id, std::vector<uint8_t>* out) {
   if (!out) return false;
   out->clear();
@@ -410,7 +450,12 @@ bool rpak_read_entry(int32_t res_id, std::vector<uint8_t>* out) {
   in.seekg(static_cast<std::streamoff>(ent->offset));
   in.read(reinterpret_cast<char*>(out->data()),
           static_cast<std::streamsize>(ent->size));
-  return static_cast<bool>(in) || in.gcount() == static_cast<std::streamsize>(ent->size);
+  if (!(static_cast<bool>(in) ||
+        in.gcount() == static_cast<std::streamsize>(ent->size))) {
+    out->clear();
+    return false;
+  }
+  return true;
 }
 
 namespace {
@@ -518,7 +563,7 @@ int32_t rpak_parent_id(int32_t child_res_id) {
   if (child_pack) {
     if (int32_t id = find_in_pack(*child_pack)) return id;
     for (const auto& dep : child_pack->deps) {
-      const std::string want = stem(dep);
+      const std::string want = stem(dep.name);
       for (const auto& p : g_packs) {
         if (stem(p.name) != want) continue;
         if (int32_t id = find_in_pack(p)) return id;

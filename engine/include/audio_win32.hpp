@@ -28,6 +28,18 @@ bool audio_music_playing();
 bool audio_ds_ready();
 const char* audio_backend();  // "dsound" | "winmm" | "none"
 
+// Soft PE Sfx_ListenerSetPose @ 0x005508F0 — packed 12 floats
+// (xyz + ox/oy/oz + ux/uy/uz + fx/fy/fz) → padded Sfx_listener_* →
+// Sfx_ApplyListenerToDS. Returns 0.
+int32_t audio_sfx_listener_set_pose(const float* pose12);
+// Soft PE Sfx_UpdateVoices @ 0x00550980 — HwVoiceBudget + qsort +
+// typeUse + pass1/pass2 + CommitListenerDS. Returns 0.
+int32_t audio_sfx_update_voices();
+// Soft PE Sfx_HwVoiceBudget @ 0x00559DD0 (UpdateVoices head).
+int32_t audio_sfx_hw_voice_budget();
+// Soft PE Sfx_listener_x/y/z mirrors (cull / tests).
+void audio_sfx_listener_get_pos(float* x, float* y, float* z);
+
 // Resolve res_id → on-disk WAV (RPAK blob sourcefile / entry name heuristics).
 bool audio_resolve_wav(int32_t res_id, char* out, size_t out_cap);
 

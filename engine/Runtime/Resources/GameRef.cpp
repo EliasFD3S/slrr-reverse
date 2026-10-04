@@ -7,11 +7,20 @@
 #include "render_d3d9.hpp"
 #include "input_win32.hpp"
 #include "video_fmv.hpp"
+#include "Resources.h"
+#include "System.h"
+#include "GameRef.h"
+#include "GameRef_internal.hpp"
+#include "../Parts/Body/Chassis.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -21,109 +30,1141 @@
 namespace inv {
 namespace {
 
-std::mutex g_mu;
 
-struct GameRefState {
-  int32_t flags = 0;
-  float px = 0, py = 0, pz = 0;
-  float oy = 0, op = 0, or_ = 0;
-  float vx = 0, vy = 0, vz = 0;
-  InvObject* parent = nullptr;
-  InvObject* script = nullptr;
-  std::string script_class;
-  std::string script_alias;
-  bool empty = true;
-  // Phase 2.94 — Vehicle horn (sethorn via EVENT_COMMAND).
-  int32_t horn = 0;
-  // Phase 2.101 — CarMarket start/stop (1 = held/grabbed).
-  int32_t drive_held = 0;
-  // Phase 2.102 — Vehicle assist / gearbox commands.
-  int32_t transmission = 0;
-  float steerhelp = 0.f;
-  float asr = 0.f;
-  float abs_ = 0.f;
-  float difflock = 0.f;
-  int32_t cruise = 0;
-  float damage_multiplier = 1.f;
-  float setsteer = 0.f;
-  // Phase 2.103 — Garage/Mechanic/Track "filter cat mode".
-  int32_t filter_engine = 0;
-  int32_t filter_body = 0;
-  int32_t filter_rgear = 0;
+// PE add_light list @ 0x45B034: [tail+4]=node; node+4=&+0x206C; node+8=tail;
+// +0x2074=node. Host: heap sentinel stands in for &GameRef+0x206C.
+static GameRefState::PeLightNode* pe_light_ensure_sent(GameRefState& r) {
+  if (!r.light_sent) {
+    r.light_sent = std::make_unique<GameRefState::PeLightNode>();
+    r.light_tail = r.light_sent.get();
+  }
+  if (!r.light_tail) r.light_tail = r.light_sent.get();
+  return r.light_sent.get();
+}
+
+static void pe_light_insert_tail(GameRefState& r,
+                                 GameRefState::PeLightNode* node) {
+  auto* sent = pe_light_ensure_sent(r);
+  auto* old_tail = r.light_tail ? r.light_tail : sent;
+  old_tail->next = node;
+  node->next = sent;
+  node->prev = old_tail;
+  r.light_tail = node;
+}
+
+static void pe_light_unlink(GameRefState& r, GameRefState::PeLightNode* node) {
+  if (!node || !r.light_sent) return;
+  auto* sent = r.light_sent.get();
+  if (node->prev) node->prev->next = node->next;
+  if (node->next && node->next != sent) node->next->prev = node->prev;
+  if (r.light_tail == node) r.light_tail = node->prev ? node->prev : sent;
+  node->next = nullptr;
+  node->prev = nullptr;
+}
+
+static GameRefState::PeWingNode* pe_wing_ensure_sent(GameRefState& r) {
+  if (!r.wing_sent) {
+    r.wing_sent = std::make_unique<GameRefState::PeWingNode>();
+    r.wing_tail = r.wing_sent.get();
+  }
+  if (!r.wing_tail) r.wing_tail = r.wing_sent.get();
+  return r.wing_sent.get();
+}
+
+static void pe_wing_insert_tail(GameRefState& r,
+                                GameRefState::PeWingNode* node) {
+  auto* sent = pe_wing_ensure_sent(r);
+  auto* old_tail = r.wing_tail ? r.wing_tail : sent;
+  old_tail->next = node;
+  node->next = sent;
+  node->prev = old_tail;
+  r.wing_tail = node;
+}
+
+static void pe_wing_unlink(GameRefState& r, GameRefState::PeWingNode* node) {
+  if (!node || !r.wing_sent) return;
+  auto* sent = r.wing_sent.get();
+  if (node->prev) node->prev->next = node->next;
+  if (node->next && node->next != sent) node->next->prev = node->prev;
+  if (r.wing_tail == node) r.wing_tail = node->prev ? node->prev : sent;
+  node->next = nullptr;
+  node->prev = nullptr;
+}
+
+static GameRefState::PeMslotNode* pe_mslot_ensure_sent(GameRefState& r) {
+  if (!r.mslot_sent) {
+    r.mslot_sent = std::make_unique<GameRefState::PeMslotNode>();
+    r.mslot_tail = r.mslot_sent.get();
+  }
+  if (!r.mslot_tail) r.mslot_tail = r.mslot_sent.get();
+  return r.mslot_sent.get();
+}
+
+static void pe_mslot_insert_tail(GameRefState& r,
+                                 GameRefState::PeMslotNode* node) {
+  auto* sent = pe_mslot_ensure_sent(r);
+  auto* old_tail = r.mslot_tail ? r.mslot_tail : sent;
+  old_tail->next = node;
+  node->next = sent;
+  node->prev = old_tail;
+  r.mslot_tail = node;
+}
+
+// PE GameRef_physDcList_insertTail @ 0x45FAF0 (this=phys+0xD4):
+//   tail=*(this+0x18); [tail+4]=node; node+4=this+0x10; node+8=tail;
+//   *(this+0x18)=node. Host: heap sentinel == PE +0xE4.
+static GameRefState::PePhysDcNode* pe_phys_dc_ensure_sent(GameRefState& r) {
+  if (!r.phys_dc_sent) {
+    r.phys_dc_sent = std::make_unique<GameRefState::PePhysDcNode>();
+    r.phys_dc_tail = r.phys_dc_sent.get();
+  }
+  if (!r.phys_dc_tail) r.phys_dc_tail = r.phys_dc_sent.get();
+  return r.phys_dc_sent.get();
+}
+
+static void pe_phys_dc_insert_tail(GameRefState& r,
+                                   GameRefState::PePhysDcNode* node) {
+  auto* sent = pe_phys_dc_ensure_sent(r);
+  auto* old_tail = r.phys_dc_tail ? r.phys_dc_tail : sent;
+  old_tail->next = node;
+  node->next = sent;
+  node->prev = old_tail;
+  r.phys_dc_tail = node;
+}
+
+static void pe_phys_dc_unlink(GameRefState& r,
+                              GameRefState::PePhysDcNode* node) {
+  if (!node || !r.phys_dc_sent) return;
+  auto* sent = r.phys_dc_sent.get();
+  if (node->prev) node->prev->next = node->next;
+  if (node->next && node->next != sent) node->next->prev = node->prev;
+  if (r.phys_dc_tail == node) r.phys_dc_tail = node->prev ? node->prev : sent;
+  node->next = nullptr;
+  node->prev = nullptr;
+}
+
+// PE GameRef_cmdAddPart @ 0x447B3D..0x447B88: malloc 0x1C →
+// Engine_SimCallbackNode_ctor @ 0x429130 → ResHandle clear @ +0xC →
+// ResHandle_Rebind(node+0xC, *(part+0xC)) @ 0x447B74 →
+// GameRef_physDcList_insertTail(phys+0xD4, node) @ 0x447B82.
+static void gameref_phys_dc_add_part(InvObject* self, InvObject* part) {
+  if (!self || !part) return;
+  native_ptr_ensure(part);
+  void* inst = native_ptr_node(part);
+  auto node = std::make_unique<GameRefState::PePhysDcNode>();
+  node->part = part;
+  if (inst) {
+    res_handle_rebind(node->rh, inst);
+    node->match_key =
+        *reinterpret_cast<int32_t*>(reinterpret_cast<char*>(node->rh) + 8);
+  }
+  if (node->match_key == 0)
+    node->match_key = java_util_resource_ResourceRef_id(part);
+  {
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    auto& st = ref(self);
+    GameRefState::PePhysDcNode* raw = node.get();
+    pe_phys_dc_insert_tail(st, raw);
+    st.phys_dc_nodes.push_back(std::move(node));
+  }
+  tree_field_set_int(self, "phys_dc_count",
+                     tree_field_get_int(self, "phys_dc_count") + 1);
+  tree_field_set_obj(self, "last_phys_dc_part", part);
+}
+
+// PE GameRef_cmdRemPart @ 0x44803E..0x4480A1: Engine_SimObjectListEmpty
+// (phys+0xD4); walk head=*[phys+0xDC] match *(node+0x14)==*(part+8);
+// unlink next/prev; vtbl dtor(1).
+static void gameref_phys_dc_rem_part(InvObject* self, InvObject* part) {
+  if (!self || !part) return;
+  const int32_t want = java_util_resource_ResourceRef_id(part);
+  bool removed = false;
+  {
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    auto& st = ref(self);
+    GameRefState::PePhysDcNode* hit = nullptr;
+    for (auto& up : st.phys_dc_nodes) {
+      if (!up) continue;
+      if (up->part == part || (want != 0 && up->match_key == want)) {
+        hit = up.get();
+        break;
+      }
+    }
+    if (!hit) return;
+    pe_phys_dc_unlink(st, hit);
+    void_event_res_handle_unbind_owner(hit->rh);
+    for (auto it = st.phys_dc_nodes.begin(); it != st.phys_dc_nodes.end();
+         ++it) {
+      if (it->get() == hit) {
+        st.phys_dc_nodes.erase(it);
+        removed = true;
+        break;
+      }
+    }
+  }
+  if (removed) {
+    const int32_t n = tree_field_get_int(self, "phys_dc_count");
+    if (n > 0) tree_field_set_int(self, "phys_dc_count", n - 1);
+  }
+}
+
+// PE ResHandle_Bind @ 0x546070: this=rh, a2=id, a3=type, a4=0.
+// → ResourceEngine_LookupById @ 0x536820 (was sub_536820) →
+// ResourceEngine_ResolveParent @ 0x537000 (type filter a3 vs [inner+0x4C]).
+// On hit: link rh into instance+0x44 list; rh+8=id; rh+0xC=instance.
+// Host: resref_find_by_id + type gate + res_handle_rebind (same +0x44/+0x48
+// list as Bind) then overwrite rh+8 with requested id (PE Bind ≠ Rebind key).
+// Miss / no Native.ptr: soft store id at +8 only (no invent ResourceEngine).
+// Returns 1 when rh+0xC linked.
+static int32_t res_handle_bind_resolve(void* rh, int32_t handle_id,
+                                       int32_t type) {
+  if (!rh) return 0;
+  auto* words = reinterpret_cast<int32_t*>(rh);
+  // PE @ 0x54607d: same id → no-op (keep prior link).
+  if (handle_id != 0 && words[2] == handle_id &&
+      *reinterpret_cast<void**>(reinterpret_cast<char*>(rh) + 0xC) != nullptr) {
+    return 1;
+  }
+  // Unlink prior owner slice (Bind @ 0x546083..0x5460bd ≡ Rebind(rh,0)).
+  res_handle_rebind(rh, nullptr);
+  std::memset(rh, 0, 16);
+  if (handle_id == 0) return 0;
+  words[2] = handle_id;
+
+  InvObject* obj = resref_find_by_id(handle_id);
+  if (!obj) return 0;
+  // PE ResolveParent @ 0x5370cd: a3!=0 → require [inner+0x4C]==a3.
+  // RESOURCE_VIEWPORT=0x12 (ResourceRef.java). Host type 0 = unset → allow.
+  if (type != 0) {
+    const int32_t ot = java_util_resource_ResourceRef_type(obj);
+    if (ot != 0 && ot != type) return 0;
+  }
+  native_ptr_ensure(obj);
+  void* node = native_ptr_node(obj);
+  if (!node) return 0;
+  // Seed owner+0x50 when empty so Rebind-shaped list key matches id.
+  {
+    auto* key = reinterpret_cast<int32_t*>(reinterpret_cast<char*>(node) + 0x50);
+    if (*key == 0) *key = handle_id;
+  }
+  res_handle_rebind(rh, node);
+  words[2] = handle_id;  // PE Bind stores a2, not *(owner+0x50)
+  return *reinterpret_cast<void**>(reinterpret_cast<char*>(rh) + 0xC) != nullptr
+             ? 1
+             : 0;
+}
+
+static void pe_mslot_unlink(GameRefState& r, GameRefState::PeMslotNode* node) {
+  if (!node || !r.mslot_sent) return;
+  auto* sent = r.mslot_sent.get();
+  if (node->prev) node->prev->next = node->next;
+  if (node->next && node->next != sent) node->next->prev = node->prev;
+  if (r.mslot_tail == node) r.mslot_tail = node->prev ? node->prev : sent;
+  node->next = nullptr;
+  node->prev = nullptr;
+}
+
+// PE GameRef_setParent_inner @ 0x0048ABA0 type 2–3: GameRef_dllist_unlink
+// @ 0x004A5D00 + list_add_tail under parent +0x30 sentinel / +0x38 tail.
+// Type-1 @ 0x48ACC1: getPayload → leaf.vtbl+0x20 @ 0x48AD0A →
+// CameraCtrl_attachSetParent @ 0x00438590: handleAttachUnderParent @
+// 0x00429C80 then setParent_inner(block+0x30). Chassis @ 0x44C170 OOS.
+// Type53_ensureHandleSlot @ 0x004B3EE0: lists A/B/C + malloc(200);
+// found A/C retarget + C promote; W21C: insertSpatialBounds @ 0x4B3120;
+// W22C: linkNearbySlots @ 0x4B36B0 malloc20+dllist;
+// W23C: Type53_promoteSlotOnLink @ 0x4B3AC0 (RE @ 0x537240 OOS).
+// W24C: insertSpatialBounds READS owner+0x84/+0x90 only (a3=cursor);
+// half-extent fill = EXTP@53E108 / unionChildAabb@4988A0 (Resources OOS
+// on HostResNode). Degenerate AABB skip + walk_guard 4096 kept.
+// Host: sib_* == parent ↔ PE &parent+0x30 sentinel. Hold g_gr_mu.
+
+// PE Type53_ensureHandleSlot @ 0x004B3EE0 size 0x367 (mgr = type53_block+0xB4).
+// Walks three SimObject lists then Engine_malloc(200) @ 0x4B403A.
+// Mgr dword layout (IDA): listA this+11 → head [13]; listB this+4 → head [6];
+// listC sentinel [20]; insert sentinel &mgr[15] (+0x3C) / tail [17] (+0x44);
+// counts [47]/[48]; gen [52]. Slot: +4 next / +8 prev / +0x14 key / +0x18
+// Rebind owner; [49]=a3 binder. Found A/C: a3 retarget @ 0x4B3F74 / 0x4B410C;
+// found C: promote to insert-list @ 0x4B4181 (or flag|8 if [47]!=0).
+// Malloc tail @ 0x4B422F: Type53_insertSpatialBounds(mgr,slot,a3) @ 0x4B3120
+// + Type53_linkNearbySlots(mgr,slot) @ 0x4B36B0.
+// Key: PE result[5]==handle[+8]; host also stores handle addr at slot[+0x14]
+// (HostNativeHandle+8 is alive=1 for all).
+// Callers a3=0: setParent @ 0x48AD45, CreateGameInstanceNative @ 0x53A57B.
+std::vector<void*> g_type53_owned_slots;  // malloc(200) lifetimes
+std::vector<void*> g_type53_owned_neighbor_links;  // malloc(20) @ 0x4B378C
+
+// PE spatial axis lists @ mgr+0x64 stride 0x38 ×3 (disasm edi=mgr+0x6C).
+// Host HostType53Block.mgr[0xD4] ends at axis2 base — side blob mirrors
+// PE +0x64..+0x10C so splice never OOB. Counts stay at mgr[+0xC4].
+struct Type53SpatialLists {
+  std::uint32_t raw[0x38u * 3u / 4u]{};
+  // PE mgr[+0xC4]/[+0xCC]/[+0xD4]; host mgr[0xD4] only fits first two.
+  std::uint32_t counts[3]{};
 };
+std::unordered_map<std::uint32_t*, Type53SpatialLists> g_type53_spatial;
 
+enum class Type53FoundList : std::uint8_t { None, A, B, C };
+
+static bool type53_sim_list_empty(std::uint32_t* list_obj) {
+  // Engine_SimObjectListEmpty @ 0x00429390: *(*(this+2)+4)==0
+  if (!list_obj) return true;
+  auto* head_holder = reinterpret_cast<std::uint32_t**>(list_obj + 2);
+  std::uint32_t* head = *head_holder;
+  if (!head) return true;
+  return head[1] == 0;
+}
+
+static std::uint32_t* type53_sim_list_head(std::uint32_t* list_obj) {
+  if (!list_obj || type53_sim_list_empty(list_obj)) return nullptr;
+  return reinterpret_cast<std::uint32_t*>(list_obj[2]);
+}
+
+static void type53_mgr_lazy_init(std::uint32_t* mgr) {
+  // HostType53Block.mgr starts zeroed — PE constructs sentinels before use.
+  // Insert list: tail [17] = &sentinel[15] when empty (see insert @ 0x4B420C).
+  if (mgr[17] == 0) {
+    mgr[15] = 0;
+    mgr[16] = 0;
+    mgr[17] = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(&mgr[15]));
+  }
+  // List A/B heads → insert sentinel (next==0 ⇒ empty).
+  if (mgr[13] == 0)
+    mgr[13] = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(&mgr[15]));
+  if (mgr[6] == 0)
+    mgr[6] = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(&mgr[15]));
+  // List C: [20] is node*; empty when *[20]+4 == 0.
+  if (mgr[20] == 0) {
+    mgr[20] = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(&mgr[20]));
+    mgr[21] = 0;
+    mgr[22] = 0;
+  }
+}
+
+static std::uint32_t* type53_slot_walk(std::uint32_t* head, std::uint32_t key,
+                                      void* handle_node) {
+  std::uint32_t* result = head;
+  while (result) {
+    // PE @ 0x4B3F4A: result[5] == *(handle+8)
+    bool key_ok = (result[5] == key);
+    // Host: key may be handle addr (alive collision); also match Rebind node.
+    if (!key_ok && handle_node &&
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(result[6])) ==
+            handle_node)
+      key_ok = true;
+    if (key_ok) return result;
+    result = reinterpret_cast<std::uint32_t*>(
+        static_cast<std::uintptr_t>(result[1]));
+    if (!result || result[1] == 0) return nullptr;
+  }
+  return nullptr;
+}
+
+// PE @ 0x4B3F74 (list A) / 0x4B410C (list C): retarget result[49] binder.
+static void type53_slot_retarget_a3(std::uint32_t* result, void* a3) {
+  if (!result) return;
+  std::uint32_t cur = result[49];
+  if (cur == 0) return;
+  auto a3u = reinterpret_cast<std::uintptr_t>(a3);
+  if (a3 && a3u != static_cast<std::uintptr_t>(cur)) {
+    --(*reinterpret_cast<std::uint32_t*>(
+        static_cast<std::uintptr_t>(cur) + 188));
+    ++(*reinterpret_cast<std::uint32_t*>(
+        reinterpret_cast<unsigned char*>(a3) + 188));
+    result[49] = static_cast<std::uint32_t>(a3u);
+  }
+  // Clear binder if owner node parent id mismatch @ 0x4B3F9F / 0x4B4133.
+  std::uint32_t owner = result[6];
+  if (owner == 0) return;
+  std::uint32_t binder = result[49];
+  if (binder == 0) return;
+  auto* own_b = reinterpret_cast<unsigned char*>(
+      static_cast<std::uintptr_t>(owner));
+  void* mid14 = *reinterpret_cast<void**>(own_b + 0x14);
+  if (!mid14) return;
+  std::uint32_t parent_id =
+      *reinterpret_cast<std::uint32_t*>(
+          reinterpret_cast<unsigned char*>(mid14) + 0x50);
+  std::uint32_t binder_id =
+      *reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(binder) + 0x14);
+  if (parent_id != binder_id) {
+    --(*reinterpret_cast<std::uint32_t*>(
+        static_cast<std::uintptr_t>(binder) + 188));
+    result[49] = 0;
+  }
+}
+
+// PE splice into insert-list: flag&=~0x1A; unlink +4/+8; tail→slot→sentinel;
+// mgr[47]++ mgr[48]--. Shared by list-C promote @ 0x4B4181 and
+// Type53_promoteSlotOnLink @ 0x4B3BDF.
+static void type53_slot_splice_to_insert_list(std::uint32_t* mgr,
+                                             std::uint32_t* slot) {
+  if (!mgr || !slot) return;
+  slot[7] &= 0xFFFFFFE5u;
+  std::uint32_t prev = slot[2];
+  if (prev != 0) {
+    std::uint32_t next = slot[1];
+    if (next != 0) {
+      *reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(next) + 8) = prev;
+      *reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(prev) + 4) = next;
+    }
+  }
+  slot[1] = 0;
+  slot[2] = 0;
+  auto* old_tail = reinterpret_cast<std::uint32_t*>(
+      static_cast<std::uintptr_t>(mgr[17]));
+  if (!old_tail) old_tail = &mgr[15];
+  old_tail[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(slot));
+  slot[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(old_tail));
+  slot[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(&mgr[15]));
+  mgr[17] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(slot));
+  ++mgr[47];
+  --mgr[48];
+}
+
+// PE @ 0x4B415E–0x4B41B6: list-C hit → flag|8 if [47]!=0, else splice into
+// insert-list (sentinel &mgr[15] / tail mgr[17]); counts [47]++ [48]--.
+static void type53_list_c_promote(std::uint32_t* mgr, std::uint32_t* result) {
+  if (!mgr || !result) return;
+  if (result[47] != 0) {
+    result[7] |= 8u;
+    return;
+  }
+  type53_slot_splice_to_insert_list(mgr, result);
+}
+
+// PE Type53_promoteSlotOnLink @ 0x004B3AC0: walk list A (mgr[13]) then list C
+// (mgr[20]) for deps with [49]==slot; unlink dep Rebind list via [3]/[4] +
+// owner[+0x48]; --slot[+0xBC]; clear binder. Then splice slot → insert-list.
+// Call site linkNearby @ 0x4B37FC when flag&8 && flag&0x10.
+static std::uint32_t* type53_sim_walk_next(std::uint32_t* cur) {
+  if (!cur || cur[1] == 0) return nullptr;
+  auto* n = reinterpret_cast<std::uint32_t*>(
+      static_cast<std::uintptr_t>(cur[1]));
+  if (!n || n[1] == 0) return nullptr;
+  return n;
+}
+
+static void type53_clear_dependent_binder(std::uint32_t* dep,
+                                         std::uint32_t* binder) {
+  // PE @ 0x4B3AF7 / 0x4B3B87: owner=dep[6]; prev/next = dep[3]/[4].
+  std::uint32_t owner = dep[6];
+  if (owner != 0) {
+    std::uint32_t prev = dep[3];
+    std::uint32_t next = dep[4];
+    if (prev != 0) {
+      *reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(prev) + 4) = next;
+    } else {
+      *reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(owner) + 0x48) = next;
+    }
+    if (next != 0) {
+      *reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(next)) = prev;
+    }
+    dep[6] = 0;
+    dep[5] = 0;
+    dep[3] = 0;
+    dep[4] = 0;
+  } else {
+    dep[5] = 0;
+  }
+  --binder[47];  // binder+0xBC
+  dep[49] = 0;
+}
+
+static void type53_promote_slot_on_link(std::uint32_t* mgr,
+                                       std::uint32_t* slot) {
+  if (!mgr || !slot) return;
+  // List A: start at mgr[13] if head.next != 0 — PE @ 0x4B3AC1.
+  std::uint32_t* cur = nullptr;
+  if (mgr[13] != 0) {
+    auto* head = reinterpret_cast<std::uint32_t*>(
+        static_cast<std::uintptr_t>(mgr[13]));
+    if (head[1] != 0) cur = head;
+  }
+  bool early = false;
+  while (cur) {
+    std::uint32_t* next = type53_sim_walk_next(cur);
+    if (reinterpret_cast<std::uint32_t*>(
+            static_cast<std::uintptr_t>(cur[49])) == slot) {
+      type53_clear_dependent_binder(cur, slot);
+      if (slot[47] == 0) {
+        early = true;
+        break;
+      }
+    }
+    cur = next;
+  }
+  // LABEL_16 @ 0x4B3B53: if binder count still >0, walk list C.
+  if (!early && slot[47] != 0) {
+    cur = nullptr;
+    if (mgr[20] != 0) {
+      auto* head = reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(mgr[20]));
+      if (head[1] != 0) cur = head;
+    }
+    while (cur) {
+      std::uint32_t* next = type53_sim_walk_next(cur);
+      if (reinterpret_cast<std::uint32_t*>(
+              static_cast<std::uintptr_t>(cur[49])) == slot) {
+        type53_clear_dependent_binder(cur, slot);
+        if (slot[47] == 0) break;
+      }
+      cur = next;
+    }
+  }
+  // PE @ 0x4B3BDF — always splice after binder walks.
+  type53_slot_splice_to_insert_list(mgr, slot);
+}
+
+// PE spatial list @ mgr+0x64+axis*0x38: head[2], sentinel[4] (+0x10),
+// tail[6] (+0x18). physDc-style — empty when head.next==0.
+static std::uint32_t* type53_spatial_axis_list(std::uint32_t* mgr, int axis) {
+  auto& blob = g_type53_spatial[mgr];
+  return blob.raw + static_cast<std::size_t>(axis) * (0x38u / 4u);
+}
+
+static void type53_spatial_list_lazy(std::uint32_t* list) {
+  if (!list || list[2] != 0) return;
+  list[4] = 0;
+  list[5] = 0;
+  list[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(&list[4]));
+  list[6] = list[2];
+}
+
+// PE @ 0x4B3273: push min-link as new head.
+static void type53_spatial_insert_head(std::uint32_t* list,
+                                      std::uint32_t* node) {
+  auto* head = reinterpret_cast<std::uint32_t*>(
+      static_cast<std::uintptr_t>(list[2]));
+  if (!head) head = &list[4];
+  head[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(node));
+  node[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(head));
+  node[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(&list[1]));
+  list[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(node));
+}
+
+// PE @ 0x4B3354: append max-link as new tail (next → sentinel @ list+0x10).
+static void type53_spatial_insert_tail(std::uint32_t* list,
+                                      std::uint32_t* node) {
+  auto* tail = reinterpret_cast<std::uint32_t*>(
+      static_cast<std::uintptr_t>(list[6]));
+  if (!tail) tail = &list[4];
+  tail[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(node));
+  node[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(&list[4]));
+  node[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(tail));
+  list[6] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(node));
+}
+
+// PE @ 0x4B3242: splice node before `at`.
+static void type53_spatial_splice_before(std::uint32_t* node,
+                                        std::uint32_t* at) {
+  auto* prev = reinterpret_cast<std::uint32_t*>(
+      static_cast<std::uintptr_t>(at[2]));
+  node[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(at));
+  node[2] = at[2];
+  if (prev)
+    prev[1] = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(node));
+  at[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(node));
+}
+
+// PE @ 0x4B329F: splice node after `at` (between at and at.next).
+static void type53_spatial_splice_after(std::uint32_t* node,
+                                       std::uint32_t* at) {
+  auto* next = reinterpret_cast<std::uint32_t*>(
+      static_cast<std::uintptr_t>(at[1]));
+  node[1] = at[1];
+  node[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(at));
+  at[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(node));
+  if (next)
+    next[2] = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(node));
+}
+
+// PE Type53_insertSpatialBounds @ 0x004B3120: READS owner AABB then embeds.
+// W24C IDA: result=*(slot+0x18); result[33..38] = +0x84 center / +0x90 half
+// → mins/maxs → slot axis floats (+0x30/+0x6C …); a3 is a *cursor slot*
+// for sorted splice (a3+0x20/+0x5C), NOT a bounds source. PE does NOT write
+// owner+0x84..+0x98 here. Half-extent fill is Resources:
+//   EXTP expand @ 0x53E108 (host_extp_expand_node_aabb) /
+//   ResNode_unionChildAabb @ 0x4988A0. Host Native.ptr HostResNode pad at
+//   +0x84 stays 0 until that path lands on the same node blob.
+static void type53_insert_spatial_bounds(std::uint32_t* mgr,
+                                        std::uint32_t* slot, void* a3) {
+  if (!mgr || !slot) return;
+  auto* node = reinterpret_cast<float*>(
+      static_cast<std::uintptr_t>(slot[6]));  // +0x18
+  if (!node) return;
+
+  // PE @ 0x4B313E..0x4B3162: consume only (no invent / no a3→owner copy).
+  const float cx = node[0x84 / 4];
+  const float cy = node[0x88 / 4];
+  const float cz = node[0x8C / 4];
+  const float hx = node[0x90 / 4];
+  const float hy = node[0x94 / 4];
+  const float hz = node[0x98 / 4];
+  const float mins[3] = {cx - hx, cy - hy, cz - hz};
+  const float maxs[3] = {cx + hx, cy + hy, cz + hz};
+
+  auto* a3b = reinterpret_cast<unsigned char*>(a3);
+  // PE loop: ebp 0,8,16 cmp 0xC — three axes; slot stride 0x28; list +0x38.
+  for (int axis = 0; axis < 3; ++axis) {
+    auto* list = type53_spatial_axis_list(mgr, axis);
+    type53_spatial_list_lazy(list);
+
+    auto* slot_b = reinterpret_cast<unsigned char*>(slot);
+    auto* min_link = reinterpret_cast<std::uint32_t*>(
+        slot_b + 0x20 + axis * 0x28);
+    auto* max_link = reinterpret_cast<std::uint32_t*>(
+        slot_b + 0x5C + axis * 0x28);
+    *reinterpret_cast<float*>(slot_b + 0x30 + axis * 0x28) = mins[axis];
+    *reinterpret_cast<float*>(slot_b + 0x6C + axis * 0x28) = maxs[axis];
+
+    // --- min sorted insert (PE @ 0x4B31CE) ---
+    std::uint32_t* cur = nullptr;
+    if (a3b) {
+      cur = reinterpret_cast<std::uint32_t*>(a3b + 0x20 + axis * 0x28);
+    } else if (!type53_sim_list_empty(list)) {
+      cur = reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(list[2]));
+    }
+    if (!cur) {
+      type53_spatial_insert_head(list, min_link);
+    } else {
+      const float our = mins[axis];
+      float cf = *reinterpret_cast<float*>(
+          reinterpret_cast<unsigned char*>(cur) + 0x10);
+      if (cf > our) {
+        // Walk prev (+8) while float >= our — PE @ 0x4B3253.
+        while (cur) {
+          cf = *reinterpret_cast<float*>(
+              reinterpret_cast<unsigned char*>(cur) + 0x10);
+          if (cf < our) break;
+          auto* prev = reinterpret_cast<std::uint32_t*>(
+              static_cast<std::uintptr_t>(cur[2]));
+          if (!prev || prev[2] == 0) {
+            cur = nullptr;
+            break;
+          }
+          cur = prev;
+        }
+        if (!cur)
+          type53_spatial_insert_head(list, min_link);
+        else
+          type53_spatial_splice_after(min_link, cur);
+      } else {
+        // Walk next (+4) while float < our — PE @ 0x4B320A.
+        while (cur) {
+          cf = *reinterpret_cast<float*>(
+              reinterpret_cast<unsigned char*>(cur) + 0x10);
+          if (!(cf < our)) break;
+          auto* next = reinterpret_cast<std::uint32_t*>(
+              static_cast<std::uintptr_t>(cur[1]));
+          if (!next || next[1] == 0) {
+            cur = nullptr;
+            break;
+          }
+          cur = next;
+        }
+        if (!cur)
+          type53_spatial_insert_tail(list, min_link);  // PE @ 0x4B322A
+        else
+          type53_spatial_splice_before(min_link, cur);
+      }
+    }
+
+    // --- max sorted insert (PE @ 0x4B3283) ---
+    cur = nullptr;
+    if (a3b) {
+      cur = reinterpret_cast<std::uint32_t*>(a3b + 0x5C + axis * 0x28);
+    } else if (list[2] != 0 &&
+               reinterpret_cast<std::uint32_t*>(
+                   static_cast<std::uintptr_t>(list[2]))[1] != 0) {
+      cur = reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(list[6]));
+    }
+    if (!cur) {
+      type53_spatial_insert_tail(list, max_link);
+    } else {
+      const float our = maxs[axis];
+      float cf = *reinterpret_cast<float*>(
+          reinterpret_cast<unsigned char*>(cur) + 0x10);
+      if (our >= cf) {
+        // Walk next while float < our — PE @ 0x4B331A.
+        while (cur) {
+          cf = *reinterpret_cast<float*>(
+              reinterpret_cast<unsigned char*>(cur) + 0x10);
+          if (!(cf < our)) break;
+          auto* next = reinterpret_cast<std::uint32_t*>(
+              static_cast<std::uintptr_t>(cur[1]));
+          if (!next || next[1] == 0) {
+            cur = nullptr;
+            break;
+          }
+          cur = next;
+        }
+        if (!cur)
+          type53_spatial_insert_tail(list, max_link);
+        else
+          type53_spatial_splice_before(max_link, cur);
+      } else {
+        // Walk prev while float >= our — PE @ 0x4B32D2.
+        while (cur) {
+          cf = *reinterpret_cast<float*>(
+              reinterpret_cast<unsigned char*>(cur) + 0x10);
+          if (cf < our) break;
+          auto* prev = reinterpret_cast<std::uint32_t*>(
+              static_cast<std::uintptr_t>(cur[2]));
+          if (!prev || prev[2] == 0) {
+            cur = nullptr;
+            break;
+          }
+          cur = prev;
+        }
+        if (!cur)
+          type53_spatial_insert_head(list, max_link);  // PE @ 0x4B32F3
+        else
+          type53_spatial_splice_after(max_link, cur);
+      }
+    }
+
+    // PE @ 0x4B3366: *(mgr+0xC4+axis*8) += 2. Axis2 @ +0xD4 OOB on
+    // host mgr[0xD4] — side counts[]; mirror 0/1 into mgr.
+    auto& spat = g_type53_spatial[mgr];
+    spat.counts[axis] += 2;
+    if (axis < 2) mgr[49 + axis * 2] += 2;
+  }
+}
+
+// PE slot neighbor dllist @ +0xA8 sentinel / +0xB0 tail / +0xB4 count.
+static void type53_neighbor_list_lazy(std::uint32_t* slot) {
+  if (!slot || slot[44] != 0) return;
+  slot[42] = 0;
+  slot[43] = 0;
+  slot[44] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(&slot[42]));
+}
+
+// PE Type53_linkNearbySlots @ 0x004B36B0: walk list B; same node[+0xC8]
+// + XZ AABB (center +0x84/+0x8C, half +0x90/+0x98) → malloc(20) link into
+// other[+0xA8]. W22C: ctor+dllist+flag&~8; W23C: promote @ 0x4B3AC0.
+// Twin: Type53_linkNearbyFromListA @ 0x4B33A0 (list A → a2 neighbors;
+// ensureActiveSlot @ 0x4B3C40). OOS: ResourceEngine sub_537240 @ 0x537240.
+// W24C: no PE write of half-extents on this path — keep degenerate skip.
+static void type53_link_nearby_slots(std::uint32_t* mgr,
+                                    std::uint32_t* slot) {
+  if (!mgr || !slot) return;
+  auto* owner = reinterpret_cast<unsigned char*>(
+      static_cast<std::uintptr_t>(slot[6]));  // +0x18
+  if (!owner) return;
+
+  auto* list_b = mgr + 4;  // +0x10 — PE @ 0x4B36CD
+  if (type53_sim_list_empty(list_b)) return;
+  std::uint32_t* cur = type53_sim_list_head(list_b);
+  int walk_guard = 0;
+  const float ox = *reinterpret_cast<float*>(owner + 0x84);
+  const float oz = *reinterpret_cast<float*>(owner + 0x8C);
+  const float hx = *reinterpret_cast<float*>(owner + 0x90);
+  const float hz = *reinterpret_cast<float*>(owner + 0x98);
+  const std::uint32_t tag =
+      *reinterpret_cast<std::uint32_t*>(owner + 0xC8);
+
+  while (cur) {
+    // W24: host list-B can cycle (Valocity hang); PE walk is acyclic.
+    if (++walk_guard > 4096) break;
+    // PE walk: next = cur[1] if next[1]!=0 else null — @ 0x4B36EF
+    std::uint32_t* next = nullptr;
+    if (cur[1] != 0) {
+      auto* cand = reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(cur[1]));
+      if (cand && cand != cur && cand[1] != 0) next = cand;
+    }
+    if (cur[5] != 0 && cur != slot) {
+      auto* other = reinterpret_cast<unsigned char*>(
+          static_cast<std::uintptr_t>(cur[6]));
+        if (other &&
+          *reinterpret_cast<std::uint32_t*>(other + 0xC8) == tag) {
+        const float cx = *reinterpret_cast<float*>(other + 0x84);
+        const float cz = *reinterpret_cast<float*>(other + 0x8C);
+        const float ohx = *reinterpret_cast<float*>(other + 0x90);
+        const float ohz = *reinterpret_cast<float*>(other + 0x98);
+        // W24/W24C: host owner AABB often still 0 (HostResNode pad; fill is
+        // EXTP/unionChildAabb in Resources, not insertSpatialBounds). PE
+        // halfsum>=|Δ| with hx=ohx=0 matches every peer → O(N²) hang.
+        // Keep skip until Resources writes real half-extents on this node.
+        if (hx + ohx <= 0.f && hz + ohz <= 0.f) {
+          cur = next;
+          continue;
+        }
+        // PE @ 0x4B373E..0x4B3786: halfsum >= fabs(delta)
+        if (hx + ohx >= std::fabs(cx - ox) &&
+            hz + ohz >= std::fabs(cz - oz)) {
+          // PE @ 0x4B378C Engine_malloc(20)
+          auto* link =
+              static_cast<std::uint32_t*>(std::calloc(1, 20));
+          if (link) {
+            g_type53_owned_neighbor_links.push_back(link);
+            // Engine_SimCallbackNode_ctor @ 0x429130 ([1]=[2]=0);
+            // PE then *link = Type53_NeighborLink_vtbl @ 0x5F14F8 —
+            // host skips PE vtbl (no invent).
+            link[1] = 0;
+            link[2] = 0;
+            link[3] = static_cast<std::uint32_t>(
+                reinterpret_cast<std::uintptr_t>(slot));  // +0xC
+            ++slot[46];                                   // +0xB8
+            link[4] = mgr[52];  // gen @ mgr+0xD0 — PE @ 0x4B379F
+
+            // Splice into other neighbor list — PE @ 0x4B37C8
+            type53_neighbor_list_lazy(cur);
+            auto* tail = reinterpret_cast<std::uint32_t*>(
+                static_cast<std::uintptr_t>(cur[44]));
+            if (!tail) tail = &cur[42];
+            tail[1] = static_cast<std::uint32_t>(
+                reinterpret_cast<std::uintptr_t>(link));
+            link[2] = static_cast<std::uint32_t>(
+                reinterpret_cast<std::uintptr_t>(tail));
+            link[1] = static_cast<std::uint32_t>(
+                reinterpret_cast<std::uintptr_t>(&cur[42]));
+            cur[44] = static_cast<std::uint32_t>(
+                reinterpret_cast<std::uintptr_t>(link));
+            ++cur[45];  // +0xB4
+
+            // PE @ 0x4B37EC: bit8+bit16 → promote @ 0x4B3AC0; else clear bit8
+            const std::uint32_t fl = slot[7];
+            if ((fl & 8u) != 0) {
+              if ((fl & 0x10u) != 0)
+                type53_promote_slot_on_link(mgr, slot);
+              else
+                slot[7] = fl & 0xFFFFFFF7u;
+            }
+            // ResourceEngine sub_537240 @ 0x537240 OOS
+          }
+        }
+      }
+    }
+    cur = next;
+  }
+}
+
+}  // namespace
+
+std::mutex g_gr_mu;
 std::unordered_map<InvObject*, GameRefState> g_refs;
-InvObject* g_vehicle_types = nullptr;  // Vector of created VehicleType hosts
-
-struct GroundTrafficState {
-  int32_t traffic_count = 0;
-  int32_t traffic_streams = 0;
-  int32_t next_car_id = 1;
-  float ped_density = 0.f;
-  float ped_density_hi = 0.f;
-  int32_t ped_types = 0;
-  int32_t path_spawns = 0;
-  std::vector<int32_t> car_ids;
-  std::unordered_map<int32_t, InvObject*> cars_by_id;
-  // PE addTrafficN @ 0x00484050: one GameRef alias "traffic_car" per call
-  // (params "0,-10000,0,0,0,0") plus Traffic_trySpawnOnRandomPath @ 0x0057B420.
-  std::vector<InvObject*> traffic_cars;
-  // Phase 2.84 — water / halt / ped distance.
-  float water_level = 0.f;
-  float water_density = 0.f;
-  float water_viscosity = 0.f;
-  float water_px = 0, water_py = 0, water_pz = 0;
-  float water_nx = 0, water_ny = 1.f, water_nz = 0;
-  bool water_plane = false;
-  // PE addWaterLimit @ 0x00486920 stack defaults before vm_get_float_field:
-  // point=(0,-12,0) normal=(0,1,0) — same as setWater(FFF) @ 0x004866C0.
-  struct WaterLimit {
-    float px = 0, py = -12.f, pz = 0;
-    float nx = 0, ny = 1.f, nz = 0;
-  };
-  std::vector<WaterLimit> water_limits;
-  std::unordered_map<int32_t, int32_t> car_behaviour;
-  struct HaltCross {
-    float x = 0, y = 0, z = 0;
-    float time = 0;
-  };
-  std::vector<HaltCross> halt_crosses;
-  struct HaltPath {
-    float x1 = 0, y1 = 0, z1 = 0;
-    float x2 = 0, y2 = 0, z2 = 0;
-  };
-  std::vector<HaltPath> halt_paths;
-  struct PedSample {
-    int32_t type_id = 0;
-    float x = 0, y = 0, z = 0;
-  };
-  std::vector<PedSample> ped_samples;
-};
+InvObject* g_vehicle_types = nullptr;
 std::unordered_map<InvObject*, GroundTrafficState> g_grounds;
-
 GameRefState& ref(InvObject* self) { return g_refs[self]; }
 GroundTrafficState& ground(InvObject* self) { return g_grounds[self]; }
 
-void ground_sync_fields(InvObject* self) {
-  if (!self) return;
-  GroundTrafficState& g = ground(self);
-  tree_field_set_int(self, "traffic_count", g.traffic_count);
-  tree_field_set_int(self, "traffic_streams", g.traffic_streams);
-  tree_field_set_float(self, "pedestrian_density", g.ped_density);
-  tree_field_set_float(self, "pedestrian_density_hi", g.ped_density_hi);
-  tree_field_set_int(self, "pedestrian_types", g.ped_types);
-  tree_field_set_int(self, "path_spawns", g.path_spawns);
-  tree_field_set_float(self, "water_level", g.water_level);
-  tree_field_set_float(self, "water_density", g.water_density);
-  tree_field_set_float(self, "water_viscosity", g.water_viscosity);
-  tree_field_set_int(self, "water_plane", g.water_plane ? 1 : 0);
-  tree_field_set_int(self, "water_limits",
-                     static_cast<int32_t>(g.water_limits.size()));
-  tree_field_set_int(self, "halt_crosses",
-                     static_cast<int32_t>(g.halt_crosses.size()));
-  tree_field_set_int(self, "halt_paths",
-                     static_cast<int32_t>(g.halt_paths.size()));
+void* type53_ensure_handle_slot(void* mgr_raw, void* child_handle,
+                                int32_t a3) {
+  if (!mgr_raw || !child_handle) return nullptr;
+  auto* hb = reinterpret_cast<unsigned char*>(child_handle);
+  // PE: *(handle+0xC) node; type at node+0x4C must be 1.
+  void* node = *reinterpret_cast<void**>(hb + 0xC);
+  if (!node) return nullptr;
+  auto* nb = reinterpret_cast<unsigned char*>(node);
+  if (*reinterpret_cast<int32_t*>(nb + 0x4C) != 1) return nullptr;
+  // PE @ 0x4B3F0F: (node+0x64)&1 && node[+0xC8] != mgr[+8] → null.
+  if ((nb[0x64] & 1) != 0 &&
+      *reinterpret_cast<std::uint32_t*>(nb + 0xC8) !=
+          *reinterpret_cast<std::uint32_t*>(reinterpret_cast<unsigned char*>(
+                                               mgr_raw) +
+                                           8))
+    return nullptr;
+
+  auto* mgr = reinterpret_cast<std::uint32_t*>(mgr_raw);
+  type53_mgr_lazy_init(mgr);
+
+  const std::uint32_t h8 = *reinterpret_cast<std::uint32_t*>(hb + 8);
+  // Host uniqueness: PE key is handle[+8]; alive=1 collides — prefer handle addr.
+  const std::uint32_t key =
+      (h8 != 0 && h8 != 1)
+          ? h8
+          : static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(
+                child_handle));
+
+  void* a3p = reinterpret_cast<void*>(
+      static_cast<std::uintptr_t>(static_cast<std::uint32_t>(a3)));
+
+  std::uint32_t* result = nullptr;
+  Type53FoundList found = Type53FoundList::None;
+  // List A @ mgr+0x2C (this+11) — PE @ 0x4B3F30
+  result = type53_slot_walk(type53_sim_list_head(mgr + 11), key, node);
+  if (result) {
+    found = Type53FoundList::A;
+  } else {
+    // List B @ mgr+0x10 (this+4) — PE @ 0x4B3FE2
+    result = type53_slot_walk(type53_sim_list_head(mgr + 4), key, node);
+    if (result) {
+      found = Type53FoundList::B;
+    } else {
+      // List C: start at sentinel mgr[20] if its next != 0 — PE @ 0x4B4010
+      auto* sent = reinterpret_cast<std::uint32_t*>(
+          static_cast<std::uintptr_t>(mgr[20]));
+      if (sent && sent[1] != 0)
+        result = type53_slot_walk(sent, key, node);
+      if (result) found = Type53FoundList::C;
+    }
+  }
+  if (result) {
+    // List A/C retarget; list B returns as-is (PE no post-walk).
+    if (found == Type53FoundList::A || found == Type53FoundList::C)
+      type53_slot_retarget_a3(result, a3p);
+    if (found == Type53FoundList::C) type53_list_c_promote(mgr, result);
+    return result;
+  }
+
+  // LABEL_38: Engine_malloc(200) @ 0x4B403A
+  auto* slot = static_cast<std::uint32_t*>(std::calloc(1, 200));
+  if (!slot) return nullptr;
+  g_type53_owned_slots.push_back(slot);
+  // Minimal ctor (vtbl/sub_4B5B20 loops omitted — no invent PE vtables).
+  // ResHandle_Rebind stand-in @ v9+3: owner node at +0xC of ResHandle =
+  // slot[+0x18]; key at slot[+0x14] (= Rebind copies node[+0x50]).
+  *reinterpret_cast<std::uint32_t*>(nb + 0x50) = key;
+  slot[5] = key;                                      // +0x14
+  slot[6] = static_cast<std::uint32_t>(               // +0x18 owner node
+      reinterpret_cast<std::uintptr_t>(node));
+  slot[7] = 0;
+  slot[11] = 4;
+  slot[16] = 5;
+  slot[21] = 6;
+  slot[26] = 8;
+  slot[31] = 9;
+  slot[36] = 10;
+  slot[45] = slot[46] = slot[47] = slot[49] = 0;
+  if (a3p) {
+    auto* a3b = reinterpret_cast<unsigned char*>(a3p);
+    slot[49] = static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(a3b));
+    ++(*reinterpret_cast<std::uint32_t*>(a3b + 188));
+    slot[7] |= *reinterpret_cast<std::uint32_t*>(a3b + 28) & 0x20u;
+  }
+  slot[48] = mgr[52] ? (mgr[52] - 1) : 0;
+  // Insert at mgr insert-list: sentinel &mgr[15], tail mgr[17] @ 0x4B420C.
+  auto* old_tail = reinterpret_cast<std::uint32_t*>(
+      static_cast<std::uintptr_t>(mgr[17]));
+  if (!old_tail) old_tail = &mgr[15];
+  old_tail[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(slot));  // old_tail.next = slot
+  slot[2] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(old_tail));  // slot.prev
+  slot[1] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(&mgr[15]));  // slot.next = sentinel
+  mgr[17] = static_cast<std::uint32_t>(
+      reinterpret_cast<std::uintptr_t>(slot));
+  ++mgr[47];
+  // PE @ 0x4B422F Type53_insertSpatialBounds(mgr,slot,a3) — consume AABB.
+  // @ 0x4B4237 Type53_linkNearbySlots(mgr,slot) — W22C+W23C promote.
+  // W24C: no PE owner AABB write before these calls (a3==0 on setParent).
+  // EnsureActiveSlot@4B3C40 also insert→linkNearbyFromListA→linkNearby.
+  type53_insert_spatial_bounds(mgr, slot, a3p);
+  type53_link_nearby_slots(mgr, slot);
+  return slot;
 }
+
+
+
+// PE GameRef_handleAttachUnderParent @ 0x00429C80: splice *(block+0xC) under
+// parent_inner +0x30/+0x38. mid_block is Native.ptr (host) or phys block.
+void gameref_handle_attach_under_parent(void* mid_block, InvObject* parent) {
+  if (!mid_block || !parent) return;
+  auto* block = reinterpret_cast<unsigned char*>(mid_block);
+  void* child_inner = *reinterpret_cast<void**>(block + 0xC);
+  void* parent_inner = native_ptr_node(parent);
+  HostNativeHandle* parent_h = native_ptr_get(parent);
+  if (!child_inner || !parent_inner || !parent_h) return;
+  if (*reinterpret_cast<int32_t*>(reinterpret_cast<unsigned char*>(parent_h) +
+                                  8) == 0)
+    return;
+  auto* ci = reinterpret_cast<unsigned char*>(child_inner);
+  auto* pi = reinterpret_cast<unsigned char*>(parent_inner);
+  // Already under this parent: PE compares parent handle to *(+0x14)+0x50.
+  void* cur = *reinterpret_cast<void**>(ci + 0x14);
+  if (cur) {
+    void* back = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(cur) +
+                                           0x50);
+    if (back == parent_h) return;
+  }
+  // Unlink if both next/prev set (PE inline, same as dllist).
+  void* next = *reinterpret_cast<void**>(ci + 0x4);
+  void* prev = *reinterpret_cast<void**>(ci + 0x8);
+  if (next && prev) {
+    *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(next) + 0x8) =
+        prev;
+    *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(prev) + 0x4) =
+        next;
+  }
+  *reinterpret_cast<void**>(ci + 0x4) = nullptr;
+  *reinterpret_cast<void**>(ci + 0x8) = nullptr;
+  *reinterpret_cast<void**>(ci + 0x14) = parent_inner;
+  *reinterpret_cast<void**>(pi + 0x50) = parent_h;  // inner back-ref
+  void* sent = pi + 0x30;
+  void** tailp = reinterpret_cast<void**>(pi + 0x38);
+  if (*tailp == nullptr) *tailp = sent;  // empty → sentinel
+  void* old_tail = *tailp;
+  *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(old_tail) + 0x4) =
+      child_inner;
+  *reinterpret_cast<void**>(ci + 0x4) = sent;
+  *reinterpret_cast<void**>(ci + 0x8) = old_tail;
+  *tailp = child_inner;
+}
+
+// PE GameRef_setParent_inner @ 0x0048ABA0 on a handle-shaped this.
+// CameraCtrl @ 0x4385A2: this = mid_block+0x30. Types 2/3 → dllist via
+// handleAttach shape (handle+0xC = node). Type 1 nest attach not recursed.
+void gameref_set_parent_inner_handle(void* handle, InvObject* parent) {
+  if (!handle || !parent) return;
+  auto* hb = reinterpret_cast<unsigned char*>(handle);
+  void* node = *reinterpret_cast<void**>(hb + 0xC);
+  if (!node) return;
+  const int32_t ty =
+      *reinterpret_cast<int32_t*>(reinterpret_cast<unsigned char*>(node) + 0x4C);
+  if (ty == 2 || ty == 3) {
+    gameref_handle_attach_under_parent(handle, parent);
+  }
+  // type 1 / other: PE may nest further — host stops (no invent).
+}
+
+void gameref_list_unlink(InvObject* child) {
+  if (!child) return;
+  auto it = g_refs.find(child);
+  if (it == g_refs.end()) return;
+  GameRefState& cs = it->second;
+  InvObject* p = cs.parent;
+  InvObject* next = cs.sib_next;
+  InvObject* prev = cs.sib_prev;
+  // PE GameRef_dllist_unlink @ 0x004A5D00: if prev!=0 && next!=0:
+  //   [next+8]=prev; [prev+4]=next; then clear this+4/+8.
+  // Linked nodes always have both (sibling or &sentinel). Writing
+  // sentinel+8 / sentinel+4 updates parent+0x38 / +0x34 (tail/head).
+  if (p && next && prev) {
+    const bool next_sent = (next == p);
+    const bool prev_sent = (prev == p);
+    auto pit = g_refs.find(p);
+    if (!next_sent) {
+      auto nit = g_refs.find(next);
+      if (nit != g_refs.end()) nit->second.sib_prev = prev;
+    } else if (pit != g_refs.end()) {
+      pit->second.child_list_tail = prev_sent ? nullptr : prev;
+    }
+    if (!prev_sent) {
+      auto qit = g_refs.find(prev);
+      if (qit != g_refs.end()) qit->second.sib_next = next;
+    } else if (pit != g_refs.end()) {
+      pit->second.child_list_head = next_sent ? nullptr : next;
+    }
+  }
+  cs.parent = nullptr;
+  cs.sib_next = nullptr;
+  cs.sib_prev = nullptr;
+}
+
+// Caller must hold g_gr_mu. Same-parent → no-op (PE early return 1 @ 0x48AC57).
+void gameref_list_link(InvObject* child, InvObject* parent) {
+  if (!child || !parent) return;
+  auto& cs = ref(child);
+  if (cs.parent == parent) return;
+  gameref_list_unlink(child);
+  auto& ps = ref(parent);
+  InvObject* old_tail = ps.child_list_tail;
+  // PE @ 0x48AC6A-0x48AC96: zero +0x14 → GameRef_dllist_unlink → restore
+  // +0x14; [old_tail+4]=child; child+8=old_tail; child+4=&parent+0x30;
+  // parent+0x38=child. Empty list: old_tail was sentinel → first.prev=sent.
+  cs.parent = parent;
+  cs.sib_next = parent;  // → &parent+0x30
+  if (old_tail) {
+    cs.sib_prev = old_tail;
+    auto tit = g_refs.find(old_tail);
+    if (tit != g_refs.end()) tit->second.sib_next = child;
+  } else {
+    cs.sib_prev = parent;  // first: prev also → sentinel
+    ps.child_list_head = child;
+  }
+  ps.child_list_tail = child;
+  // PE @ 0x48AC19: parent WT node *(+0xCC)+0x54 |= 0x40000 (dirty).
+  constexpr int32_t kWtParentDirty = 0x40000;
+  ps.flags |= kWtParentDirty;
+}
+
+// PE GameRef_worldTreeLink @ 0x00544F40 (thiscall ecx=inner, a2=handle):
+// WT node at inner+0xC0 into list at *(handle+0xC)+0x48. setFlags: owner=self.
+// Hold g_gr_mu.
+void gameref_world_tree_link(InvObject* self) {
+  if (!self) return;
+  auto& r = ref(self);
+  // setFlags path: a2=handle → owner=*(handle+0xC)=self.
+  InvObject* owner = self;
+  // PE: if *(inner+0xCC) == owner already linked → skip.
+  if (r.wt_owner == owner) return;
+  // Unlink from prior owner list (PE 0x544F5A-0x544F83).
+  if (r.wt_owner) {
+    auto oit = g_refs.find(r.wt_owner);
+    if (oit != g_refs.end()) {
+      GameRefState& os = oit->second;
+      // PE: if node.next≠0 → next.prev=prev; else owner+0x48=prev (head).
+      if (r.wt_next) {
+        auto nit = g_refs.find(r.wt_next);
+        if (nit != g_refs.end()) nit->second.wt_prev = r.wt_prev;
+      } else if (os.wt_list_head == self) {
+        os.wt_list_head = r.wt_prev;
+      }
+      if (r.wt_prev) {
+        auto pit = g_refs.find(r.wt_prev);
+        if (pit != g_refs.end()) pit->second.wt_next = r.wt_next;
+      }
+    }
+    r.wt_next = nullptr;
+    r.wt_prev = nullptr;
+    r.wt_owner = nullptr;
+    r.wt_aux = nullptr;
+    r.worldtree_root = false;
+  }
+  // Insert at head (PE 0x544F8A-0x544FAF): next=0, prev=old_head,
+  // old_head.next=new, owner+0x48=new, node+0xCC=owner,
+  // node+0xC8=*(owner+0x50) (host: wt_list_aux).
+  auto& os = ref(owner);
+  InvObject* old_head = os.wt_list_head;
+  if (old_head) {
+    auto hit = g_refs.find(old_head);
+    if (hit != g_refs.end()) hit->second.wt_next = self;
+  }
+  r.wt_next = nullptr;
+  r.wt_prev = old_head;
+  os.wt_list_head = self;
+  r.wt_owner = owner;
+  r.wt_aux = os.wt_list_aux;  // PE *(owner+0x50)
+  r.worldtree_root = true;
+}
+
+
+// ground_sync_fields → GroundRef_traffic.cpp
 
 std::string script_fqn_for_entry(const RpakEntry* e) {
   if (!e || e->name.empty()) return {};
@@ -148,10 +1189,14 @@ void bind_gameref(InvObject* o, InvObject* parent, const std::string& fqn,
                   const char* alias) {
   auto& rs = ref(o);
   rs.empty = false;
-  rs.parent = parent;
   rs.script = o;
   rs.script_class = fqn;
   rs.script_alias = alias ? alias : "";
+  // Caller holds g_gr_mu (create / traffic smoke). Keep +0x30/+0x38 stand-in.
+  if (parent)
+    gameref_list_link(o, parent);
+  else
+    gameref_list_unlink(o);
 }
 
 // Stock create params: "px,py,pz,oy,op,or" (metres + YPR radians; spaces OK).
@@ -178,27 +1223,138 @@ void apply_instance_pose(InvObject* o, const float pose[6]) {
       ypr_new(pose[3], pose[4], pose[5]));
   InvObject* parent = nullptr;
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     parent = ref(o).parent;
   }
   if (parent) java_util_resource_GameRef_setParent(o, parent);
 }
 
-}  // namespace
 
 InvObject* gameref_new() {
   auto* o = reinterpret_cast<InvObject*>(new InvString{nullptr});
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     g_refs[o] = GameRefState{};
   }
   resref_ensure(o);
   return o;
 }
 
+// W10A — PE *[phys+0xDC] walk export (forceUpdate_apply @ 0x4485C9).
+void* gameref_phys_dc_head(InvObject* gameref) {
+  if (!gameref) return nullptr;
+  std::lock_guard<std::mutex> lock(g_gr_mu);
+  auto it = g_refs.find(gameref);
+  if (it == g_refs.end()) return nullptr;
+  auto& st = it->second;
+  if (!st.phys_dc_sent) return nullptr;
+  // PE: head=*[phys+0xDC]; start=*(head+4)!=0 ? head : 0.
+  // Host circular sent→first; expose first live node (part!=null).
+  auto* n = st.phys_dc_sent->next;
+  if (!n || !n->part) return nullptr;
+  return n;
+}
+
+void* gameref_phys_dc_next(void* node) {
+  if (!node) return nullptr;
+  auto* n = static_cast<GameRefState::PePhysDcNode*>(node);
+  auto* nxt = n->next;
+  // PE stop: next==0 || *(next+4)==0 (sentinel next stays 0 after insert).
+  // Host sentinel: part==nullptr.
+  if (!nxt || !nxt->part) return nullptr;
+  return nxt;
+}
+
+int32_t gameref_phys_dc_part_id(void* node) {
+  if (!node) return 0;
+  return static_cast<GameRefState::PePhysDcNode*>(node)->match_key;
+}
+
+InvObject* gameref_phys_dc_child(void* node) {
+  if (!node) return nullptr;
+  return static_cast<GameRefState::PePhysDcNode*>(node)->part;
+}
+
+int32_t gameref_phys_dc_count(InvObject* gameref) {
+  if (!gameref) return 0;
+  std::lock_guard<std::mutex> lock(g_gr_mu);
+  auto it = g_refs.find(gameref);
+  if (it == g_refs.end()) return 0;
+  return static_cast<int32_t>(it->second.phys_dc_nodes.size());
+}
+
+// PE GameRef_findCamIndexByMatchId @ 0x448D10 (W12A).
+// this+0x177C = count; walk chassis_blob+0x128+idx*0x4A8 == match_id;
+// wrap with step; full lap → -1. Host: GameRefState.cam_rows[].match_id;
+// count = chassis_cam_count (+0x177C stand-in).
+static int32_t find_cam_index_by_match_id_unlocked(GameRefState& r, int32_t count,
+                                                  int32_t match_id,
+                                                  int32_t start_idx,
+                                                  int32_t step) {
+  if (count <= 0) return -1;
+  if (count > GameRefState::kCamTableMax) count = GameRefState::kCamTableMax;
+  int32_t result = start_idx;
+  if (start_idx < count) {
+    if (start_idx < 0) result = count - 1;
+  } else {
+    result = 0;
+  }
+  const int32_t begin = result;
+  for (;;) {
+    if (r.cam_rows[static_cast<size_t>(result)].match_id == match_id)
+      return result;
+    result += step;
+    if (result < count) {
+      if (result < 0) result = count - 1;
+    } else {
+      result = 0;
+    }
+    if (result == begin) return -1;
+  }
+}
+
+static int32_t cam_table_count_for(InvObject* self, InvObject* chassis) {
+  InvObject* ch = chassis ? chassis : self;
+  if (!ch && !self) return 0;
+  int32_t n = ch ? chassis_cam_count(ch) : 0;
+  if (n <= 0 && ch) n = tree_field_get_int(ch, "camera_count");
+  if (n <= 0 && self) n = tree_field_get_int(self, "camera_count");
+  // PE Chassis_allocCamBlob always constructs 4 cam entries (@ 0x44a295);
+  // +0x177C live count inits 0 @ 0x446948. Host: walk all 4 when live
+  // count unset so findCam(0) free-slot (activate @ 0x4591E0) works.
+  if (n <= 0) n = GameRefState::kCamTableMax;
+  if (n > GameRefState::kCamTableMax) n = GameRefState::kCamTableMax;
+  return n;
+}
+
+static void cam_rows_tree_sync(InvObject* self, GameRefState& r, int32_t count) {
+  if (!self) return;
+  tree_field_set_int(self, "cam_table_count", count);
+  for (int32_t i = 0; i < GameRefState::kCamTableMax; ++i) {
+    char key[32];
+    std::snprintf(key, sizeof(key), "cam_%d_match_id", i);
+    tree_field_set_int(self, key, r.cam_rows[static_cast<size_t>(i)].match_id);
+    std::snprintf(key, sizeof(key), "cam_%d_osd_bound", i);
+    tree_field_set_int(self, key,
+                       r.cam_rows[static_cast<size_t>(i)].osd_bound_id);
+  }
+}
+
+int32_t gameref_find_cam_index_by_match_id(InvObject* gameref, int32_t match_id,
+                                           int32_t start_idx, int32_t step) {
+  if (!gameref) return -1;
+  InvObject* chassis = tree_field_get_obj(gameref, "chassis");
+  if (!chassis) chassis = gameref;
+  chassis_cam_tables_ensure(chassis);
+  const int32_t count = cam_table_count_for(gameref, chassis);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
+  return find_cam_index_by_match_id_unlocked(ref(gameref), count, match_id,
+                                             start_idx, step);
+}
+
 void gameref_on_res_bound(InvObject* self) {
   if (!self) return;
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
   auto it = g_refs.find(self);
   if (it != g_refs.end()) it->second.empty = false;
 }
@@ -225,886 +1381,38 @@ void gameref_on_destroy(InvObject* self) {
   tree_field_set_obj(self, "part_parent", nullptr);
   tree_field_set_int(self, "part_parent_slot", 0);
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    // Drop from parent +0x30/+0x38 dllist before erase (PE unlink).
+    gameref_list_unlink(self);
+    // Orphan children via +0x38 tail walk (PE ResHandle teardown elsewhere).
+    auto it = g_refs.find(self);
+    if (it != g_refs.end()) {
+      InvObject* c = it->second.child_list_tail;
+      while (c && c != self) {
+        auto cit = g_refs.find(c);
+        if (cit == g_refs.end()) break;
+        InvObject* prev = cit->second.sib_prev;
+        cit->second.parent = nullptr;
+        cit->second.sib_next = nullptr;
+        cit->second.sib_prev = nullptr;
+        // PE sentinel stand-in: prev==self means end of +0x38 walk.
+        c = (prev == self) ? nullptr : prev;
+      }
+      it->second.child_list_tail = nullptr;
+      it->second.child_list_head = nullptr;
+    }
     g_refs.erase(self);
   }
 }
 
-InvObject* java_util_resource_GameRef_create(InvObject* self, InvObject* parent,
-                                             InvObject* type, InvObject* params,
-                                             InvObject* alias) {
-  // PE @ 0x0047D7B0 size 0x147 (327). JNI
-  // (LGameRef;LGameRef;Ljava/lang/String;Ljava/lang/String;)LGameType;.
-  // UnboxArg @ 0x0045D910: dest0=this, dest1=parent (overwrites CallInfo),
-  // dest2=type, dest3=params, dest4=alias. Native.ptr via dword_62E008
-  // (JVM_vm_get_int_field @ 0x0042AB50). handle==0 → "!"+"Mighty ERROR"
-  // (CRT_strcat_n_thunk + Engine_ErrorLogPrintf) return 0.
-  // parent==null → g_WorldTreeRoot @ 0x636460; require parent[+0xC]!=0 else
-  // silent return 0. Factory Engine_CreateGameInstance @ 0x53A5E0
-  // (parent, type, params, alias) — NOT create_native's
-  // Engine_CreateGameInstanceNative @ 0x53A2A0. Factory RESTYPE: if type
-  // RID (handle+8)!=0 and (inner==0 || [inner+0x4C]!=RESTYPE_GAME=8) →
-  // Fatal "create: Wrong GameType!". Alias null → strncpy "_gameinst" (31).
-  // Params passed to GameType ctor (vtbl+0xC), not parsed in this native.
-  // Relink: if handle[+0xC]!=new_inst → ResHandle_Unlink old; inline
-  // ResHandle_Link at inst+0x44/+0x48; handle+8=inst+0x50. handle[+0xC]==0
-  // → 0. Else sub_419860(inst, 0x80000000, 1.0f=0x3F800000, 0, 0); null→0;
-  // return *[eax+0x50] Java GameType (null→0).
-  // Host: !self = handle 0. No PE blob / ResHandle / sub_419860 /
-  // THRD-CREATE/sub_404E20. Soft RESTYPE only when R(type).type known
-  // non-zero and !=8 (PE would Fatal). Null parent = world-root stand-in.
-  // Return = script GameType stand-in (VT host or bound GameRef); pose
-  // parse is factory/ctor stand-in.
-  if (!self) return nullptr;
 
-  const int32_t type_id =
-      type ? java_util_resource_ResourceRef_id(type) : 0;
-  // PE Fatal "create: Wrong GameType!" when type RID bound and
-  // [inner+0x4C]!=RESTYPE_GAME=8. Host ResourceRef_type is often a non-8
-  // stand-in for cars/traffic — never soft-null on that (breaks addTrafficP).
+// → GameRef_core.cpp (GameRef_core create..clearFlags)
 
-  const RpakEntry* ent = type_id ? rpak_find_entry(type_id) : nullptr;
-  // PE null alias → "_gameinst"; host keeps empty for VehicleType detect.
-  const char* alias_cstr = alias ? string_cstr(alias) : "";
-  const std::string fqn = script_fqn_for_entry(ent);
-  const bool want_vt =
-      (alias_cstr && std::strstr(alias_cstr, "VehicleType")) ||
-      (!fqn.empty() && fqn.size() >= 3 &&
-       fqn.compare(fqn.size() - 3, 3, "_VT") == 0);
 
-  float pose[6] = {};
-  const bool have_pose =
-      parse_instance_params(params ? string_cstr(params) : nullptr, pose);
+// → GameRef_core.cpp (GameRef_core soft+fwd)
 
-  auto finish_create = [&](InvObject* inst) {
-    // Phase 2.59: world-tree parent → getParentID (Part.addPart install check).
-    // PE null parent already resolved to g_WorldTreeRoot before factory.
-    if (parent) {
-      java_util_resource_GameRef_setParent(inst, parent);
-      if (self != inst) java_util_resource_GameRef_setParent(self, parent);
-    }
-    if (have_pose) apply_instance_pose(inst, pose);
-  };
 
-  InvObject* inst = nullptr;
-  if (want_vt && !fqn.empty()) {
-    // Stand-in for factory GameType ctor + return *[sub_419860+0x50].
-    inst = make_vt_host(fqn.c_str());
-    java_util_resource_ResourceRef_set(inst, type_id);
-    java_util_resource_ResourceRef_set(self, type_id);
-    if (type) {
-      java_util_resource_RenderRef_setType(inst, type);
-      if (self != inst) java_util_resource_RenderRef_setType(self, type);
-    }
-    {
-      std::lock_guard<std::mutex> lock(g_mu);
-      bind_gameref(inst, parent, fqn, alias_cstr);
-      bind_gameref(self, parent, fqn, alias_cstr);
-      ref(self).script = inst;  // PE handle+8 = inst+0x50 GameType*
-    }
-    if (Jvm* j = jvm_active()) {
-      if (!j->find_class(fqn.c_str())) j->load_class(fqn.c_str());
-      j->invoke(fqn.c_str(), "<init>", "(I)V",
-                {JvmValue::make_obj(inst), JvmValue::make_int(type_id)}, false);
-    }
-    finish_create(inst);
-    return inst;
-  }
-
-  // Generic GameRef bind (non-scripted / unknown alias).
-  // PE still returns GameType* at +0x50; host returns bound GameRef as
-  // script stand-in (no separate THRD-CREATE object).
-  inst = gameref_new();
-  java_util_resource_ResourceRef_set(inst, type_id);
-  java_util_resource_ResourceRef_set(self, type_id);
-  // Keep type_id distinct from instance id for GII_TYPE (Phase 2.96).
-  if (type) {
-    java_util_resource_RenderRef_setType(inst, type);
-    if (self != inst) java_util_resource_RenderRef_setType(self, type);
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    bind_gameref(inst, parent, fqn, alias_cstr);
-    bind_gameref(self, parent, fqn, alias_cstr);
-    ref(self).script = inst;
-  }
-  finish_create(inst);
-  return inst;
-}
-
-void java_util_resource_GameRef_create_native(InvObject* self, InvObject* parent,
-                                              InvObject* type, InvObject* params,
-                                              InvObject* alias) {
-  // PE @ 0x0047D900 size 0x129. JNI
-  // (LGameRef;LGameRef;Ljava/lang/String;Ljava/lang/String;)V.
-  // Unbox this+parent+type+params+alias; handle via dword_62E008
-  // (0x62E008). handle==0 → Mighty ERROR ("!"+"Mighty ERROR").
-  // parent null → g_WorldTreeRoot @ 0x636460; require parent[+0xC]!=0 else
-  // silent ret. Factory Engine_CreateGameInstanceNative @ 0x53A2A0
-  // (parent, type, script=0, params, alias) — NOT create's
-  // Engine_CreateGameInstance @ 0x53A5E0. Relink: inline unlink old,
-  // ResHandle_Link(inst+0x44), handle+8=inst+0x50. VOID: no sub_419860,
-  // no Java GameType (THRD-CREATE/sub_404E20 skipped). Sibling
-  // GameType.createNativeInstance @ 0x481A70. Stand-in: bind self only,
-  // script slot stays null; no alias to create @ 0x0047D7B0.
-  if (!self) return;
-  const int32_t type_id =
-      type ? java_util_resource_ResourceRef_id(type) : 0;
-  // PE factory requires type RID (handle+8)!=0; else returns null / clears.
-  if (!type_id) return;
-
-  const char* alias_cstr = alias ? string_cstr(alias) : "";
-  float pose[6] = {};
-  const bool have_pose =
-      parse_instance_params(params ? string_cstr(params) : nullptr, pose);
-
-  java_util_resource_ResourceRef_set(self, type_id);
-  if (type) java_util_resource_RenderRef_setType(self, type);
-
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    auto& rs = ref(self);
-    rs.empty = false;
-    // PE null parent → g_WorldTreeRoot; host has no PE object — nullptr.
-    rs.parent = parent;
-    rs.script = nullptr;  // factory a3=0 → body+0x50 / handle+8
-    rs.script_class.clear();
-    rs.script_alias = alias_cstr ? alias_cstr : "";
-  }
-
-  if (have_pose) apply_instance_pose(self, pose);
-  if (parent) java_util_resource_GameRef_setParent(self, parent);
-}
-
-int32_t game_logic_init_vehicle_types() {
-  const RpakPack* cars = rpak_find_by_name("cars");
-  if (!cars) {
-    const int32_t opened = java_lang_System_openLib(string_new("cars.rpk"));
-    if (!opened) return 0;
-  }
-  const RpakPack* cars2 = rpak_find_by_name("cars");
-  if (!cars2) return 0;
-  const int32_t root_id = rpak_make_id(cars2->pack_id, 0x1000);
-
-  InvObject* root = resref_new();
-  java_util_resource_ResourceRef_set(root, root_id);
-
-  std::vector<InvObject*> kids;
-  for (InvObject* c = java_util_resource_ResourceRef_getFirstChild(root); c;
-       c = java_util_resource_ResourceRef_getNextChild(c)) {
-    kids.push_back(c);
-  }
-
-  InvObject* vts = tree_vector_new();
-  Jvm* j = jvm_active();
-  // Match Java: for (i = ct.length-1; i >= 0; i--)
-  for (int i = static_cast<int>(kids.size()) - 1; i >= 0; --i) {
-    InvObject* xa = gameref_new();
-    InvObject* vt = java_util_resource_GameRef_create(
-        xa, nullptr, kids[static_cast<size_t>(i)], nullptr,
-        string_new("VehicleType"));
-    if (!vt) continue;
-    if (j) {
-      const char* cn = tree_host_class(vt);
-      if (!cn || !cn[0]) cn = "java.game.VehicleType";
-      j->invoke(cn, "init", "()V", {JvmValue::make_obj(vt)}, false);
-    }
-    tree_vector_add(vts, vt);
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    g_vehicle_types = vts;
-  }
-  return tree_vector_size(vts);
-}
-
-InvObject* game_logic_vehicle_types() {
-  std::lock_guard<std::mutex> lock(g_mu);
-  return g_vehicle_types;
-}
-
-namespace {
-
-InvObject* pick_weighted(InvObject* vec, int32_t set, bool models) {
-  if (!vec) return nullptr;
-  const int n = tree_vector_size(vec);
-  float gross = 0.f;
-  for (int i = n - 1; i >= 0; --i) {
-    InvObject* e = tree_vector_element_at(vec, i);
-    if (!e) continue;
-    const int32_t mask = tree_field_get_int(e, "vehicleSetMask");
-    if (!(set & mask)) continue;
-    gross += tree_field_get_float(e, "prevalence");
-  }
-  if (gross <= 0.f) return nullptr;
-  float target = gross * java_lang_Math_random();
-  float acc = 0.f;
-  InvObject* pick = nullptr;
-  for (int i = n - 1; i >= 0; --i) {
-    InvObject* e = tree_vector_element_at(vec, i);
-    if (!e) continue;
-    const int32_t mask = tree_field_get_int(e, "vehicleSetMask");
-    if (!(set & mask)) continue;
-    acc += tree_field_get_float(e, "prevalence");
-    if (acc > target) {
-      pick = e;
-      break;
-    }
-  }
-  (void)models;
-  return pick;
-}
-
-}  // namespace
-
-InvObject* game_logic_get_vehicle_type(int32_t set) {
-  return pick_weighted(game_logic_vehicle_types(), set, false);
-}
-
-InvObject* vehicle_type_get_vehicle_descriptor(InvObject* vt, int32_t set,
-                                               float param) {
-  if (!vt) return nullptr;
-  InvObject* vtdarr = tree_field_get_obj(vt, "vtdarr");
-  InvObject* vtd = pick_weighted(vtdarr, set, true);
-  if (!vtd) return nullptr;
-
-  InvObject* vd = tree_host_new("java.game.VehicleDescriptor");
-  const int32_t mid = tree_field_get_int(vtd, "id");
-  tree_field_set_int(vd, "id", mid);
-  tree_field_set_float(vd, "stockPrestige",
-                       tree_field_get_float(vtd, "stockPrestige"));
-  tree_field_set_float(vd, "fullPrestige",
-                       tree_field_get_float(vtd, "fullPrestige"));
-  tree_field_set_float(vd, "stockQM", tree_field_get_float(vtd, "stockQM"));
-  tree_field_set_float(vd, "fullQM", tree_field_get_float(vtd, "fullQM"));
-  const char* ns = "";
-  if (InvObject* name = tree_field_get_obj(vtd, "vehicleName")) {
-    ns = string_cstr(name);
-    tree_field_set_obj(vd, "vehicleName", string_new(ns ? ns : ""));
-  } else {
-    tree_field_set_obj(vd, "vehicleName", string_new("unknown"));
-  }
-
-  InvObject* model_colors = tree_field_get_obj(vtd, "preferredColorIndexes");
-  InvObject* type_colors = tree_field_get_obj(vt, "preferredColorIndexes");
-  const int m = tree_vector_size(model_colors);
-  const int t = tree_vector_size(type_colors);
-  InvObject* colorIndexes = nullptr;
-  if (tree_field_get_int(vtd, "exclusiveColors") && m > 0) {
-    colorIndexes = model_colors;
-  } else if (m > 0 || t > 0) {
-    if ((m + t) * java_lang_Math_random() < static_cast<float>(m))
-      colorIndexes = model_colors;
-    else
-      colorIndexes = type_colors;
-  }
-  if (colorIndexes && tree_vector_size(colorIndexes) > 0) {
-    const int idx = static_cast<int>(
-        java_lang_Math_random() *
-        static_cast<float>(tree_vector_size(colorIndexes)));
-    InvObject* boxed = tree_vector_element_at(colorIndexes, idx);
-    tree_field_set_int(vd, "colorIndex", tree_field_get_int(boxed, "value"));
-  }
-
-  const float minP = tree_field_get_float(vtd, "minPower");
-  const float maxP = tree_field_get_float(vtd, "maxPower");
-  const float minO = tree_field_get_float(vtd, "minOptical");
-  const float maxO = tree_field_get_float(vtd, "maxOptical");
-  const float minT = tree_field_get_float(vtd, "minTear");
-  const float maxT = tree_field_get_float(vtd, "maxTear");
-  const float minW = tree_field_get_float(vtd, "minWear");
-  const float maxW = tree_field_get_float(vtd, "maxWear");
-
-  if (param < 0.f) {
-    tree_field_set_float(vd, "power",
-                         minP + java_lang_Math_random() * (maxP - minP));
-    tree_field_set_float(vd, "optical",
-                         minO + java_lang_Math_random() * (maxO - minO));
-    tree_field_set_float(vd, "tear",
-                         minT + java_lang_Math_random() * (maxT - minT));
-    tree_field_set_float(vd, "wear",
-                         minW + java_lang_Math_random() * (maxW - minW));
-  } else {
-    if (param > 1.f) param = 1.f;
-    tree_field_set_float(vd, "power", minP + param * (maxP - minP));
-    tree_field_set_float(vd, "optical", minO + param * (maxO - minO));
-    tree_field_set_float(vd, "tear", minT + param * (maxT - minT));
-    tree_field_set_float(vd, "wear", minW + param * (maxW - minW));
-  }
-  return vd;
-}
-
-InvObject* game_logic_get_vehicle_descriptor(int32_t set, float param) {
-  InvObject* vt = game_logic_get_vehicle_type(set);
-  if (!vt) return nullptr;
-  return vehicle_type_get_vehicle_descriptor(vt, set, param);
-}
-
-int32_t java_util_resource_GameRef_getFlags(InvObject* self) {
-  // PE @ 0x0047DF40 size 0x36 (54): ()I. GameRef_getFlags.
-  // Unbox this (JVM_UnboxArg @ 0x0045D910). handle =
-  // JVM_vm_get_int_field(this, dword_62E008 @ 0x0042AB50). No handle==0 test
-  // (stock derefs [handle+0xC] unconditionally). NO Mighty ERROR (unlike
-  // getPos @ 0x0047DAD0). inner=*(handle+0xC) offset 12; inner==0 → 0 @
-  // loc_47DF72 (xor esi,esi). else return *(inner+0x54) offset 84. Sole
-  // callees: UnboxArg, vm_get_int_field (xref Natives_RegisterAll @ 0x4895AC).
-  // Host: GameRefState.flags; g_refs miss = inner 0; !self = unbox null.
-  if (!self) return 0;
-  std::lock_guard<std::mutex> lock(g_mu);
-  const auto it = g_refs.find(self);
-  if (it == g_refs.end()) return 0;  // inner==0 @ loc_47DF72
-  return it->second.flags;           // mov eax,[eax+54h] @ 0x47df6d
-}
-
-void java_util_resource_GameRef_setFlags(InvObject* self, int32_t flags) {
-  // PE @ 0x00486C80 size 0x45: Unbox this+I. Same walk: Native.ptr,
-  // inner=*(handle+0xC). inner==0 → return. else *(inner+0x54) |= flags.
-  // flags & 0x10 (WORLDTREEROOT) → sub_544F40(handle) world-tree splice
-  // (4 xrefs, not unique — not ported). Host: still |= ref.flags.
-  if (!self) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  ref(self).flags |= flags;
-}
-
-void java_util_resource_GameRef_clearFlags(InvObject* self, int32_t flags) {
-  // PE @ 0x00486CD0 size 0x3f: Unbox this+I. Same walk as getFlags.
-  // inner==0 → return. else *(inner+0x54) &= ~flags. No WORLDTREEROOT call.
-  if (!self) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  ref(self).flags &= ~flags;
-}
-
-InvObject* java_util_resource_GameRef_getPos(InvObject* self) {
-  // PE @ 0x0047DAD0: Unbox this only. Handle via dword_62E008.
-  // handle==0 → Mighty ERROR, return nullptr.
-  // *(handle+8)==0 → return nullptr (not Vector3 0,0,0).
-  // else sub_48B280 fills xyz, alloc java.lang.Vector3 (0x1C).
-  // Host: empty starts true; setMatrix/setPos/setState set empty=false.
-  // !self or empty==true → nullptr (uncreated / never posed).
-  // Posed at origin (0,0,0) with empty=false → still Vector3.
-  if (!self) return nullptr;
-  std::lock_guard<std::mutex> lock(g_mu);
-  auto& r = ref(self);
-  if (r.empty) return nullptr;
-  return vec3_new(r.px, r.py, r.pz);
-}
-
-InvObject* java_util_resource_GameRef_getOri(InvObject* self) {
-  // PE @ 0x0047DBE0: Unbox this. Handle 0 → Mighty ERROR + nullptr.
-  // NO handle+8 skip (unlike getPos @ 0x0047DAD0). Always alloc Ypr
-  // (0x1C) if handle≠0. GameRef_readOri @ 0x0048B300 then fields y/p/r.
-  // Host: !self → nullptr (handle 0 analogue). Empty still Ypr(0,0,0).
-  if (!self) return nullptr;
-  std::lock_guard<std::mutex> lock(g_mu);
-  auto& r = ref(self);
-  return ypr_new(r.oy, r.op, r.or_);
-}
-
-InvObject* java_util_resource_GameRef_getVel(InvObject* self) {
-  // PE @ 0x0047DCE0 size 0x101 (257) end ~0x47DDE0.
-  // GameRef.getVel()Ljava.lang.Vector3;
-  // Callees: JVM_UnboxArg @ 0x0045D910, JVM_vm_get_int_field @ 0x0042AB50
-  // (dword_62E008 Native.ptr), Engine_queryGameRefChannel @ 0x00426470
-  // (thiscall ecx=g_EngineState @ 0x636338; args handle, channel=3, out
-  // float[3]), Engine_malloc @ 0x0054F560 (0x1C), JVM_getClass /
-  // JVM_Instance_initialize, JVM_vm_set_float_field x/y/z, Mighty path
-  // CRT_strcat_n_thunk + Engine_ErrorLogPrintf.
-  // Flow: Unbox this. handle==0 → "!Mighty ERROR" + return nullptr (only
-  // null). NO [handle+8] early-out (getPos @ 0x0047DAD0 has one). Else
-  // always query channel 3 then always alloc java.lang.Vector3 — even if
-  // helper returns 0 without writing out ([handle+8]==0 @ 0x426479).
-  // Channel 3 = velocity (same push 3 as Vehicle.getSpeedSquare @
-  // 0x00480500). Do not rename Engine_queryGameRefChannel (164 xrefs).
-  // Host: !self → nullptr (handle-0 analogue, silent — no Mighty log).
-  // Empty / never setState → Vector3(0,0,0) from GameRefState vx (setMatrix
-  // zeros vx; setState restores linvel). City.createQuickRaceBot /
-  // Track.changeCamTV: vel.normalize() / if(vel) — empty must not be null.
-  // Gaps: Engine_queryGameRefChannel not ported (RESTYPE paths, sub_5447D0,
-  // vtbl+0xC / vtbl+0x3C live physics, script getInfo). No Native.ptr /
-  // handle+8. Live sim vel may sit on ResState/chassis while this returns
-  // GameRefState cache only — Vehicle.getSpeedSquare prefers physics_shape;
-  // getVel does not invent that redirect here.
-  if (!self) return nullptr;
-  std::lock_guard<std::mutex> lock(g_mu);
-  auto& r = ref(self);
-  return vec3_new(r.vx, r.vy, r.vz);
-}
-
-void java_util_resource_GameRef_setPos(InvObject* self, InvObject* v) {
-  // PE @ 0x0047E350: Unbox this+Vector3 (no Vector3-null test). Handle 0 →
-  // Mighty ERROR. sub_551C70(0,0,0) zeros YPR then GameRef_applyWorldXform
-  // @ 0x0048B440 — same pose write as setMatrix. Garage.lockCar.
-  java_util_resource_GameRef_setMatrix(self, v, nullptr);
-}
-
-void java_util_resource_GameRef_setMatrix(InvObject* self, InvObject* p, InvObject* o) {
-  // PE @ 0x0047E490: Unbox this+Vector3+Ypr. Handle 0 → Mighty ERROR.
-  // Null Vector3 → pos 0,0,0. sub_551C70(0,0,0) zeros YPR; Ypr fields
-  // overwrite if non-null. Always GameRef_applyWorldXform @ 0x0048B440
-  // (physics vtable+0x1C pose write). No freeze-in-place skip.
-  // Vehicle.create: setMatrix(null,null) after chassis.forceUpdate.
-  if (!self) return;
-  float x = 0.f, y = 0.f, z = 0.f;
-  if (p) vec3_get(p, &x, &y, &z);
-  float yaw = 0.f, pitch = 0.f, roll = 0.f;
-  if (o) ypr_get(o, &yaw, &pitch, &roll);
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    auto& r = ref(self);
-    r.px = x;
-    r.py = y;
-    r.pz = z;
-    r.oy = yaw;
-    r.op = pitch;
-    r.or_ = roll;
-    r.vx = r.vy = r.vz = 0;
-    r.empty = false;
-  }
-  render_d3d9_mesh_set_transform(self, x, y, z, yaw, pitch, roll, 1.f, 1.f, 1.f);
-}
-
-void java_util_resource_GameRef_setParent(InvObject* self, InvObject* newparent) {
-  // PE @ 0x0047E2D0 size 0x7b: UnboxArg this+parent. Native.ptr
-  // (dword_62E008)==0 → Mighty ERROR, return (no splice). Else thiscall
-  // sub_48ABA0 (16 xrefs, not renamed). Host: !self / id==0 = handle-0
-  // (silent; PE logs Mighty).
-  // PE @ 0x0048ABA0 size 0x1bf: parent Java null crashes [a2+8]. Boxed
-  // parent Native.ptr 0 → jz return 0, no detach. Already parented
-  // ([inner+0x14]+0x50 == parent ptr) → 1. Type [inner+0x4C]: 1 INSTANCE
-  // → sub_419860 (198 xrefs, not ported); 2–3 PHYSICS/RENDER circular
-  // splice parent+0x30 sentinel / +0x38 tail (sub_4A5D00 / WT 544FE0
-  // not ported); else 0. Host: null parent / parent id 0 → no-op. Keep
-  // resref + mesh; no type-2/3 list fields yet.
-  if (!self || java_util_resource_ResourceRef_id(self) == 0) return;
-  if (!newparent || java_util_resource_ResourceRef_id(newparent) == 0) return;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    ref(self).parent = newparent;
-  }
-  resref_set_parent(self, newparent);
-  render_d3d9_mesh_set_parent(self, newparent);
-}
-
-void java_util_resource_GameRef_setState(InvObject* self, InvObject* p, InvObject* o,
-                                        InvObject* l, InvObject* a) {
-  // PE @ 0x0047E630: Unbox this, Vector3 p, Ypr o, Vector3 linvel, Vector3 angvel.
-  // Handle 0 → Mighty ERROR. p: NO null-check (reads x/y/z). o: sub_551C70 zeros
-  // YPR; non-null reads y/p/r. linvel/angvel default 0,0,0 if null else x/y/z.
-  // Packs 12 floats "ffffffffffff" (p.xyz, ypr.ypr, lin.xyz, ang.xyz) via
-  // sub_551FC0 then GameRef_applyWorldXform @ 0x0048B440.
-  // Host: setMatrix writes pose (and zeros vx — race80 analogue); then overwrite
-  // linvel so vel is not left wiped. GameRefState has no wx/wy/wz — Java GameRef
-  // has getVel only (no getAngVel, no setState call sites). Angular stored on
-  // existing ResState via physics_set_ang_vel (same path as GameRef stop/reset).
-  if (!self) return;
-  java_util_resource_GameRef_setMatrix(self, p, o);
-  float lx = 0.f, ly = 0.f, lz = 0.f;
-  if (l) vec3_get(l, &lx, &ly, &lz);
-  float ax = 0.f, ay = 0.f, az = 0.f;
-  if (a) vec3_get(a, &ax, &ay, &az);
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    auto& r = ref(self);
-    r.vx = lx;
-    r.vy = ly;
-    r.vz = lz;
-  }
-  physics_set_ang_vel(self, ax, ay, az);
-}
-
-int32_t java_util_resource_GameRef_isEmpty(InvObject* self) {
-  // PE @ 0x00486D10 size 0x8c (140) end 0x486D9B. GameRef.isEmpty()I —
-  // Java: "ures gametype az illeto?" Empty flag gated on RESTYPE_GAME=8.
-  // Callees: JVM_UnboxArg @ 0x0045D910, JVM_vm_get_int_field @ 0x0042AB50
-  // (dword_62E008 Native.ptr), sub_5447D0 @ 0x005447D0. Unbox this;
-  // edi=1 default empty @ 0x486d2d. Handle 0 → loc_486D97 return 1 —
-  // NO Mighty ERROR (unlike getPos @ 0x0047DAD0). inner=*(handle+0xC)
-  // @ 0x486d3e — NOT handle+8. inner==0 → 1. [inner+0x4C]==8 only
-  // (ResourceRef.RESTYPE_GAME); type!=8 → 1. INSTANCE_GAME=1 has no
-  // success path (unlike isScripted @ 0x00486DA0 / getScriptInstance
-  // @ 0x00486F30). Dead cmp eax,edi (type==1) @ 0x486d4d — eax already
-  // 8. vtbl+0x14(1.0f=0x3F800000) @ 0x486d53; sub_5447D0(inner,
-  // push 0A0000000h, 0, 0) @ 0x486d61/68 — test sign 0x80000000 → 1.
-  // vtbl+0xC(1.0f) payload @ 0x486d7d; payload==0 → 1. *(payload+0x10)
-  // Class* OR *(payload+0xC) nonzero → loc_486D92 return 0; else 1.
-  // (isEmpty-only +0xC vs getScriptInstance type-8 +0x10-only.) Host:
-  // g_refs.empty + script_class / res_id mirror +0x10/+0xC on type-8;
-  // no +0x50 script slot. pose/RID bind clears empty without GameType
-  // (host stand-in when ResourceRef.type!=8 — PE would still return 1).
-  // sub_5447D0 / vtbl+0x14 not mirrored. !self = handle 0.
-  if (!self) return 1;
-
-  GameRefState st{};
-  bool mapped = false;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    const auto it = g_refs.find(self);
-    if (it != g_refs.end()) {
-      st = it->second;
-      mapped = true;
-    }
-  }
-  if (!mapped || st.empty) return 1;  // inner==0 @ loc_486D97
-
-  constexpr int32_t kRestypeGame = 8;
-  const int32_t restype = java_util_resource_ResourceRef_type(self);
-  if (restype == kRestypeGame) {
-    // PE type-8 path only (not isScripted type-1): payload+0x10 Class*,
-    // then payload+0xC — no script-instance (+0x50) slot on this native.
-    if (!st.script_class.empty()) return 0;
-    if (java_util_resource_ResourceRef_id(self) != 0) return 0;  // +0xC stand-in
-    return 1;
-  }
-
-  // Host stand-in: type!=8 but empty flag already cleared (traffic/cars/RID).
-  // PE jnz loc_486D97 would return 1 here.
-  return 0;
-}
-
-namespace {
-
-// PE Class_isInheritedFrom @ 0x00404500: walk super at Class+0x1C8 until
-// this==want. Host: exact FQN, then JvmClass::super_name (TREE classpath).
-bool gameref_script_isa(const std::string& have, const char* want) {
-  if (have.empty() || !want || !want[0]) return false;
-  if (have == want) return true;
-  Jvm* j = jvm_active();
-  if (!j) return false;
-  if (!j->find_class(have.c_str())) j->load_class(have.c_str());
-  const JvmClass* cls = j->find_class(have.c_str());
-  for (int depth = 0; cls && depth < 32; ++depth) {
-    if (cls->name == want) return true;
-    if (cls->super_name.empty()) break;
-    if (!j->find_class(cls->super_name.c_str()))
-      j->load_class(cls->super_name.c_str());
-    cls = j->find_class(cls->super_name.c_str());
-  }
-  return false;
-}
-
-}  // namespace
-
-int32_t java_util_resource_GameRef_isScripted(InvObject* self, InvObject* clazzname) {
-  // PE @ 0x00486DA0 size 0x189 (int_convert 393). Unbox this (var_104) +
-  // String clazzname (var_108, box+8 C str). clazzname!=0 → JNI `L`+fqn+`;`
-  // (sub_551120 / sub_551140). Native.ptr (dword_62E008).
-  // Handle 0: xor ebx,ebx @ 0x00486DC3; jz @ 0x00486E1E → loc_486F1E
-  // mov eax,ebx (0). NO sub_5513B0 — unlike getPos @ 0x0047DAD0 jz
-  // loc_47DB90 ("!" @ 0x612EA4 + "Mighty ERROR" @ 0x612EA8).
-  // Contrast isEmpty @ 0x00486D10: jz loc_486D97 edi=1 (also no Mighty);
-  // isEmpty requires [inner+0x4C]==RESTYPE_GAME=8 else empty. isScripted
-  // accepts INSTANCE_GAME=1 or RESTYPE_GAME=8 else ebx=0.
-  // inner=*(handle+0xC) (int_convert 12); 0 → 0. NOT handle+8.
-  // [inner+0x4C] INSTANCE_GAME=1: sub_5447D0 sign → 0; vtbl+0xC(1.0f);
-  //   *(payload+0x50)==0 → 0 (no script instance). clazzname==0 → 1.
-  //   Class_isInheritedFrom_desc @ 0x004044E0 this=*(script+0xC).
-  // [inner+0x4C] RESTYPE_GAME=8: vtbl+0x14(1.0f); same sub_5447D0;
-  //   *(payload+0x10)==0 → 0 (no script class). clazzname==0 → 1.
-  //   *(Class+0x10)!=0 → 0 (interface). isInheritedFrom this=Class.
-  // else 0. Compare: script FQN is-a clazzname (superclass), NOT alias /
-  // suffix / VehicleType heuristic. Catalog Part vs Set; Java null wrapper.
-  // Host: !self / g_refs miss = handle 0 → 0 (no Mighty). Keep getPos.
-  if (!self) return 0;
-  std::string have;
-  InvObject* script = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    auto it = g_refs.find(self);
-    if (it == g_refs.end()) return 0;
-    const GameRefState& r = it->second;
-    if (!r.script && r.script_class.empty()) return 0;
-    have = r.script_class;
-    script = r.script;
-  }
-  if (!clazzname) return 1;
-  const char* want = string_cstr(clazzname);
-  // Empty C str: PE still wraps `L;` → lookup fail → 0. Only nullptr is "any".
-  if (!want || !want[0]) return 0;
-  if (have.empty() && script) {
-    if (const char* hc = tree_host_class(script)) have = hc;
-  }
-  return gameref_script_isa(have, want) ? 1 : 0;
-}
-
-InvObject* java_util_resource_GameRef_getScriptInstance(InvObject* self) {
-  // PE @ 0x00486F30 size 0xe1: Unbox this. Native.ptr (dword_62E008).
-  // Handle 0 → null. NO Mighty ERROR (unlike getPos @ 0x0047DAD0;
-  // same family as isEmpty @ 0x00486D10 / isScripted @ 0x00486DA0).
-  // inner=*(handle+0xC) — NOT handle+8. inner==0 → null.
-  // [inner+0x4C] INSTANCE_GAME=1: sub_5447D0(0x80000000) sign → null;
-  //   vtbl+0xC(1.0f); *(payload+0x50) raw Java obj (no box).
-  // [inner+0x4C] RESTYPE_GAME=8: vtbl+0x14(1.0f); same sub_5447D0;
-  //   *(payload+0x10) Class* via sub_404E20 (no Native.ptr store).
-  // else null. Host: C++ GameRefState.script. !self = handle 0.
-  if (!self) return nullptr;
-  std::lock_guard<std::mutex> lock(g_mu);
-  return ref(self).script;
-}
-
-int32_t java_util_resource_GameRef_getInfo(InvObject* self, int32_t query,
-                                          int32_t subquery) {
-  // PE @ 0x0047DDF0 size 0x150 (336). Shared with
-  // getInfo(ILjava.lang.String;)I — same native (Natives_RegisterAll
-  // data xrefs @ 0x00489666 + 0x00489685). Java getInfo(I) is non-native
-  // wrapper → getInfo(q, 0). Unbox this+query+subquery (var_4=query INT
-  // GII_*, var_8=subquery int|String*). Native.ptr (dword_62E008)==0 →
-  // "!"+"Mighty ERROR"+ErrorLogPrintf, ret 0. Else: *(handle+8)==0 → 0;
-  // lock=*(handle+0xC); lock==0 → 0; [lock+0x4C]!=1 → vtbl+0x14(1.0f);
-  // sub_5447D0(lock, 0x80000000, 0.f, 0.f) sign-bit fail → 0;
-  // edi=vtbl+0xC(1.0f); edi==0||[edi+0x4C]==0 → 0; same lock walk on
-  // [edi+0x44]; then thiscall vtbl+0x3C(ecx=[payload+0xC], [edi+0x4C],
-  // query, subquery) → int. NOT MouseCursor path (no sub_426470, no
-  // query 59, no float dest). Do NOT rename sub_5447D0 / sub_426470 /
-  // JVM_UnboxArg / dword_62E008. Host: GII_* switch stand-in for
-  // vtbl+0x3C (subquery used by GII_AXIS).
-  if (!self) return 0;
-  // Mirrored from GameType / GameInstance.h (Phase 2.96+).
-  constexpr int32_t kGiiBone = 1;
-  constexpr int32_t kGiiId = 5;
-  constexpr int32_t kGiiType = 6;
-  constexpr int32_t kGiiCategory = 7;
-  constexpr int32_t kGiiSize = 11;
-  constexpr int32_t kGiiOwner = 24;
-  constexpr int32_t kGiiAxis = 25;
-  constexpr int32_t kGiiCamera = 34;
-  constexpr int32_t kGiiRemoveOk = 41;  // == GII_GETOUT_OK
-  constexpr int32_t kGiiRender = 48;    // internal camera count (Track)
-  constexpr int32_t kGiiCarDrivetype = 52;
-  constexpr int32_t kGiiPartCategory = 55;
-  constexpr int32_t kGiiCarTrafficPtr = 56;
-  constexpr int32_t kGirCatVehicle = 5;
-  constexpr int32_t kGirCatPart = 9;
-  switch (query) {
-    case kGiiId:
-      return java_util_resource_ResourceRef_id(self);
-    case kGiiType: {
-      int32_t tid = java_util_resource_RenderRef_getTypeID(self);
-      if (!tid) tid = java_util_resource_ResourceRef_id(self);
-      return tid;
-    }
-    case kGiiCategory: {
-      if (tree_field_get_obj(self, "chassis")) return kGirCatVehicle;
-      const char* hc = tree_host_class(self);
-      if (hc && hc[0]) {
-        if (std::strstr(hc, "VehicleType") ||
-            std::strstr(hc, "VehicleDescriptor"))
-          return 0;
-        if (std::strstr(hc, "Vehicle")) return kGirCatVehicle;
-        if (std::strstr(hc, "Part") || std::strstr(hc, ".parts."))
-          return kGirCatPart;
-      }
-      std::lock_guard<std::mutex> lock(g_mu);
-      auto it = g_refs.find(self);
-      if (it != g_refs.end()) {
-        const std::string& sc = it->second.script_class;
-        const std::string& al = it->second.script_alias;
-        if (sc.find("VehicleType") == std::string::npos &&
-            (sc.find("Vehicle") != std::string::npos ||
-             al.find("Vehicle") != std::string::npos))
-          return kGirCatVehicle;
-        if (sc.find("parts") != std::string::npos ||
-            al.find("Part") != std::string::npos)
-          return kGirCatPart;
-      }
-      return 0;
-    }
-    case kGiiOwner:
-      return java_util_resource_ResourceRef_getParentID(self);
-    case kGiiRemoveOk: {
-      // Mechanic/VisualInventory: reason!=-1 → removable; Garage drag: ==0.
-      const char* hc = tree_host_class(self);
-      if (hc && std::strstr(hc, "Chassis")) return -1;
-      const int32_t n = part_slot_count(self);
-      for (int32_t i = 0; i < n; ++i) {
-        const int32_t sid = part_slot_id_at(self, i);
-        if (sid <= 0) continue;
-        if (part_on_slot(self, sid)) return -1;  // dependents still attached
-      }
-      return 0;
-    }
-    case kGiiPartCategory: {
-      // Mechanic filters: 1=engine 2=body 3=rgear (0 = uncategorized).
-      const int32_t stored = tree_field_get_int(self, "part_category");
-      if (stored != 0) return stored;
-      auto cat_from = [](const char* s) -> int32_t {
-        if (!s || !s[0]) return 0;
-        if (std::strstr(s, "enginepart") || std::strstr(s, "EnginePart") ||
-            std::strstr(s, ".engines."))
-          return 1;
-        if (std::strstr(s, "rgearpart") || std::strstr(s, "RGear"))
-          return 3;
-        if (std::strstr(s, "bodypart") || std::strstr(s, "BodyPart"))
-          return 2;
-        return 0;
-      };
-      if (int32_t c = cat_from(tree_host_class(self))) return c;
-      std::lock_guard<std::mutex> lock(g_mu);
-      auto it = g_refs.find(self);
-      if (it != g_refs.end()) {
-        if (int32_t c = cat_from(it->second.script_class.c_str())) return c;
-        if (int32_t c = cat_from(it->second.script_alias.c_str())) return c;
-      }
-      return 0;
-    }
-    case kGiiCarDrivetype: {
-      // Chassis bits DT_FWD=1 / DT_RWD=2 → CarInfo codes
-      // 0=none 1=AWD 2=FWD 3=RWD 4=cross.
-      InvObject* ch = tree_field_get_obj(self, "chassis");
-      if (!ch) ch = self;
-      const int32_t bits = tree_field_get_int(ch, "drive_type");
-      const int fwd = bits & 1;
-      const int rwd = bits & 2;
-      if (!fwd && !rwd) return bits ? 4 : 0;
-      if (fwd && rwd) return 1;
-      if (fwd) return 2;
-      return 3;
-    }
-    case kGiiBone: {
-      // Track: new ResourceRef(getInfo(GII_BONE)) → look target id.
-      const int32_t stored = tree_field_get_int(self, "gii_bone");
-      if (stored != 0) return stored;
-      return java_util_resource_ResourceRef_id(self);
-    }
-    case kGiiSize: {
-      // InventoryPanel: createDefCamera(size/100.0) — centimetres.
-      const int32_t stored = tree_field_get_int(self, "gii_size");
-      if (stored > 0) return stored;
-      InvObject* mesh = tree_field_get_obj(self, "visual_mesh");
-      if (!mesh) mesh = self;
-      float bmin[3] = {}, bmax[3] = {};
-      if (render_d3d9_mesh_local_bounds(mesh, bmin, bmax)) {
-        const float dx = bmax[0] - bmin[0];
-        const float dy = bmax[1] - bmin[1];
-        const float dz = bmax[2] - bmin[2];
-        float extent = dx;
-        if (dy > extent) extent = dy;
-        if (dz > extent) extent = dz;
-        int32_t cm = static_cast<int32_t>(extent + 0.5f);
-        if (cm < 1) cm = 1;
-        if (cm > 10000) cm = 10000;
-        return cm;
-      }
-      return 100;  // 1.0 m default
-    }
-    case kGiiRender: {
-      // Track.changeCamInternal: number of onboard cameras.
-      const int32_t stored = tree_field_get_int(self, "camera_count");
-      if (stored > 0) return stored;
-      if (tree_field_get_obj(self, "chassis")) return 1;
-      const char* hc = tree_host_class(self);
-      if (hc && std::strstr(hc, "Vehicle") && !std::strstr(hc, "VehicleType"))
-        return 1;
-      return 0;
-    }
-    case kGiiCamera: {
-      const int32_t stored = tree_field_get_int(self, "gii_camera");
-      if (stored != 0) return stored;
-      return java_util_resource_ResourceRef_id(self);
-    }
-    case kGiiAxis: {
-      // Input.getInput → controller.getInfo(GII_AXIS, axis_id).
-      // Milli-units of mapped logical axis (truthy when active).
-      const float v = input_map_get_logical(self, subquery);
-      if (std::fabs(v) < 0.001f) return 0;
-      int32_t iv = static_cast<int32_t>(v * 1000.f);
-      if (iv == 0) iv = (v > 0.f) ? 1 : -1;
-      return iv;
-    }
-    case kGiiCarTrafficPtr: {
-      // City traffic tracker: opaque ctCar pointer / host id.
-      int32_t t = tree_field_get_int(self, "traffic_ptr");
-      if (!t) t = tree_field_get_int(self, "gii_traffic");
-      return t;
-    }
-    default:
-      return 0;
-  }
-}
-
-int32_t java_util_resource_GameRef_getInfo_1(InvObject* self, int32_t query,
-                                            InvObject* subquery) {
-  // PE: same entry as getInfo(II)I @ 0x0047DDF0 size 0x150 — UnboxArg
-  // writes String* into subquery dword; vtbl+0x3C receives it unchanged.
-  // Contrast getInfo(II): int subquery vs String*; PE walk identical.
-  // Host: Catalog GII_INSTALL_OK / GII_COMPATIBLE parse dest id string;
-  // other queries forward getInfo(q, 0) (PE would still pass String*).
-  constexpr int32_t kGiiInstallOk = 71;
-  constexpr int32_t kGiiCompatible = 72;
-  if (query != kGiiInstallOk && query != kGiiCompatible)
-    return java_util_resource_GameRef_getInfo(self, query, 0);
-  if (!self) return 0;
-  const char* s = string_cstr(subquery);
-  if (!s || !s[0]) return 0;
-  while (*s == ' ' || *s == '\t') ++s;
-  char* end = nullptr;
-  const long dest_id_l = std::strtol(s, &end, 0);
-  if (end == s || dest_id_l == 0) return 0;
-  const int32_t dest_id = static_cast<int32_t>(dest_id_l);
-  InvObject* dest = resref_find_by_id(dest_id);
-  if (!dest || dest == self) return 0;
-
-  auto type_or_id = [](InvObject* o) -> int32_t {
-    int32_t tid = java_util_resource_RenderRef_getTypeID(o);
-    if (!tid) tid = java_util_resource_ResourceRef_id(o);
-    return tid;
-  };
-  auto is_vehicle_like = [](InvObject* o) -> bool {
-    if (!o) return false;
-    if (tree_field_get_obj(o, "chassis")) return true;
-    const char* hc = tree_host_class(o);
-    return hc && std::strstr(hc, "Vehicle") &&
-           !std::strstr(hc, "VehicleType") &&
-           !std::strstr(hc, "VehicleDescriptor");
-  };
-  auto install_target = [](InvObject* o) -> InvObject* {
-    if (!o) return nullptr;
-    if (InvObject* ch = tree_field_get_obj(o, "chassis")) return ch;
-    return o;
-  };
-  auto has_free_slot = [&](InvObject* o) -> bool {
-    InvObject* root = install_target(o);
-    if (!root) return false;
-    const int32_t n = part_slot_count(root);
-    if (n <= 0) {
-      // No slot table yet: Catalog allows 1-step onto a vehicle/chassis.
-      return is_vehicle_like(o) || root != o;
-    }
-    for (int32_t i = 0; i < n; ++i) {
-      const int32_t sid = part_slot_id_at(root, i);
-      if (sid <= 0) continue;
-      if (part_slot_is_disabled(root, sid)) continue;
-      if (!part_on_slot(root, sid)) return true;
-    }
-    return false;
-  };
-
-  if (query == kGiiCompatible) {
-    const int32_t st = type_or_id(self);
-    const int32_t dt = type_or_id(dest);
-    if ((st >> 16) != 0 && (st >> 16) == (dt >> 16)) return 1;
-    if (is_vehicle_like(dest)) return 1;
-    return 0;
-  }
-
-  // GII_INSTALL_OK — free install target on dest (or its chassis).
-  if (has_free_slot(dest)) return 1;
-  // Inventory-to-part: empty mate on the other part itself (not a vehicle).
-  if (!is_vehicle_like(dest)) {
-    const int32_t n = part_slot_count(dest);
-    for (int32_t i = 0; i < n; ++i) {
-      const int32_t sid = part_slot_id_at(dest, i);
-      if (sid <= 0) continue;
-      if (part_slot_is_disabled(dest, sid)) continue;
-      if (!part_on_slot(dest, sid)) return 1;
-    }
-    // Bare part with no slot table can still accept a mate.
-    if (n == 0) return 1;
-  }
-  return 0;
-}
-
+// → GameRef_core.cpp (GameRef_core getPos..getInfo)
 void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
                                           int32_t type, InvObject* param) {
   // PE @ 0x0047DA30 size 0x9c. JNI (LResourceRef;ILjava/lang/String;)V
@@ -1113,48 +1421,137 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
   // handle = JVM_vm_get_int_field(this, dword_62E008). handle==0 →
   // Mighty ERROR ("!"+"Mighty ERROR"). ro/param NOT tested; type NOT
   // filtered (EVENT_COMMAND=0x10 is Java command() only). Else stdcall
-  // Engine_queueEvent(handle, ro, type, param, 0) @ 0x00426800.
-  // Immediate dispatch @ 0x004265C0 (not FIFO): [vtable+0x38] =
-  // sub_458C00 size 0x38fe (wakeup/sethorn/start/stop/reset). DO NOT
-  // RENAME / PORT sub_458C00. Host string parse is a stand-in.
+  // Engine_queueEvent(handle, ro, type, param, 0) @ 0x00426800 →
+  // Engine_queueEvent_dispatch @ 0x004265C0 (was sub_4265C0): payload
+  // vtbl+0x38 = sub_458C00 size 0x38fe. DO NOT RENAME / FULL-PORT
+  // sub_458C00. EVENT_COMMAND @ 0x458C3C: scanf "%s" then strcmp chain
+  // (sub_5D7190) — render/hide/…/stop/start/suspend/wakeup/reset/…
+  // /sethorn/setvel/team/…. Host string parse = strcmp subset only.
   (void)ro;
-  if (!self || !param) return;
+  if (!self) return;
+
+  // W9B — PE GameRef_voidEvent_parse EVENT type 0x80 @ 0x45C15A →
+  // jpt_45C300; case 2 @ 0x45C323..0x45C3C9: clear +0x70 bit 0x40000;
+  // gates +0x1FC0==0, +0x1FCC!=0, +0x1FD0 && *[+0x4C]==8 (GII_CONTROL);
+  // getWTRoot → LoadGameInit("1,0.25","bot") @ 0x45C3BD →
+  // void_event_loadgameinit_rebind @ 0x45C3C9; then "controllable %d" +
+  // "AI_GoToTrafficSlow" + Engine_addTimer(0x80000080). Host: subtype
+  // from param int (engine a5); soft gates (no PE blob +0x1FC*).
+  constexpr int32_t kEventType80 = 0x80;
+  if (type == kEventType80) {
+    int32_t sub = 0;
+    if (param) {
+      const char* ps = string_cstr(param);
+      if (ps && ps[0]) {
+        char* end = nullptr;
+        sub = static_cast<int32_t>(std::strtol(ps, &end, 10));
+      }
+    }
+    if (sub == 2) {
+      {
+        std::lock_guard<std::mutex> lock(g_gr_mu);
+        ref(self).flags &= ~0x40000;
+      }
+      // PE stack ResHandle ch18 @ 0x45C34x; wtroot RH from getWTRootNode.
+      alignas(4) uint8_t wt_rh[16]{};
+      alignas(4) uint8_t stack_rh[16]{};
+      int32_t wt_key = java_util_resource_ResourceRef_id(self);
+      if (wt_key == 0) {
+        if (InvObject* wt = java_util_resource_ResourceRef_getWTRoot(self))
+          wt_key = java_util_resource_ResourceRef_id(wt);
+      }
+      *reinterpret_cast<int32_t*>(wt_rh + 8) = wt_key;
+      if (wt_key != 0) {
+        // PE @ 0x45C3BD Engine_LoadGameInit(wt, g_RH@63C680, "1,0.25", "bot")
+        // → GI; Rebind @ 0x45C3C9 via void_event_loadgameinit_rebind.
+        void* gi =
+            engine_load_game_init(wt_rh, nullptr, "1,0.25", "bot");
+        void_event_loadgameinit_rebind(stack_rh, gi);
+        const int32_t gikey =
+            gi ? *reinterpret_cast<int32_t*>(reinterpret_cast<char*>(gi) + 0x50)
+               : 0;
+        tree_field_set_int(self, "loadgameinit_gi_key", gikey);
+        tree_field_set_int(self, "cmd_event_0x80_case2",
+                           tree_field_get_int(self, "cmd_event_0x80_case2") +
+                               1);
+        // Downstream PE @ 0x45C3FD — host counters only (timer OOS).
+        tree_field_set_int(self, "cmd_controllable",
+                           tree_field_get_int(self, "cmd_controllable") + 1);
+        tree_field_set_int(self, "cmd_AI_GoToTrafficSlow",
+                           tree_field_get_int(self, "cmd_AI_GoToTrafficSlow") +
+                               1);
+      }
+    }
+    return;
+  }
+
   // GameRef.command → queueEvent(null, EVENT_COMMAND=0x10, param).
   constexpr int32_t kEventCommand = 0x10;
-  if (type != kEventCommand) return;
-  const char* s = string_cstr(param);
-  if (!s || !s[0]) return;
+  if (type != kEventCommand) return;  // other types: PE vtbl; host no-op
+  if (!param) return;
+  const char* raw = string_cstr(param);
+  if (!raw || !raw[0]) return;
+  // PE: first token via "%s" into var_80, then exact strcmp (not prefix).
+  char tok[96];
+  {
+    const char* s = raw;
+    while (*s == ' ' || *s == '\t') ++s;
+    size_t n = 0;
+    while (s[n] && s[n] != ' ' && s[n] != '\t' && n + 1 < sizeof(tok)) {
+      tok[n] = s[n];
+      ++n;
+    }
+    tok[n] = '\0';
+    if (n == 0) return;
+  }
+  const char* s = raw;
   while (*s == ' ' || *s == '\t') ++s;
   // Phase 2.94 — Bot.pressHorn / City challenge: "sethorn 0|1".
-  if (std::strncmp(s, "sethorn", 7) == 0) {
+  // PE @ 0x45A589: strcmp "sethorn"; scanf "%*s %d"; store (v % 4) at
+  // obj+0x1DCC (and ecx,80000003h signed-mod). getHorn reads that slot.
+  if (std::strcmp(tok, "sethorn") == 0) {
     s += 7;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const long v = std::strtol(s, &end, 10);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
-    ref(self).horn = (v != 0) ? 1 : 0;
+    // PE signed modulo 4 (MSVC and 80000003h pattern).
+    int32_t slot = static_cast<int32_t>(v) % 4;
+    if (slot < 0) slot += 4;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      ref(self).horn = slot;
+    }
+    // TREE mirror for java_game_Vehicle_getHorn in Cars.cpp (PE +0x1DCC
+    // slot stand-in; setnz read). Keep GameRefState.horn for legacy.
+    tree_field_set_int(self, "horn", slot);
     return;
   }
   // Phase 2.101 — Vehicle.wakeUp / CarMarket start|stop|reset.
-  if (std::strncmp(s, "wakeup", 6) == 0) {
+  // PE strcmp exact: "wakeup" @ 0x459ED1 → sub_4A7990; "start" @
+  // 0x459E02 clears flag bits + physics vfuncs; "stop" @ 0x459B1E ors
+  // +0x70 bit2 + halt; "reset" @ 0x459F2D clears pose vel slots.
+  if (std::strcmp(tok, "wakeup") == 0) {
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      ref(self).suspended = 0;
+    }
     physics_set_asleep(self, 0);
     if (InvObject* ch = tree_field_get_obj(self, "chassis"))
       physics_set_asleep(ch, 0);
     tree_field_set_int(self, "awake", 1);
+    tree_field_set_int(self, "suspended", 0);
     return;
   }
-  if (std::strncmp(s, "start", 5) == 0 &&
-      (s[5] == '\0' || s[5] == ' ' || s[5] == '\t')) {
-    std::lock_guard<std::mutex> lock(g_mu);
+  if (std::strcmp(tok, "start") == 0) {
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     ref(self).drive_held = 0;
     tree_field_set_int(self, "drive_held", 0);
     return;
   }
-  if (std::strncmp(s, "stop", 4) == 0 &&
-      (s[4] == '\0' || s[4] == ' ' || s[4] == '\t')) {
+  if (std::strcmp(tok, "stop") == 0) {
     {
-      std::lock_guard<std::mutex> lock(g_mu);
+      std::lock_guard<std::mutex> lock(g_gr_mu);
       ref(self).drive_held = 1;
     }
     tree_field_set_int(self, "drive_held", 1);
@@ -1162,8 +1559,7 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
     physics_set_ang_vel(self, 0.f, 0.f, 0.f);
     return;
   }
-  if (std::strncmp(s, "reset", 5) == 0 &&
-      (s[5] == '\0' || s[5] == ' ' || s[5] == '\t')) {
+  if (std::strcmp(tok, "reset") == 0) {
     physics_set_velocity(self, 0.f, 0.f, 0.f);
     physics_set_ang_vel(self, 0.f, 0.f, 0.f);
     physics_set_asleep(self, 0);
@@ -1171,13 +1567,243 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
                        tree_field_get_int(self, "reset_count") + 1);
     return;
   }
+  // PE strcmp @ 0x459E75 "suspend" / 0x459ED1 "wakeup" twin — asleep flag.
+  if (std::strcmp(tok, "suspend") == 0) {
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      ref(self).suspended = 1;
+    }
+    physics_set_asleep(self, 1);
+    if (InvObject* ch = tree_field_get_obj(self, "chassis"))
+      physics_set_asleep(ch, 1);
+    tree_field_set_int(self, "awake", 0);
+    tree_field_set_int(self, "suspended", 1);
+    return;
+  }
+  // PE @ 0x458EB7 "hide" — visibility gate stand-in.
+  if (std::strcmp(tok, "hide") == 0) {
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    ref(self).hidden = 1;
+    tree_field_set_int(self, "hidden", 1);
+    return;
+  }
+  // PE @ 0x458C51 "render": strcmp then scanf "%*s %d %d %d" (defaults 0).
+  // IDA push order @ 0x458C67..: &arg_C=vp, &var_20=con, &arg_8=camNum.
+  // Track: cameraTarget.command("render "+vp+" "+con+" "+cameraNum).
+  // findCam(con) @ 0x448D10 → cam idx (match @ blob+0x128); gate arg_C!=0
+  // @ 0x458CC0; Bind(cam+0x44, vp, RESOURCE_VIEWPORT=0x12) @ 0x458d42 →
+  // LookupById @ 0x536820; clamp camNum @ 0x458D5C; Rebind(cam+0x34, slot)
+  // @ 0x458D88 via +0x17A8/+0x13F4.
+  if (std::strcmp(tok, "render") == 0) {
+    s += 6;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long vp_l = *s ? std::strtol(s, &end, 10) : 0;
+    if (*s && end == s) return;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long con_l = *s ? std::strtol(s, &end, 10) : 0;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long cam_l = *s ? std::strtol(s, &end, 10) : 0;
+    const int32_t vp_id = static_cast<int32_t>(vp_l);
+    const int32_t con_id = static_cast<int32_t>(con_l);
+    int32_t cam_num = static_cast<int32_t>(cam_l);
+    InvObject* chassis = tree_field_get_obj(self, "chassis");
+    if (!chassis) chassis = self;
+    chassis_cam_tables_ensure(chassis);
+    // PE clamp @ 0x458D5C: camNum < *[chassis_blob+0xA54] else max-1.
+    // Host: TREE camera_count, else chassis_cam_count (+0x177C stand-in).
+    int32_t cam_cap = tree_field_get_int(self, "camera_count");
+    if (cam_cap <= 0) cam_cap = chassis_cam_count(chassis);
+    if (cam_cap > 0 && cam_num >= cam_cap) cam_num = cam_cap - 1;
+    if (cam_num < 0) cam_num = 0;
+    InvObject* vp = vp_id != 0 ? resref_find_by_id(vp_id) : nullptr;
+    InvObject* con = con_id != 0 ? resref_find_by_id(con_id) : nullptr;
+    // PE @ 0x458C92..0x458C99: findCam(con) start=0 step=1.
+    const int32_t cam_count = cam_table_count_for(self, chassis);
+    int32_t cam_idx = -1;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      cam_idx = find_cam_index_by_match_id_unlocked(ref(self), cam_count,
+                                                    con_id, 0, 1);
+    }
+    // PE jl @ 0x458CA2 → abort; host keep prior soft 0 only when count==0.
+    if (cam_idx < 0) {
+      if (cam_count <= 0)
+        cam_idx = 0;
+      else
+        return;
+    }
+    // PE @ 0x458D66: map[cam_idx*36+camNum] after Bind (vp gate), not con.
+    const int32_t slot_idx =
+        vp_id != 0 ? chassis_cam_slot_map_get(chassis, cam_idx, cam_num) : -1;
+    void* slot_node =
+        slot_idx >= 0 ? chassis_cam_slot_node(chassis, slot_idx) : nullptr;
+    int32_t match_key = 0;
+    int32_t bind_ok = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& r = ref(self);
+      r.hidden = 0;
+      r.render_vp_id = vp_id;
+      r.render_con_id = con_id;
+      r.render_cam_num = cam_num;
+      r.render_cam_idx = cam_idx;
+      // PE arg_C==0 → skip Bind/Rebind (jz 0x458DD5).
+      if (vp_id != 0) {
+        // PE @ 0x458d42 ResHandle_Bind(cam+0x44, vp, type=0x12, 0).
+        bind_ok = res_handle_bind_resolve(r.render_cam_bind_rh, vp_id, 0x12);
+        r.render_bind_type = 0x12;
+        r.render_bind_resolved = bind_ok;
+        if (slot_node) {
+          // PE @ 0x458D88 ResHandle_Rebind(cam+0x34, chassis_slot_node).
+          res_handle_rebind(r.render_cam_rh, slot_node);
+          match_key = *reinterpret_cast<int32_t*>(
+              reinterpret_cast<char*>(r.render_cam_rh) + 8);
+        } else {
+          // Map empty / slot unset — prior soft Rebind to chassis|self.
+          match_key = void_event_res_handle_rebind_owner(
+              r.render_cam_rh, chassis, vp_id);
+        }
+        r.render_cam_match_key = match_key;
+      } else {
+        r.render_bind_type = 0;
+        r.render_bind_resolved = 0;
+      }
+    }
+    if (vp) tree_field_set_obj(self, "render_viewport", vp);
+    if (con) tree_field_set_obj(self, "render_controller", con);
+    tree_field_set_int(self, "hidden", 0);
+    tree_field_set_int(self, "render_vp_id", vp_id);
+    tree_field_set_int(self, "render_con_id", con_id);
+    tree_field_set_int(self, "render_cam_num", cam_num);
+    tree_field_set_int(self, "render_cam_idx", cam_idx);
+    tree_field_set_int(self, "render_cam_slot", slot_idx);
+    tree_field_set_int(self, "render_cam_bound", vp_id != 0 ? 1 : 0);
+    tree_field_set_int(self, "render_cam_bind_type",
+                       vp_id != 0 ? 0x12 : 0);
+    tree_field_set_int(self, "render_cam_bind_resolved", bind_ok);
+    tree_field_set_int(self, "render_cam_match_key", match_key);
+    tree_field_set_int(self, "cmd_render",
+                       tree_field_get_int(self, "cmd_render") + 1);
+    return;
+  }
+  // PE @ 0x45A232 "reload" / 0x45A27C "idle" — counters only (no full PE).
+  if (std::strcmp(tok, "reload") == 0) {
+    tree_field_set_int(self, "reload_count",
+                       tree_field_get_int(self, "reload_count") + 1);
+    return;
+  }
+  if (std::strcmp(tok, "idle") == 0) {
+    tree_field_set_int(self, "idle_count",
+                       tree_field_get_int(self, "idle_count") + 1);
+    return;
+  }
+  // PE @ 0x45A32E "setpitch" / 0x45A3C1 "addroll" / 0x459DD5 "brake".
+  if (std::strcmp(tok, "setpitch") == 0) {
+    s += 8;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const float v = std::strtof(s, &end);
+    if (end == s) return;
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    auto& r = ref(self);
+    r.setpitch = v;
+    r.op = v;
+    tree_field_set_float(self, "setpitch", v);
+    return;
+  }
+  if (std::strcmp(tok, "addroll") == 0) {
+    s += 7;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const float v = std::strtof(s, &end);
+    if (end == s) return;
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    auto& r = ref(self);
+    r.addroll = v;
+    r.or_ += v;
+    tree_field_set_float(self, "addroll", r.addroll);
+    return;
+  }
+  if (std::strcmp(tok, "brake") == 0) {
+    s += 5;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const float v = std::strtof(s, &end);
+    if (end == s) return;
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    ref(self).brake = v;
+    tree_field_set_float(self, "brake", v);
+    return;
+  }
+  // PE @ 0x45A47F "setvel" — scanf "%*s %f,%f,%f,%f,%f,%f" (lin xyz then
+  // ang xyz) into physics pose slots at obj+0x70 / xor-1 twin + ang buffer
+  // (engine double-buffer @ +0x20C — OOS layout). Host: lin + ang via
+  // physics_* (same as GameRef.setState / stop/reset); not inventing +0x70.
+  if (std::strcmp(tok, "setvel") == 0) {
+    s += 6;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const float vx = std::strtof(s, &end);
+    if (end == s) return;
+    s = end;
+    while (*s == ' ' || *s == '\t' || *s == ',') ++s;
+    const float vy = std::strtof(s, &end);
+    if (end == s) return;
+    s = end;
+    while (*s == ' ' || *s == '\t' || *s == ',') ++s;
+    const float vz = std::strtof(s, &end);
+    if (end == s) return;
+    s = end;
+    while (*s == ' ' || *s == '\t' || *s == ',') ++s;
+    float wx = 0.f, wy = 0.f, wz = 0.f;
+    if (*s) {
+      wx = std::strtof(s, &end);
+      if (end != s) {
+        s = end;
+        while (*s == ' ' || *s == '\t' || *s == ',') ++s;
+        wy = std::strtof(s, &end);
+        if (end != s) {
+          s = end;
+          while (*s == ' ' || *s == '\t' || *s == ',') ++s;
+          wz = std::strtof(s, &end);
+        }
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& r = ref(self);
+      r.vx = vx;
+      r.vy = vy;
+      r.vz = vz;
+    }
+    physics_set_velocity(self, vx, vy, vz);
+    physics_set_ang_vel(self, wx, wy, wz);
+    return;
+  }
+  // PE @ 0x4599C3 "team" — int store stand-in.
+  if (std::strcmp(tok, "team") == 0) {
+    s += 4;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s) return;
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    ref(self).team = static_cast<int32_t>(v);
+    tree_field_set_int(self, "team", static_cast<int32_t>(v));
+    return;
+  }
   // Phase 2.102 — transmission / steerhelp / asr / abs / difflock / cruise /
   // damage_multiplier / setsteer (Vehicle.java + CarMarket).
+  // PE: exact first-token strcmp (sub_5D7190), same as wakeup/sethorn.
   auto sync_assist = [self](GameRefState& r) {
     tree_field_set_int(self, "transmission", r.transmission);
     tree_field_set_float(self, "steerhelp", r.steerhelp);
     tree_field_set_float(self, "asr", r.asr);
     tree_field_set_float(self, "abs", r.abs_);
+    tree_field_set_float(self, "esp", r.esp);
     tree_field_set_float(self, "difflock", r.difflock);
     tree_field_set_int(self, "cruise", r.cruise);
     tree_field_set_float(self, "damage_multiplier", r.damage_multiplier);
@@ -1186,108 +1812,121 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
     tree_field_set_int(self, "filter_2", r.filter_body);
     tree_field_set_int(self, "filter_3", r.filter_rgear);
   };
-  if (std::strncmp(s, "transmission", 12) == 0) {
+  if (std::strcmp(tok, "transmission") == 0) {
     s += 12;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const long v = std::strtol(s, &end, 10);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.transmission = static_cast<int32_t>(v);
     sync_assist(r);
     return;
   }
-  if (std::strncmp(s, "steerhelp", 9) == 0) {
+  if (std::strcmp(tok, "steerhelp") == 0) {
     s += 9;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const float v = std::strtof(s, &end);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.steerhelp = v;
     sync_assist(r);
     return;
   }
-  if (std::strncmp(s, "asr", 3) == 0 &&
-      (s[3] == ' ' || s[3] == '\t')) {
+  if (std::strcmp(tok, "asr") == 0) {
     s += 3;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const float v = std::strtof(s, &end);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.asr = v;
     sync_assist(r);
     return;
   }
-  if (std::strncmp(s, "abs", 3) == 0 &&
-      (s[3] == ' ' || s[3] == '\t')) {
+  if (std::strcmp(tok, "abs") == 0) {
     s += 3;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const float v = std::strtof(s, &end);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.abs_ = v;
     sync_assist(r);
     return;
   }
-  if (std::strncmp(s, "difflock", 8) == 0) {
+  // PE @ 0x459739 "esp" — twin of abs/asr: scanf "%*s %f"; >0 → flag
+  // |0x4000000 + store float at *[obj+0x1FBC]+0xA30 (physics OOS).
+  // Host: GameRefState.esp stand-in (Vehicle assist family; not Java site).
+  if (std::strcmp(tok, "esp") == 0) {
+    s += 3;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const float v = std::strtof(s, &end);
+    if (end == s) return;
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    auto& r = ref(self);
+    r.esp = v;
+    sync_assist(r);
+    return;
+  }
+  if (std::strcmp(tok, "difflock") == 0) {
     s += 8;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const float v = std::strtof(s, &end);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.difflock = v;
     sync_assist(r);
     return;
   }
-  if (std::strncmp(s, "cruise", 6) == 0) {
+  if (std::strcmp(tok, "cruise") == 0) {
     s += 6;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const long v = std::strtol(s, &end, 10);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.cruise = static_cast<int32_t>(v);
     sync_assist(r);
     return;
   }
-  if (std::strncmp(s, "damage_multiplier", 17) == 0) {
+  if (std::strcmp(tok, "damage_multiplier") == 0) {
     s += 17;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const float v = std::strtof(s, &end);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.damage_multiplier = v;
     sync_assist(r);
     return;
   }
-  if (std::strncmp(s, "setsteer", 8) == 0) {
+  if (std::strcmp(tok, "setsteer") == 0) {
     s += 8;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const float v = std::strtof(s, &end);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     r.setsteer = v;
     sync_assist(r);
     return;
   }
   // Phase 2.103 — "filter <cat> <mode>" (1=engine 2=body 3=rgear).
-  if (std::strncmp(s, "filter", 6) == 0 &&
-      (s[6] == ' ' || s[6] == '\t')) {
+  if (std::strcmp(tok, "filter") == 0) {
     s += 6;
+    while (*s == ' ' || *s == '\t') ++s;
     while (*s == ' ' || *s == '\t') ++s;
     char* end = nullptr;
     const long cat = std::strtol(s, &end, 10);
@@ -1296,7 +1935,7 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
     while (*s == ' ' || *s == '\t') ++s;
     const long mode = std::strtol(s, &end, 10);
     if (end == s) return;
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto& r = ref(self);
     if (cat == 1)
       r.filter_engine = static_cast<int32_t>(mode);
@@ -1309,11 +1948,846 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
     sync_assist(r);
     return;
   }
+  // race123 — more EVENT_COMMAND tokens from sub_458C00 (stand-in stores;
+  // full physics/slot handlers OOS — not porting 0x38fe). IDA push-string
+  // audit: "bot"/"controllable %d"/"ai_info_leavetraffic …" are sprintf /
+  // LoadGameInit data — NOT first-token strcmp inputs.
+  // PE @ 0x459109 "activate": scanf "%*s %d %d %d" → findCam(a0) @
+  // 0x459151; miss → findCam(0) free row @ 0x4591E0; Bind(cam+0x4, a0,
+  // type=1) writes match @ cam+0xC; Bind(cam+0x14, a1, type=1);
+  // Relink(cam+0x24, a2). Host: cam_rows + res_handle_bind_resolve.
+  if (std::strcmp(tok, "activate") == 0) {
+    s += 8;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long a0 = *s ? std::strtol(s, &end, 10) : 0;
+    if (*s && end == s) return;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long a1 = *s ? std::strtol(s, &end, 10) : 0;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long a2 = *s ? std::strtol(s, &end, 10) : 0;
+    const int32_t ctrl_id = static_cast<int32_t>(a0);
+    const int32_t b_id = static_cast<int32_t>(a1);
+    const int32_t c_id = static_cast<int32_t>(a2);
+    InvObject* chassis = tree_field_get_obj(self, "chassis");
+    if (!chassis) chassis = self;
+    chassis_cam_tables_ensure(chassis);
+    const int32_t cam_count = cam_table_count_for(self, chassis);
+    void* c_node = nullptr;
+    if (c_id != 0) {
+      if (InvObject* cobj = resref_find_by_id(c_id)) {
+        native_ptr_ensure(cobj);
+        c_node = native_ptr_node(cobj);
+      }
+    }
+    int32_t cam_idx = -1;
+    int32_t bind_a = 0;
+    int32_t bind_b = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& r = ref(self);
+      // PE: find existing match for ctrl, else free row (match_id==0).
+      cam_idx = find_cam_index_by_match_id_unlocked(r, cam_count, ctrl_id, 0,
+                                                    1);
+      if (cam_idx < 0)
+        cam_idx =
+            find_cam_index_by_match_id_unlocked(r, cam_count, 0, 0, 1);
+      if (cam_idx >= 0 && cam_idx < GameRefState::kCamTableMax) {
+        auto& row = r.cam_rows[static_cast<size_t>(cam_idx)];
+        // PE Bind type=1 @ cam+0x4 / +0x14 (push 0; push 1; push id).
+        bind_a = res_handle_bind_resolve(row.rh_ctrl, ctrl_id, 1);
+        row.match_id = ctrl_id;  // PE rh+8 after Bind @ cam+0x4
+        if (b_id != 0)
+          bind_b = res_handle_bind_resolve(row.rh_b, b_id, 1);
+        if (c_id != 0) {
+          res_handle_rebind(row.rh_c, c_node);
+          if (!c_node) {
+            auto* w = reinterpret_cast<int32_t*>(row.rh_c);
+            w[2] = c_id;
+          }
+        }
+      }
+      r.activated = 1;
+      r.activate_a = ctrl_id;
+      r.activate_b = b_id;
+      r.activate_c = c_id;
+      cam_rows_tree_sync(self, r, cam_count);
+    }
+    tree_field_set_int(self, "activated", 1);
+    tree_field_set_int(self, "activate_a", ctrl_id);
+    tree_field_set_int(self, "activate_b", b_id);
+    tree_field_set_int(self, "activate_c", c_id);
+    tree_field_set_int(self, "activate_cam_idx", cam_idx);
+    tree_field_set_int(self, "activate_bind_ctrl", bind_a);
+    tree_field_set_int(self, "activate_bind_b", bind_b);
+    tree_field_set_int(self, "cmd_activate",
+                       tree_field_get_int(self, "cmd_activate") + 1);
+    // PE @ 0x4591c7 / 0x4592a2: Chassis_camApplyBoundSlot after Bind.
+    if (cam_idx >= 0) {
+      int32_t osd_live = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_gr_mu);
+        if (cam_idx < GameRefState::kCamTableMax)
+          osd_live = ref(self)
+                         .cam_rows[static_cast<size_t>(cam_idx)]
+                         .osd_bound_id != 0
+                         ? 1
+                         : 0;
+      }
+      chassis_cam_apply_bound_slot(chassis, cam_idx, osd_live);
+    }
+    return;
+  }
+  if (std::strcmp(tok, "deactivate") == 0) {
+    // PE hide/deactivate paths Unlink cam embeds + findCam clear; host:
+    // zero match_id for activate_a row (free slot for next activate).
+    int32_t cleared = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& r = ref(self);
+      const int32_t want = r.activate_a;
+      if (want != 0) {
+        for (auto& row : r.cam_rows) {
+          if (row.match_id == want) {
+            row.match_id = 0;
+            row.osd_bound_id = 0;
+            std::memset(row.rh_ctrl, 0, sizeof(row.rh_ctrl));
+            std::memset(row.rh_b, 0, sizeof(row.rh_b));
+            std::memset(row.rh_c, 0, sizeof(row.rh_c));
+            std::memset(row.rh_osd, 0, sizeof(row.rh_osd));
+            ++cleared;
+          }
+        }
+      }
+      r.activated = 0;
+      cam_rows_tree_sync(self, r, GameRefState::kCamTableMax);
+    }
+    tree_field_set_int(self, "activated", 0);
+    tree_field_set_int(self, "deactivate_cleared", cleared);
+    return;
+  }
+  if (std::strcmp(tok, "next") == 0) {
+    tree_field_set_int(self, "cmd_next",
+                       tree_field_get_int(self, "cmd_next") + 1);
+    return;
+  }
+  if (std::strcmp(tok, "prev") == 0) {
+    tree_field_set_int(self, "cmd_prev",
+                       tree_field_get_int(self, "cmd_prev") + 1);
+    return;
+  }
+  if (std::strcmp(tok, "corpse") == 0) {
+    tree_field_set_int(self, "corpse", 1);
+    return;
+  }
+  // PE @ 0x459A07 "pickup": first `%*s %d %d` (defaults 0,1); if first
+  // int≠0 → exit. Else `%*s %32s %d` — second token:
+  //   "health" @ 0x459A6A: add scaled int to +0xB4 (cap 1.0f);
+  //   "ammo"   @ 0x459ACE: match → immediate ret (no-op);
+  //   "all"    @ 0x459AEA: set +0xB4=1.0f.
+  // These are NOT first-token strcmp (only nested under pickup).
+  // race125: nested ammo no-op; +0xB4 via ammo_frac float stand-in.
+  if (std::strcmp(tok, "pickup") == 0) {
+    s += 6;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    // Nested form: "pickup health N" / "pickup all" / "pickup ammo" (nop)
+    if (std::strncmp(s, "health", 6) == 0 &&
+        (s[6] == ' ' || s[6] == '\t' || s[6] == '\0')) {
+      s += 6;
+      while (*s == ' ' || *s == '\t') ++s;
+      const long v = std::strtol(s, &end, 10);
+      if (end == s) return;
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& r = ref(self);
+      // PE +0xB4 float frac: add then cap at 1.0 — host health int + frac.
+      r.health += static_cast<int32_t>(v);
+      float frac = tree_field_get_float(self, "ammo_frac") +
+                   static_cast<float>(v);
+      if (frac > 1.f) frac = 1.f;
+      if (frac < 0.f) frac = 0.f;
+      tree_field_set_int(self, "health", r.health);
+      tree_field_set_float(self, "ammo_frac", frac);
+      return;
+    }
+    if (std::strncmp(s, "ammo", 4) == 0 &&
+        (s[4] == ' ' || s[4] == '\t' || s[4] == '\0')) {
+      // PE @ 0x459ADE: ammo match → jz exit (no store).
+      return;
+    }
+    if (std::strcmp(s, "all") == 0 ||
+        (std::strncmp(s, "all", 3) == 0 &&
+         (s[3] == ' ' || s[3] == '\t' || s[3] == '\0'))) {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      ref(self).ammo = 1;  // PE +0xB4 = 1.0f full
+      tree_field_set_int(self, "ammo", 1);
+      tree_field_set_float(self, "ammo_frac", 1.f);
+      return;
+    }
+    const long v = *s ? std::strtol(s, &end, 10) : 1;
+    if (*s && end == s) return;
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    ref(self).pickup = static_cast<int32_t>(v);
+    tree_field_set_int(self, "pickup", static_cast<int32_t>(v));
+    return;
+  }
+  // PE has no first-token "health"/"ammo" (only nested under pickup).
+  // Host stand-in kept for TREE callers that emit bare tokens.
+  if (std::strcmp(tok, "health") == 0) {
+    s += 6;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s) return;
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    ref(self).health = static_cast<int32_t>(v);
+    tree_field_set_int(self, "health", static_cast<int32_t>(v));
+    return;
+  }
+  if (std::strcmp(tok, "ammo") == 0) {
+    // PE nested ammo is no-op; bare first-token also no-op (no invent parse).
+    return;
+  }
+  // PE @ 0x45A5DA install / 0x45A6BF remove / 0x45A71A cancel / 0x45A76D repair.
+  if (std::strcmp(tok, "install") == 0 || std::strcmp(tok, "remove") == 0 ||
+      std::strcmp(tok, "cancel") == 0 || std::strcmp(tok, "repair") == 0) {
+    char key[32];
+    std::snprintf(key, sizeof(key), "cmd_%s", tok);
+    tree_field_set_int(self, key, tree_field_get_int(self, key) + 1);
+    return;
+  }
+  // PE @ 0x45AF19 "updatevariables".
+  if (std::strcmp(tok, "updatevariables") == 0) {
+    tree_field_set_int(self, "updatevariables",
+                       tree_field_get_int(self, "updatevariables") + 1);
+    return;
+  }
+  // PE @ 0x45BBA6 autopilot_on / 0x45BBF7 autopilot_off — store 1/0 at
+  // gameInst[+0x180] stride (host: GameRefState.autopilot).
+  if (std::strcmp(tok, "autopilot_on") == 0) {
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    ref(self).autopilot = 1;
+    tree_field_set_int(self, "autopilot", 1);
+    return;
+  }
+  if (std::strcmp(tok, "autopilot_off") == 0) {
+    std::lock_guard<std::mutex> lock(g_gr_mu);
+    ref(self).autopilot = 0;
+    tree_field_set_int(self, "autopilot", 0);
+    return;
+  }
+  if (std::strcmp(tok, "ai_cheat") == 0) {
+    tree_field_set_int(self, "ai_cheat",
+                       tree_field_get_int(self, "ai_cheat") + 1);
+    return;
+  }
+  // race120/126 — physical EVENT_COMMAND cluster (sub_458C00 @ 0x45AE64..).
+  // Light/wing/mslot intrusive lists + rollbar table ported on GameRefState
+  // (PE blob +0x206C/+0x2088/+0x20A4/+0x1FBC). Chassis slot tables still OOS.
+  // IDA: ResHandle_orPayloadFlags @ 0x48D1F0, RenderRef_applyBoneId @ 0x48BD30.
+  // PE @ 0x45AE64 "add_part": scanf "%*s %d" → GameRef_cmdAddPart @ 0x45AE95
+  // (alias "addpart") + Chassis_attachPartSlot @ 0x45AEA1 (flag |1 @ +0x88).
+  // W9B: cmdAddPart @ 0x447B82 inserts *[phys+0xDC] via physDcList_insertTail.
+  // W17D: attachPartSlot @ 0x43F2E0 walks SimObjectList(+0x1154).head@+0x115C
+  // — Chassis producer/consumer OOS here (no GameRef list insert). phys+0x78
+  // table = Part_buildPhysSlotTable @ 0x46EAE0 (Chassis_allocCamBlob).
+  if (std::strcmp(tok, "add_part") == 0) {
+    s += 8;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long id = std::strtol(s, &end, 10);
+    if (end == s) return;
+    const int32_t rid = static_cast<int32_t>(id);
+    tree_field_set_int(self, "cmd_add_part",
+                       tree_field_get_int(self, "cmd_add_part") + 1);
+    tree_field_set_int(self, "add_part_id", rid);
+    InvObject* type = resref_find_by_id(rid);
+    if (!type) return;
+    InvObject* part = gameref_new();
+    java_util_resource_GameRef_create(part, self, type, string_new(""),
+                                      string_new("addpart"));
+    int32_t parent_slot = 0, child_slot = 0;
+    if (part_find_cfg_install(self, part, &parent_slot, &child_slot))
+      part_install(self, parent_slot, part, child_slot);
+    else
+      java_util_resource_GameRef_setParent(part, self);
+    gameref_phys_dc_add_part(self, part);  // PE @ 0x447B82
+    tree_field_set_obj(self, "last_add_part", part);
+    return;
+  }
+  // PE @ 0x45AEC6 "rem_part": scanf "%*s %d" → Chassis_detachPartSlot +
+  // GameRef_cmdRemPart (alias "rempart").
+  // W9B: cmdRemPart @ 0x448047 walks/unlinks *[phys+0xDC] node.
+  if (std::strcmp(tok, "rem_part") == 0) {
+    s += 8;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long id = std::strtol(s, &end, 10);
+    if (end == s) return;
+    const int32_t rid = static_cast<int32_t>(id);
+    tree_field_set_int(self, "cmd_rem_part",
+                       tree_field_get_int(self, "cmd_rem_part") + 1);
+    tree_field_set_int(self, "rem_part_id", rid);
+    InvObject* part = resref_find_by_id(rid);
+    if (!part) part = tree_field_get_obj(self, "last_add_part");
+    if (!part) return;
+    gameref_phys_dc_rem_part(self, part);  // PE @ 0x448047
+    part_uninstall(part);
+    java_util_resource_GameRef_setParent(part, nullptr);
+    return;
+  }
+  // PE @ 0x45AF46 "add_light": scanf "%*s %d %d" (type handle, flags);
+  // malloc 0x2C; sub_429130; ResHandle_Rebind(node+0xC, type+0xC);
+  // node+0x1C=flags; intensity @ +0x20/+0x28 if flags&8|0x30;
+  // list insert +0x206C/+0x2074; unless flags&0x40 → orPayloadFlags 0x400000.
+  if (std::strcmp(tok, "add_light") == 0) {
+    s += 9;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long type_id = std::strtol(s, &end, 10);
+    if (end == s) return;
+    s = end;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long flags_l = *s ? std::strtol(s, &end, 10) : 0;
+    const int32_t flags = static_cast<int32_t>(flags_l);
+    tree_field_set_int(self, "cmd_add_light",
+                       tree_field_get_int(self, "cmd_add_light") + 1);
+    tree_field_set_int(self, "add_light_type_id",
+                       static_cast<int32_t>(type_id));
+    tree_field_set_int(self, "add_light_flags", flags);
+    InvObject* type = resref_find_by_id(static_cast<int32_t>(type_id));
+    if (!type) return;
+    InvObject* light = gameref_new();
+    java_util_resource_ResourceRef_set(
+        light, java_util_resource_ResourceRef_id(type));
+    java_util_resource_GameRef_setParent(light, self);
+    tree_field_set_int(light, "light_flags", flags);
+    auto node = std::make_unique<GameRefState::PeLightNode>();
+    node->type = type;
+    node->flags = flags;
+    node->light_obj = light;
+    // PE @ 0x45AFC9: ResHandle_Rebind(node+0xC, *(type+0xC)); +0x14←*(rh+8).
+    node->match_key = void_event_res_handle_rebind_owner(
+        node->rh, type, static_cast<int32_t>(type_id));
+    if (node->match_key == 0) node->match_key = static_cast<int32_t>(type_id);
+    // PE @ 0x45AFD5: flags&8 → rand intensity; flags&0x30 → (obj+8&0xF)*0.01+0.4
+    // flt_5F0DBC=1/32768, flt_5F0D50=0.4, flt_5F0CD4=0.2, flt_5F0C20=0.01,
+    // flt_5F09D0=0.5 (IDA bytes @ 0x5F0DBC..).
+    if (flags & 8) {
+      const float r01 =
+          static_cast<float>(std::rand() & 0x7FFF) * (1.f / 32768.f);
+      node->f20 = r01 * 0.4f + 0.2f;
+      node->f24 = 0.f;
+      node->f28 = node->f20 * 0.5f;
+    } else if (flags & 0x30) {
+      int32_t lo4 = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_gr_mu);
+        lo4 = ref(self).flags & 0xF;
+      }
+      node->f20 = static_cast<float>(lo4) * 0.01f + 0.4f;
+      node->f24 = 0.f;
+      node->f28 = node->f20 * 0.5f;
+    }
+    tree_field_set_float(light, "light_f20", node->f20);
+    tree_field_set_float(light, "light_f28", node->f28);
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      GameRefState::PeLightNode* raw = node.get();
+      pe_light_insert_tail(st, raw);
+      st.light_nodes.push_back(std::move(node));
+    }
+    // PE ResHandle_orPayloadFlags(type, 0x400000) @ 0x48D1F0 / 0x45B05C
+    // when !(flags & 0x40).
+    if ((flags & 0x40) == 0) res_handle_or_payload_flags(type, 0x400000);
+    tree_field_set_obj(self, "last_add_light", light);
+    tree_field_set_int(self, "pe_light_count",
+                       tree_field_get_int(self, "pe_light_count") + 1);
+    return;
+  }
+  // PE @ 0x45B077 "rem_light": scanf "%*s %d %d"; walk list from +0x2064;
+  // match node+0x14==key; node+0x1C &= ~mask; if flags left keep node;
+  // else andNot/or 0x400000 (mask&0x40) + vtbl dtor.
+  if (std::strcmp(tok, "rem_light") == 0) {
+    s += 9;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long key = *s ? std::strtol(s, &end, 10) : 0;
+    if (*s && end == s) return;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long mask_l = *s ? std::strtol(s, &end, 10) : 0;
+    const int32_t mask = static_cast<int32_t>(mask_l);
+    tree_field_set_int(self, "cmd_rem_light",
+                       tree_field_get_int(self, "cmd_rem_light") + 1);
+    tree_field_set_int(self, "rem_light_key", static_cast<int32_t>(key));
+    tree_field_set_int(self, "rem_light_flags", mask);
+    InvObject* light_obj = nullptr;
+    InvObject* typ = nullptr;
+    bool destroy = false;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      auto* sent = st.light_sent.get();
+      GameRefState::PeLightNode* cur =
+          sent && sent->next && sent->next != sent ? sent->next : nullptr;
+      while (cur && cur != sent) {
+        GameRefState::PeLightNode* nxt = cur->next;
+        if (cur->match_key == static_cast<int32_t>(key)) {
+          cur->flags &= ~mask;
+          if (cur->flags != 0) break;
+          typ = cur->type;
+          light_obj = cur->light_obj;
+          destroy = true;
+          // PE GameRef_LightNode_dtor @ 0x45F8B0: unlink rh from owner list.
+          void_event_res_handle_unbind_owner(cur->rh);
+          pe_light_unlink(st, cur);
+          for (auto it = st.light_nodes.begin(); it != st.light_nodes.end();
+               ++it) {
+            if (it->get() == cur) {
+              st.light_nodes.erase(it);
+              break;
+            }
+          }
+          break;
+        }
+        cur = (nxt && nxt != sent) ? nxt : nullptr;
+      }
+    }
+    if (destroy) {
+      if (light_obj) java_util_resource_GameRef_setParent(light_obj, nullptr);
+      // PE @ 0x45B100: mask&0x40 → andNot else or 0x400000 on type handle.
+      if (typ) {
+        if (mask & 0x40)
+          res_handle_and_not_payload_flags(typ, 0x400000);
+        else
+          res_handle_or_payload_flags(typ, 0x400000);
+      }
+      if (tree_field_get_obj(self, "last_add_light") == light_obj)
+        tree_field_set_obj(self, "last_add_light", nullptr);
+      const int32_t n = tree_field_get_int(self, "pe_light_count");
+      if (n > 0) tree_field_set_int(self, "pe_light_count", n - 1);
+    }
+    return;
+  }
+  // PE @ 0x45B15D "add_wing": scanf "%*s %d %d"; malloc 0x1C; +0x0C=2nd,
+  // +0x10=1st handle; list insert +0x2088/+0x2090.
+  if (std::strcmp(tok, "add_wing") == 0) {
+    s += 8;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long a = std::strtol(s, &end, 10);
+    if (end == s) return;
+    s = end;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long b = *s ? std::strtol(s, &end, 10) : 0;
+    tree_field_set_int(self, "cmd_add_wing",
+                       tree_field_get_int(self, "cmd_add_wing") + 1);
+    tree_field_set_int(self, "add_wing_a", static_cast<int32_t>(a));
+    tree_field_set_int(self, "add_wing_b", static_cast<int32_t>(b));
+    InvObject* wing = resref_find_by_id(static_cast<int32_t>(a));
+    if (wing) java_util_resource_GameRef_setParent(wing, self);
+    auto node = std::make_unique<GameRefState::PeWingNode>();
+    node->key_a = static_cast<int32_t>(a);
+    node->key_b = static_cast<int32_t>(b);
+    node->handle_a = wing;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      GameRefState::PeWingNode* raw = node.get();
+      pe_wing_insert_tail(st, raw);
+      st.wing_nodes.push_back(std::move(node));
+    }
+    if (wing) tree_field_set_obj(self, "last_add_wing", wing);
+    tree_field_set_int(self, "pe_wing_count",
+                       tree_field_get_int(self, "pe_wing_count") + 1);
+    return;
+  }
+  // PE @ 0x45B223 "rem_wing": scanf "%*s %d %d"; match list @ +0x2080
+  // node+0xC==2nd && node+0x10==1st; release +0x10 ref + vtbl dtor.
+  if (std::strcmp(tok, "rem_wing") == 0) {
+    s += 8;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long a = *s ? std::strtol(s, &end, 10) : 0;
+    if (*s && end == s) return;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long b = *s ? std::strtol(s, &end, 10) : 0;
+    tree_field_set_int(self, "cmd_rem_wing",
+                       tree_field_get_int(self, "cmd_rem_wing") + 1);
+    tree_field_set_int(self, "rem_wing_a", static_cast<int32_t>(a));
+    tree_field_set_int(self, "rem_wing_b", static_cast<int32_t>(b));
+    InvObject* wing = nullptr;
+    bool removed = false;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      auto* sent = st.wing_sent.get();
+      GameRefState::PeWingNode* cur =
+          sent && sent->next && sent->next != sent ? sent->next : nullptr;
+      while (cur && cur != sent) {
+        GameRefState::PeWingNode* nxt = cur->next;
+        if (cur->key_a == static_cast<int32_t>(a) &&
+            cur->key_b == static_cast<int32_t>(b)) {
+          wing = cur->handle_a;
+          pe_wing_unlink(st, cur);
+          for (auto it = st.wing_nodes.begin(); it != st.wing_nodes.end();
+               ++it) {
+            if (it->get() == cur) {
+              st.wing_nodes.erase(it);
+              break;
+            }
+          }
+          removed = true;
+          break;
+        }
+        cur = (nxt && nxt != sent) ? nxt : nullptr;
+      }
+    }
+    if (wing) java_util_resource_GameRef_setParent(wing, nullptr);
+    if (wing && tree_field_get_obj(self, "last_add_wing") == wing)
+      tree_field_set_obj(self, "last_add_wing", nullptr);
+    if (removed) {
+      const int32_t n = tree_field_get_int(self, "pe_wing_count");
+      if (n > 0) tree_field_set_int(self, "pe_wing_count", n - 1);
+    }
+    return;
+  }
+  // PE @ 0x45B2F9 "add_rollbar": scanf "%*s %d %d %f %f" (defaults
+  // 0x461C4000=1e4, 0x43FA0000=500); *[+0x1FBC]+0x44 count max 8;
+  // entry at +0x48+16*i = {i0,i1,f0,f1}. Host: GameRefState.rollbars.
+  if (std::strcmp(tok, "add_rollbar") == 0) {
+    s += 11;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long i0 = *s ? std::strtol(s, &end, 10) : -1;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long i1 = *s ? std::strtol(s, &end, 10) : -1;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    float f0 = 10000.f, f1 = 500.f;
+    if (*s) {
+      f0 = std::strtof(s, &end);
+      if (end != s) {
+        s = end;
+        while (*s == ' ' || *s == '\t') ++s;
+        if (*s) f1 = std::strtof(s, &end);
+      }
+    }
+    tree_field_set_int(self, "cmd_add_rollbar",
+                       tree_field_get_int(self, "cmd_add_rollbar") + 1);
+    tree_field_set_int(self, "rollbar_a", static_cast<int32_t>(i0));
+    tree_field_set_int(self, "rollbar_b", static_cast<int32_t>(i1));
+    tree_field_set_float(self, "rollbar_f0", f0);
+    tree_field_set_float(self, "rollbar_f1", f1);
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      if (st.rollbars.size() < 8) {
+        GameRefState::PeRollbarEntry e;
+        e.a = static_cast<int32_t>(i0);
+        e.b = static_cast<int32_t>(i1);
+        e.f0 = f0;
+        e.f1 = f1;
+        st.rollbars.push_back(e);
+      }
+    }
+    return;
+  }
+  // PE @ 0x45B38A "rem_rollbar": match a/b/f0/f1; splice last entry over.
+  if (std::strcmp(tok, "rem_rollbar") == 0) {
+    s += 11;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long i0 = *s ? std::strtol(s, &end, 10) : -1;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long i1 = *s ? std::strtol(s, &end, 10) : -1;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    float f0 = 10000.f, f1 = 500.f;
+    if (*s) {
+      f0 = std::strtof(s, &end);
+      if (end != s) {
+        s = end;
+        while (*s == ' ' || *s == '\t') ++s;
+        if (*s) f1 = std::strtof(s, &end);
+      }
+    }
+    tree_field_set_int(self, "cmd_rem_rollbar",
+                       tree_field_get_int(self, "cmd_rem_rollbar") + 1);
+    tree_field_set_int(self, "rollbar_a", static_cast<int32_t>(i0));
+    tree_field_set_int(self, "rollbar_b", static_cast<int32_t>(i1));
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      for (size_t i = 0; i < st.rollbars.size(); ++i) {
+        auto& e = st.rollbars[i];
+        if (e.a == static_cast<int32_t>(i0) &&
+            e.b == static_cast<int32_t>(i1) && e.f0 == f0 && e.f1 == f1) {
+          st.rollbars[i] = st.rollbars.back();
+          st.rollbars.pop_back();
+          break;
+        }
+      }
+    }
+    return;
+  }
+  // PE @ 0x45B46E "add_linked": scanf "%*s %d %d %d %d"; Veh_ensureSceneBound
+  // ×2; RenderRef_bindBone("bone00"/"bone01") @ 0x48BC40 +
+  // RenderRef_applyBoneId @ 0x48BD30. Host: getBoneId (JNI→bindBone).
+  if (std::strcmp(tok, "add_linked") == 0) {
+    s += 10;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long i0 = *s ? std::strtol(s, &end, 10) : 0;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long i1 = *s ? std::strtol(s, &end, 10) : -1;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long i2 = *s ? std::strtol(s, &end, 10) : 0;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long i3 = *s ? std::strtol(s, &end, 10) : 0;
+    tree_field_set_int(self, "cmd_add_linked",
+                       tree_field_get_int(self, "cmd_add_linked") + 1);
+    tree_field_set_int(self, "linked_i0", static_cast<int32_t>(i0));
+    tree_field_set_int(self, "linked_i1", static_cast<int32_t>(i1));
+    InvObject* a = resref_find_by_id(static_cast<int32_t>(i2));
+    InvObject* b = resref_find_by_id(static_cast<int32_t>(i3));
+    if (a) {
+      tree_field_set_obj(self, "linked_a", a);
+      int32_t b0 =
+          java_util_resource_RenderRef_getBoneId(a, string_new("bone00"));
+      int32_t b1 =
+          java_util_resource_RenderRef_getBoneId(a, string_new("bone01"));
+      tree_field_set_int(self, "linked_bone00", b0);
+      tree_field_set_int(self, "linked_bone01", b1);
+      // PE RenderRef_applyBoneId @ 0x48BD30 after bindBone.
+      render_ref_apply_bone_id(a, b0);
+      render_ref_apply_bone_id(a, b1);
+    }
+    if (b) {
+      tree_field_set_obj(self, "linked_b", b);
+      int32_t b0 =
+          java_util_resource_RenderRef_getBoneId(b, string_new("bone00"));
+      int32_t b1 =
+          java_util_resource_RenderRef_getBoneId(b, string_new("bone01"));
+      render_ref_apply_bone_id(b, b0);
+      render_ref_apply_bone_id(b, b1);
+    }
+    return;
+  }
+  // PE @ 0x45B6D9 "rem_linked": scanf 4 ints; bindBone bone00/01 then dtor.
+  if (std::strcmp(tok, "rem_linked") == 0) {
+    s += 10;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long i0 = *s ? std::strtol(s, &end, 10) : 0;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long i1 = *s ? std::strtol(s, &end, 10) : -1;
+    tree_field_set_int(self, "cmd_rem_linked",
+                       tree_field_get_int(self, "cmd_rem_linked") + 1);
+    tree_field_set_int(self, "linked_i0", static_cast<int32_t>(i0));
+    tree_field_set_int(self, "linked_i1", static_cast<int32_t>(i1));
+    InvObject* a = tree_field_get_obj(self, "linked_a");
+    if (a) {
+      java_util_resource_RenderRef_getBoneId(a, string_new("bone00"));
+      java_util_resource_RenderRef_getBoneId(a, string_new("bone01"));
+    }
+    tree_field_set_obj(self, "linked_a", nullptr);
+    tree_field_set_obj(self, "linked_b", nullptr);
+    return;
+  }
+  // PE @ 0x45B7E3 "add_mslot": scanf "%*s %d %d"; ResListNode_ctor;
+  // malloc 0x54; +0x0C/+0x10 keys; mesh memcpy from handle+0x2C/+0x38 OOS;
+  // list +0x20A4/+0x20AC.
+  if (std::strcmp(tok, "add_mslot") == 0) {
+    s += 9;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long a = std::strtol(s, &end, 10);
+    if (end == s) return;
+    s = end;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long b = *s ? std::strtol(s, &end, 10) : 0;
+    tree_field_set_int(self, "cmd_add_mslot",
+                       tree_field_get_int(self, "cmd_add_mslot") + 1);
+    tree_field_set_int(self, "mslot_a", static_cast<int32_t>(a));
+    tree_field_set_int(self, "mslot_b", static_cast<int32_t>(b));
+    auto node = std::make_unique<GameRefState::PeMslotNode>();
+    node->key_a = static_cast<int32_t>(a);
+    node->key_b = static_cast<int32_t>(b);
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      GameRefState::PeMslotNode* raw = node.get();
+      pe_mslot_insert_tail(st, raw);
+      st.mslot_nodes.push_back(std::move(node));
+    }
+    tree_field_set_int(self, "pe_mslot_count",
+                       tree_field_get_int(self, "pe_mslot_count") + 1);
+    return;
+  }
+  // PE @ 0x45B89A "rem_mslot": scanf "%*s %d %d"; unlink @ +0x209C
+  // match +0x0C/+0x10.
+  if (std::strcmp(tok, "rem_mslot") == 0) {
+    s += 9;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long a = *s ? std::strtol(s, &end, 10) : 0;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long b = *s ? std::strtol(s, &end, 10) : 0;
+    tree_field_set_int(self, "cmd_rem_mslot",
+                       tree_field_get_int(self, "cmd_rem_mslot") + 1);
+    tree_field_set_int(self, "mslot_a", static_cast<int32_t>(a));
+    tree_field_set_int(self, "mslot_b", static_cast<int32_t>(b));
+    bool removed = false;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& st = ref(self);
+      auto* sent = st.mslot_sent.get();
+      GameRefState::PeMslotNode* cur =
+          sent && sent->next && sent->next != sent ? sent->next : nullptr;
+      while (cur && cur != sent) {
+        GameRefState::PeMslotNode* nxt = cur->next;
+        if (cur->key_a == static_cast<int32_t>(a) &&
+            cur->key_b == static_cast<int32_t>(b)) {
+          pe_mslot_unlink(st, cur);
+          for (auto it = st.mslot_nodes.begin(); it != st.mslot_nodes.end();
+               ++it) {
+            if (it->get() == cur) {
+              st.mslot_nodes.erase(it);
+              break;
+            }
+          }
+          removed = true;
+          break;
+        }
+        cur = (nxt && nxt != sent) ? nxt : nullptr;
+      }
+    }
+    if (removed) {
+      const int32_t n = tree_field_get_int(self, "pe_mslot_count");
+      if (n > 0) tree_field_set_int(self, "pe_mslot_count", n - 1);
+    }
+    return;
+  }
+  // PE @ 0x45C3FD "AI_GoToTrafficSlow" — also fired from EVENT 0x80 case2
+  // after LoadGameInit Rebind @ 0x45C3C9 (W9B). sub_45F780 AI cmd +
+  // sub_48B750 (0x80000080) traffic-slow path (OOS). Host counter only.
+  if (std::strcmp(tok, "AI_GoToTrafficSlow") == 0) {
+    tree_field_set_int(self, "cmd_AI_GoToTrafficSlow",
+                       tree_field_get_int(self, "cmd_AI_GoToTrafficSlow") + 1);
+    return;
+  }
+  // W13A — PE @ 0x4594B4 "osd": scanf "%*s %d %d" defaults 0,0.
+  // Disasm 0x4594CA..0x45952E: first %d→arg_8=osd.id, second→arg_C=ctrl;
+  // findCam(arg_C) @ 0x4594F5; if cam+0x5C!=arg_8 Bind(cam+0x54, arg_8,
+  // type=1) @ 0x45952E then Chassis_camApplyBoundSlot @ 0x449680.
+  // Java Track: "osd "+osd.id()+" "+con.id(); single-arg → findCam(0).
+  // osd.id lands @ cam+0x5C — NOT blob+0x128 (that stays ctrl/activate).
+  if (std::strcmp(tok, "osd") == 0) {
+    s += 3;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const long oid = *s ? std::strtol(s, &end, 10) : 0;
+    if (*s && end == s) return;
+    s = end ? end : s;
+    while (*s == ' ' || *s == '\t') ++s;
+    const long cid = *s ? std::strtol(s, &end, 10) : 0;
+    const int32_t osd_id = static_cast<int32_t>(oid);
+    const int32_t ctrl_id = static_cast<int32_t>(cid);
+    InvObject* chassis = tree_field_get_obj(self, "chassis");
+    if (!chassis) chassis = self;
+    chassis_cam_tables_ensure(chassis);
+    const int32_t cam_count = cam_table_count_for(self, chassis);
+    int32_t cam_idx = -1;
+    int32_t bind_ok = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto& r = ref(self);
+      r.osd_id = osd_id;
+      r.osd_ctrl_id = ctrl_id;
+      // PE @ 0x4594EB..0x4594F5: findCam(arg_C=ctrl) start=0 step=1.
+      cam_idx = find_cam_index_by_match_id_unlocked(r, cam_count, ctrl_id, 0,
+                                                    1);
+      if (cam_idx >= 0 && cam_idx < GameRefState::kCamTableMax) {
+        auto& row = r.cam_rows[static_cast<size_t>(cam_idx)];
+        // PE @ 0x459510..0x459520: if cam+0x5C == osd.id → skip Bind.
+        if (row.osd_bound_id != osd_id) {
+          // PE @ 0x45952E ResHandle_Bind(cam+0x54, osd.id, type=1, 0).
+          bind_ok = res_handle_bind_resolve(row.rh_osd, osd_id, 1);
+          row.osd_bound_id = osd_id;  // PE key @ cam+0x5C / blob+0x178
+        }
+        r.osd_cam_idx = cam_idx;
+        r.osd_bind_ok = bind_ok;
+      } else {
+        r.osd_cam_idx = -1;
+        r.osd_bind_ok = 0;
+      }
+      cam_rows_tree_sync(self, r, cam_count);
+    }
+    tree_field_set_int(self, "osd_id", osd_id);
+    tree_field_set_int(self, "osd_ctrl_id", ctrl_id);
+    tree_field_set_int(self, "osd_cam_idx", cam_idx);
+    tree_field_set_int(self, "osd_bind_ok", bind_ok);
+    tree_field_set_int(self, "osd_bound", osd_id != 0 ? 1 : 0);
+    tree_field_set_int(self, "cmd_osd",
+                       tree_field_get_int(self, "cmd_osd") + 1);
+    // PE @ 0x459537: Chassis_camApplyBoundSlot after osd Bind.
+    if (cam_idx >= 0)
+      chassis_cam_apply_bound_slot(chassis, cam_idx, osd_id != 0 ? 1 : 0);
+    return;
+  }
+  // PE @ 0x458DD5 "camera_int_viewrange" — scanf float then
+  // ResHandle_getPayload camera chain (OOS). Host: store float stand-in.
+  if (std::strcmp(tok, "camera_int_viewrange") == 0) {
+    s += 20;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    const float v = std::strtof(s, &end);
+    if (end != s) tree_field_set_float(self, "camera_int_viewrange", v);
+    tree_field_set_int(self, "cmd_camera_int_viewrange",
+                       tree_field_get_int(self, "cmd_camera_int_viewrange") + 1);
+    return;
+  }
+  // PE @ 0x45AAEB texture / 0x45ABCC mesh / 0x45ADD1 paint / decals —
+  // counters only (RenderInst paths OOS).
+  if (std::strcmp(tok, "texture") == 0 || std::strcmp(tok, "mesh") == 0 ||
+      std::strcmp(tok, "paint") == 0 || std::strcmp(tok, "decal") == 0 ||
+      std::strcmp(tok, "bigdecal") == 0) {
+    char key[32];
+    std::snprintf(key, sizeof(key), "cmd_%s", tok);
+    tree_field_set_int(self, key, tree_field_get_int(self, key) + 1);
+    return;
+  }
+  // race124/126 — IDA string-xref audit of sub_458C00 (size 0x38fe):
+  // first-token strcmp covered. Light/wing/mslot intrusive lists + rollbar
+  // table on GameRefState (PE +0x206C/+0x2088/+0x20A4/+0x1FBC). W9B/W11A:
+  // EVENT 0x80 case2 LoadGameInit Rebind + phys+0xDC list via cmdAddPart
+  // (exported gameref_phys_dc_*); render Bind(vp, RESOURCE_VIEWPORT=0x12)
+  // @ 0x458d42 → LookupById @ 0x536820 + Rebind when slot map filled.
+  // Remaining gap: Chassis forceUpdate → gameref_phys_dc_*; Engine_addTimer
+  // 0x80000080; PE gates +0x1FC0/+0x1FCC/+0x1FD0 GII_CONTROL; full
+  // LoadGameInit factory. W12A/W13A: findCam +0x128 rows + activate/render;
+  // osd Bind(cam+0x54, osd.id) @ 0x45952E (match=+0x128 stays ctrl).
+  // navigator_paint map OSD gated when tiles_absolu (PE updateNavigator
+  // @ 0x482D30 has no OSD). Soft: Chassis_camApplyBoundSlot @ 0x449680
+  // bones/gauges OOS; route/marker OSD host-only.
   // Phase 2.125 — MouseCursor GameRef EVENT_COMMAND (cursor/move/mode/…).
   auto cursor_owner = [self]() -> InvObject* {
     InvObject* parent = nullptr;
     {
-      std::lock_guard<std::mutex> lock(g_mu);
+      std::lock_guard<std::mutex> lock(g_gr_mu);
       auto it = g_refs.find(self);
       if (it != g_refs.end()) parent = it->second.parent;
     }
@@ -1337,7 +2811,7 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
       tree_field_set_int(owner, "cursor_set", 1);
     }
     {
-      std::lock_guard<std::mutex> lock(g_mu);
+      std::lock_guard<std::mutex> lock(g_gr_mu);
       auto& r = ref(gr);
       r.px = x;
       r.py = y;
@@ -1446,6 +2920,12 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
         cam_id ? resref_find_by_id(static_cast<int32_t>(cam_id)) : nullptr;
     tree_field_set_int(self, "cursor_ctrl_id", static_cast<int32_t>(ctrl_id));
     tree_field_set_int(self, "cursor_active", 1);
+    {
+      // PE @ 0x459109 "activate" also marks instance active (host stand-in).
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      ref(self).activated = 1;
+    }
+    tree_field_set_int(self, "activated", 1);
     if (ctrl) tree_field_set_obj(self, "controller", ctrl);
     if (owner) {
       tree_field_set_int(owner, "cursor_active", 1);
@@ -1511,7 +2991,7 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
   if (std::strncmp(s, "install", 7) != 0) return;
   s += 7;
 
-  float tok[8] = {};
+  float ftok[8] = {};
   int n = 0;
   const char* p = s;
   while (*p && n < 8) {
@@ -1520,12 +3000,12 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
     char* end = nullptr;
     const float v = std::strtof(p, &end);
     if (end == p) break;
-    tok[n++] = v;
+    ftok[n++] = v;
     p = end;
   }
   if (n < 2) return;
 
-  const int32_t dest_id = static_cast<int32_t>(tok[1]);
+  const int32_t dest_id = static_cast<int32_t>(ftok[1]);
   InvObject* dest = resref_find_by_id(dest_id);
   if (!dest) return;
 
@@ -1535,20 +3015,20 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
   float px = 0, py = 0, pz = 0;
   if (n >= 8) {
     // install 0 dest mySlot dest2 destSlot x y z
-    if (static_cast<int32_t>(tok[2]) > 0)
-      child_slot = static_cast<int32_t>(tok[2]);
-    if (static_cast<int32_t>(tok[4]) > 0)
-      parent_slot = static_cast<int32_t>(tok[4]);
-    px = tok[5];
-    py = tok[6];
-    pz = tok[7];
+    if (static_cast<int32_t>(ftok[2]) > 0)
+      child_slot = static_cast<int32_t>(ftok[2]);
+    if (static_cast<int32_t>(ftok[4]) > 0)
+      parent_slot = static_cast<int32_t>(ftok[4]);
+    px = ftok[5];
+    py = ftok[6];
+    pz = ftok[7];
     have_pos = true;
   } else if (n >= 5) {
     // install 0 dest mySlot dest2 destSlot
-    if (static_cast<int32_t>(tok[2]) > 0)
-      child_slot = static_cast<int32_t>(tok[2]);
-    if (static_cast<int32_t>(tok[4]) > 0)
-      parent_slot = static_cast<int32_t>(tok[4]);
+    if (static_cast<int32_t>(ftok[2]) > 0)
+      child_slot = static_cast<int32_t>(ftok[2]);
+    if (static_cast<int32_t>(ftok[4]) > 0)
+      parent_slot = static_cast<int32_t>(ftok[4]);
   }
 
   if (!part_install(dest, parent_slot, self, child_slot)) return;
@@ -1556,7 +3036,7 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
   // Part.addPart commands on `xa`; keep script instance parent in sync.
   InvObject* script = nullptr;
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     auto it = g_refs.find(self);
     if (it != g_refs.end()) script = it->second.script;
   }
@@ -1566,21 +3046,8 @@ void java_util_resource_GameRef_queueEvent(InvObject* self, InvObject* ro,
     java_util_resource_GameRef_setMatrix(self, vec3_new(px, py, pz), nullptr);
 }
 
-void java_util_resource_GameRef_setActiveCollision(InvObject* self) {
-  // PE @ 0x0047DF80 size 0x71: Unbox this. Native.ptr (dword_62E008)==0 →
-  // Mighty ERROR ("!" @ 0x612F30 + "Mighty ERROR" @ 0x612F34 via
-  // CRT_strcat_n_thunk / Engine_ErrorLogPrintf, Engine_ErrorLogBuf cap 0x100).
-  // Else GameRef_queueActiveCollision @ 0x00498810 size 0x82:
-  // inner=*(handle+0xC); inner==0 → return. *(inner+0x54)&0x10000000 already
-  // queued → return. else OR 0x10000000 (same dword as getFlags),
-  // Engine_malloc(0x1C) node (vtbl off_5F09B4), sub_429060(node+0xC, inner)
-  // (188 xrefs, not ported), splice GameRef_activeCollisionList @ 0x643740
-  // (inlined in sub_4A3BC0). 2 code xrefs. List/node not on host.
-  // Host: physics_set_collide_active (Phase 2.25 pairs). !self = handle 0
-  // (silent; PE logs Mighty).
-  resref_ensure(self);
-  physics_set_collide_active(self, 1);
-}
+
+// → GameRef_collision.cpp
 
 namespace {
 InvObject* g_player = nullptr;
@@ -1687,7 +3154,7 @@ InvObject* game_logic_boot_player_garage() {
   InvObject* ctrl = input_init_controllers();
   InvObject* player = nullptr;
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     if (!g_player) {
       g_player = tree_host_new("java.game.Player");
       tree_field_set_obj(g_player, "controller", ctrl);
@@ -1710,23 +3177,23 @@ InvObject* game_logic_boot_player_garage() {
     if (!g_garage) g_garage = tree_host_new("java.game.Garage");
     player = g_player;
   }
-  // Outside g_mu: ResourceRef_set → gameref_on_res_bound also takes g_mu.
+  // Outside g_gr_mu: ResourceRef_set → gameref_on_res_bound also takes g_gr_mu.
   inventory_ensure_player_parts(player);
   return player;
 }
 
 InvObject* game_logic_player() {
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
   return g_player;
 }
 
 InvObject* game_logic_garage() {
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
   return g_garage;
 }
 
 InvObject* game_logic_racesetup() {
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
   return g_racesetup;
 }
 
@@ -1737,7 +3204,7 @@ void game_logic_set_racesetup(InvObject* rs) {
     const char* hc = tree_host_class(rs);
     if (!hc || !std::strstr(hc, "RaceSetup")) return;
   }
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
   g_racesetup = rs;
 }
 
@@ -1745,7 +3212,7 @@ InvObject* frontend_loading_screen() {
   InvObject* ls = nullptr;
   bool need_start = false;
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     if (!g_loading_screen) {
       g_loading_screen = tree_host_new("java.render.LoadingScreen");
       tree_field_set_int(g_loading_screen, "visible", 0);
@@ -1954,7 +3421,7 @@ void frontend_loading_screen_run(InvObject* self) {
 }
 
 InvObject* frontend_gfx_engine() {
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
   if (!g_gfx_engine) {
     // Frontend.render = new GfxEngine(); LoadingScreen waits on this instance.
     g_gfx_engine = tree_host_new("java.render.GfxEngine");
@@ -2729,7 +4196,7 @@ InvObject* game_logic_change_active_section(InvObject* state) {
   // Host CAS(null) does not request_exit: hub smoke restores Garage after EXIT.
   InvObject* prev = nullptr;
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     prev = g_actual_state;
   }
 
@@ -2753,7 +4220,7 @@ InvObject* game_logic_change_active_section(InvObject* state) {
   }
 
   {
-    std::lock_guard<std::mutex> lock(g_mu);
+    std::lock_guard<std::mutex> lock(g_gr_mu);
     g_actual_state = state;
   }
 
@@ -2775,7 +4242,7 @@ InvObject* game_logic_change_active_section(InvObject* state) {
 }
 
 InvObject* game_logic_actual_state() {
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(g_gr_mu);
   return g_actual_state;
 }
 
@@ -3246,6 +4713,65 @@ static void racesetup_ensure_route(InvObject* rs) {
   if (pFinish) tree_field_set_obj(rs, "pFinish", pFinish);
 }
 
+// Soft deepen City.startRace / countdown / startRace2 — VA natives TREE drops.
+// Stock City.startRace tail (sources City.java ~1007-1012):
+//   setEventMask(EVENT_TIME); abandoned=0; addTimer(1, 9);
+// PE GameType.setEventMask @ 0x004819F0 → GameInstance_orEventMask @ 0x0048D3D0
+//   (OR mask; EVENT_TIME = 0x80).
+// PE GameType.addTimer @ 0x0047E1C0 size 0x9e → Engine_addTimer @ 0x0048B750
+//   type bytes 80 00 00 80 (=0x80000080 oneshot|EVENT_TIME), timerid, msg=0.
+// Countdown City.handleEvent EVENT_TIME param 9→10→11→12 → startRace2.
+// PE haltTrafficCross @ 0x00484B90: map.haltTrafficCross(raceStart, 15.0)
+//   → GroundMap_findNearestCross + GroundMap_haltCrossTraffic(cross, time, 1).
+// PE addNotification @ 0x0047E100 (custmethod): finish Trigger watch
+//   EVENT_TRIGGER_ON / EVENT_SAME → "event_handlerRaceFinish".
+// Hub --no-wait: arm EVENT_TIME + record timer id 9, then collapse 1s walls
+// to the GO leaf (startRace2) once — do not leave a live addTimer(1,9) that
+// would double-fire under pollTimers.
+static void city_start_race_soft_deepen(InvObject* track, InvObject* rs) {
+  if (!track) return;
+  constexpr int32_t kEventTime = 0x00000080;
+  constexpr int32_t kEventTriggerOn = 0x00000020;
+  constexpr int32_t kEventSame = 0;
+
+  InvObject* raceStart = tree_field_get_obj(track, "raceStart");
+  if (!raceStart && rs) raceStart = tree_field_get_obj(rs, "pStart");
+  InvObject* raceFinish = tree_field_get_obj(track, "raceFinish");
+  if (!raceFinish && rs) raceFinish = tree_field_get_obj(rs, "pFinish");
+  if (raceStart && !tree_field_get_obj(track, "raceStart"))
+    tree_field_set_obj(track, "raceStart", raceStart);
+  if (raceFinish && !tree_field_get_obj(track, "raceFinish"))
+    tree_field_set_obj(track, "raceFinish", raceFinish);
+
+  if (rs) tree_field_set_int(track, "prize", tree_field_get_int(rs, "forMoney"));
+  tree_field_set_int(track, "abandoned", 0);
+  if (tree_field_get_int(track, "raceState") == 0)
+    tree_field_set_int(track, "raceState", 1);
+
+  InvObject* map = tree_field_get_obj(track, "map");
+  if (map && raceStart)
+    java_util_resource_GroundRef_haltTrafficCross(map, raceStart, 15.f);
+
+  // Soft PE @ 0x004819F0 — OR EVENT_TIME so countdown/GO can dispatch.
+  java_lang_GameType_setEventMask(track, kEventTime);
+
+  InvObject* tr = tree_field_get_obj(track, "trRaceFinish");
+  InvObject* trig = tr ? tree_field_get_obj(tr, "trigger") : nullptr;
+  if (trig && tree_field_get_int(track, "race_finish_watch") == 0) {
+    // Soft PE addNotification_1 @ 0x0047E100 → Watch custmethod @ +0x28.
+    java_lang_GameType_addNotification_1(
+        track, trig, kEventTriggerOn, kEventSame, nullptr,
+        string_new("event_handlerRaceFinish"));
+    tree_field_set_int(track, "race_finish_watch", 1);
+  }
+
+  // Soft PE addTimer @ 0x0047E1C0 — stock arms (1, 9). Hub collapses walls:
+  // mark armed then clear so pollTimers cannot double-startRace2 after GO.
+  java_lang_GameType_addTimer(track, 1.f, 9);
+  tree_field_set_int(track, "race_timer_armed", 9);
+  java_lang_GameType_removeAllTimers(track);
+}
+
 // Stock RaceSetup.osdCommand(CMD_RACE=0): track.startRace + CAS(track).
 bool racesetup_try_cmd_race(InvObject* rs) {
   if (!rs) return false;
@@ -3356,19 +4882,27 @@ bool racesetup_try_cmd_race(InvObject* rs) {
     }
     InvObject* map = track ? tree_field_get_obj(track, "map") : nullptr;
     InvObject* tr = track ? tree_field_get_obj(track, "trRaceFinish") : nullptr;
+    // Soft deepen VA natives TREE may drop (setEventMask / addTimer /
+    // haltTrafficCross / finish Watch) before hub GO leaf.
+    city_start_race_soft_deepen(track, rs);
+    map = track ? tree_field_get_obj(track, "map") : nullptr;
     std::printf(
         "[script] RaceSetup.osdCommand CMD_RACE via TREE → %s halt=%d "
-        "trig=%d start=%d tref=%d\n",
+        "trig=%d start=%d tref=%d maskT=%d arm=%d watch=%d\n",
         sc ? sc : "?", map ? tree_field_get_int(map, "halt_crosses") : -1,
         tr ? 1 : 0, track && tree_field_get_obj(track, "raceStart") ? 1 : 0,
-        tr && tree_field_get_obj(tr, "trigger") ? 1 : 0);
-    // Stock addTimer(1, 9) → 3/2/1/GO → startRace2. Hub --no-wait skips
-    // the 1s timers; fire the GO leaf (City.startRace2) once.
+        tr && tree_field_get_obj(tr, "trigger") ? 1 : 0,
+        track ? (tree_field_get_int(track, "event_mask") & 0x80 ? 1 : 0) : 0,
+        track ? tree_field_get_int(track, "race_timer_armed") : 0,
+        track ? tree_field_get_int(track, "race_finish_watch") : 0);
+    // Stock addTimer(1, 9) → handleEvent 9/10/11/12 → startRace2.
+    // Hub --no-wait collapses the 1s walls; fire GO leaf once.
     if (track) {
       if (Jvm* j = jvm_active()) {
         if (!j->find_class("java.game.City")) j->load_class("java.game.City");
         j->invoke("java.game.City", "startRace2", "()V",
                   {JvmValue::make_obj(track)}, false);
+        tree_field_set_int(track, "start_race2_via_tree", 1);
       }
     }
     return true;
@@ -3850,10 +5384,7 @@ const char* vehicle_is_driveable(InvObject* car) {
   return nullptr;
 }
 
-void navigator_paint(InvObject* nav);
-InvObject* navigator_viewport(InvObject* nav);
-InvObject* navigator_camera(InvObject* nav);
-int32_t navigator_current_tile(InvObject* nav);
+// Navigator decls → host_objects.hpp / natives_table.inc
 
 namespace {
 
@@ -3885,6 +5416,70 @@ InvObject* navigator_new(float left, float top, float size, int32_t rid_type,
   tree_field_set_int(nav, "visible", 0);
   tree_field_set_int(nav, "mode", 0);
   tree_field_set_int(nav, "update_count", 0);
+
+  // Java Navigator ctor (sources/.../Navigator.java): Dummy(WORLDTREEROOT) +
+  // absolute world tiles — setMatrix(left+xi*size, -0.001, top+zi*size).
+  // PE updateNavigator @ 0x482D30 does NOT paint tiles; ctor does. Host
+  // navigator_paint keeps OSD overlay; absolute tiles close "paint tiles
+  // absolu" blocker for navigator_update.
+  InvObject* localroot = tree_host_new("java.util.resource.Dummy");
+  java_util_resource_GameRef_setFlags(localroot, 0x10);  // WORLDTREEROOT
+  tree_field_set_obj(nav, "localroot", localroot);
+
+  InvObject* base = resref_new();
+  java_util_resource_ResourceRef_set(base, rid_type);
+  java_util_resource_ResourceRef_load(base);
+  InvObject* base_tex = resref_new();
+  java_util_resource_ResourceRef_set(base_tex, rid_tex);
+  InvObject* base_msh = resref_new();
+  java_util_resource_ResourceRef_set(base_msh, rid_msh);
+  java_util_resource_ResourceRef_load(base_msh);
+
+  InvObject* tiles = tree_vector_new();
+  InvObject* tiletypes = tree_vector_new();
+  InvObject* meshes_v = tree_vector_new();
+  int32_t xi = 0;
+  int32_t zi = 0;
+  int32_t ridtex = rid_tex;
+  const int32_t num = x * z;
+  for (int32_t i = 0; i < num && x > 0 && z > 0; ++i) {
+    InvObject* ttype = resref_new();
+    java_util_resource_ResourceRef_duplicate(ttype, base);
+    InvObject* tex_i = resref_new();
+    java_util_resource_ResourceRef_set(tex_i, ridtex);
+    java_util_resource_ResourceRef_load(tex_i);
+    java_util_resource_RenderRef_changeResource(ttype, base_tex, tex_i);
+
+    InvObject* msh_i = resref_new();
+    java_util_resource_ResourceRef_duplicate(msh_i, base_msh);
+    java_util_resource_RenderRef_changeResource(ttype, base_msh, msh_i);
+
+    InvObject* tile = resref_new();
+    java_util_resource_RenderRef_create(tile, localroot, ttype,
+                                       string_new("navigator_segment"));
+    // Absolute world cm (Java Vector3); y = -0.001 map plane.
+    java_util_resource_RenderRef_setMatrix_1(
+        tile, vec3_new(left + static_cast<float>(xi) * size, -0.001f,
+                       top + static_cast<float>(zi) * size),
+        nullptr);
+    tree_field_set_int(tile, "tile_x", xi);
+    tree_field_set_int(tile, "tile_z", zi);
+    tree_field_set_int(tile, "tile_rid_tex", ridtex);
+    tree_vector_add(tiles, tile);
+    tree_vector_add(tiletypes, ttype);
+    tree_vector_add(meshes_v, msh_i);
+
+    ++ridtex;
+    if (++xi >= x) {
+      xi = 0;
+      ++zi;
+      ridtex += modulo;
+    }
+  }
+  tree_field_set_obj(nav, "tiles", tiles);
+  tree_field_set_obj(nav, "tiletypes", tiletypes);
+  tree_field_set_obj(nav, "meshes", meshes_v);
+  tree_field_set_int(nav, "tiles_absolu", num > 0 ? 1 : 0);
   return nav;
 }
 
@@ -3899,6 +5494,9 @@ void navigator_show(InvObject* nav) {
     tree_field_set_obj(nav, "vp", vp);
   }
   render_d3d9_viewport_create(vp, 12, 0.02f, 0.78f, 0.2f, 0.18f);
+  // PE Viewport factory [inner+0x4C]=RESOURCE_VIEWPORT=0x12; host type often
+  // unset — Bind resolve @ 0x536820 allows ot==0; TREE mark for probes.
+  tree_field_set_int(vp, "restype", 0x12);
   // Camera(localroot, vp, 1, 90→half45, 1, 100, 0.2, 2, oc=0, pt=1).
   InvObject* cam = tree_field_get_obj(nav, "cam");
   if (!cam) {
@@ -3907,9 +5505,12 @@ void navigator_show(InvObject* nav) {
   }
   const float zoom = tree_field_get_float(nav, "zoom");
   if (zoom <= 0.f) tree_field_set_float(nav, "zoom", 4.5f);
-  render_d3d9_camera_create(cam, nullptr, vp, 1, 45.f, 1.f, 100.f, 0.2f, 2.f, 0,
-                            1);
-  // Keep inactive — host paints minimap via OSD so chase cam stays primary.
+  InvObject* localroot = tree_field_get_obj(nav, "localroot");
+  render_d3d9_camera_create(cam, localroot, vp, 1, 45.f, 1.f, 100.f, 0.2f, 2.f,
+                            0, 1);
+  // PE: cam stays active on vp. Host: when tiles_absolu, skip map OSD shim
+  // (navigator_paint); chase cam stays primary via lookat stand-in only.
+  // Absolute tiles already posed in navigator_new (Java ctor path).
   navigator_paint(nav);
 }
 
@@ -4251,20 +5852,16 @@ void navigator_paint(InvObject* nav) {
   tree_field_set_int(nav, "tile_x", xi);
   tree_field_set_int(nav, "tile_z", zi);
 
-  // Navigator.java: ridtex++ per tile, +modulo on row wrap.
-  const int32_t rid_tex = rid_tex0 + zi * (tiles_x + modulo) + xi;
-
-  InvObject* tex = tree_field_get_obj(nav, "osd_tex");
-  const int32_t loaded_rid = tree_field_get_int(nav, "osd_tex_rid");
-  if (!tex || loaded_rid != rid_tex) {
-    if (!tex) {
-      tex = resref_new();
-      tree_field_set_obj(nav, "osd_tex", tex);
-    }
-    java_util_resource_ResourceRef_set(tex, rid_tex);
-    java_util_resource_ResourceRef_load(tex);
-    tree_field_set_int(nav, "osd_tex_rid", rid_tex);
-  }
+  // Absolute tiles: Java ctor setMatrix (navigator_new). PE updateNavigator
+  // @ 0x482D30 never re-paints tile RID / never draws OSD map rects — only
+  // cam bone00 SetLocalMatrix @ 0x483096 + marker symbol bones. W12A: when
+  // tiles_absolu live, skip host map/blip OSD (PE path); keep lookat stand-in
+  // for bone write. Route/marker OSD remain host boot aids (gap vs 1:1).
+  InvObject* tiles = tree_field_get_obj(nav, "tiles");
+  const int32_t tiles_n = tiles ? tree_vector_size(tiles) : 0;
+  tree_field_set_int(nav, "tiles_absolu_n", tiles_n);
+  const int32_t tiles_absolu = tree_field_get_int(nav, "tiles_absolu");
+  const bool pe_like_3d = tiles_absolu != 0 && tiles_n > 0;
 
   // Viewport [0,1] → OSD center/size in [-1,1] (y up).
   constexpr float kVpL = 0.02f, kVpT = 0.78f, kVpW = 0.2f, kVpH = 0.18f;
@@ -4276,14 +5873,38 @@ void navigator_paint(InvObject* nav) {
       reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(nav) ^ 0x4E01u);
   void* blip_key =
       reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(nav) ^ 0x4E02u);
-  render_d3d9_osd_set_rect(map_key, map_x, map_y, map_w, map_h, tex, 40);
+
+  if (pe_like_3d) {
+    // PE: no map/blip OSD — remove prior host shim rects if any.
+    render_d3d9_osd_remove_rect(map_key);
+    render_d3d9_osd_remove_rect(blip_key);
+    tree_field_set_int(nav, "osd_map_shim", 0);
+  } else {
+    // Boot shim: minimap texture when 3D tiles not the active view.
+    const int32_t rid_tex = rid_tex0 + zi * (tiles_x + modulo) + xi;
+    InvObject* tex = tree_field_get_obj(nav, "osd_tex");
+    const int32_t loaded_rid = tree_field_get_int(nav, "osd_tex_rid");
+    if (!tex || loaded_rid != rid_tex) {
+      if (!tex) {
+        tex = resref_new();
+        tree_field_set_obj(nav, "osd_tex", tex);
+      }
+      java_util_resource_ResourceRef_set(tex, rid_tex);
+      java_util_resource_ResourceRef_load(tex);
+      tree_field_set_int(nav, "osd_tex_rid", rid_tex);
+    }
+    render_d3d9_osd_set_rect(map_key, map_x, map_y, map_w, map_h, tex, 40);
+    tree_field_set_int(nav, "osd_map_shim", 1);
+  }
 
   // Phase 2.89: plotRoute line → OSD dots (player-centered follow).
+  // Host-only invent — PE markers use RenderRef bone00 (Cars @ 0x48310B),
+  // not OSD. W13D: gate when tiles_absolu (same as map/blip).
   InvObject* route = tree_field_get_obj(nav, "route");
   const int32_t prev_route_n = tree_field_get_int(nav, "route_osd_n");
   int32_t route_drawn = 0;
   constexpr int32_t kMaxRouteDots = 48;
-  if (route && size > 1e-4f) {
+  if (!pe_like_3d && route && size > 1e-4f) {
     const int32_t npts = render_line_point_count(route);
     uint32_t col = static_cast<uint32_t>(render_line_color(route));
     if ((col & 0xFF000000u) == 0) col |= 0xFF000000u;
@@ -4318,6 +5939,7 @@ void navigator_paint(InvObject* nav) {
   tree_field_set_int(nav, "route_osd_visible", route_drawn);
 
   // Phase 2.90/2.91: static + dynamic markers → OSD icons (rtype texture/mesh).
+  // Host invent — PE uses bone00 (Cars). Gate when tiles_absolu.
   const int32_t prev_mk_n = tree_field_get_int(nav, "marker_osd_n");
   int32_t mk_drawn = 0;
   int32_t mk_tex = 0;
@@ -4358,7 +5980,7 @@ void navigator_paint(InvObject* nav) {
     }
     return nullptr;
   };
-  if (size > 1e-4f) {
+  if (!pe_like_3d && size > 1e-4f) {
     const float sx = map_w / size;
     const float sy = map_h / size;
     const float half_w = map_w * 0.5f;
@@ -4421,17 +6043,49 @@ void navigator_paint(InvObject* nav) {
   tree_field_set_int(nav, "marker_osd_visible", mk_drawn);
   tree_field_set_int(nav, "marker_osd_tex", mk_tex);
 
-  // Player blip always centered (above route/marker dots).
-  render_d3d9_osd_set_rect(blip_key, map_x, map_y, map_w * 0.08f,
-                           map_h * 0.08f, tex, 42);
+  // Player blip — host map shim only (PE uses 3D tiles, no OSD blip).
+  if (!pe_like_3d) {
+    InvObject* tex = tree_field_get_obj(nav, "osd_tex");
+    render_d3d9_osd_set_rect(blip_key, map_x, map_y, map_w * 0.08f,
+                             map_h * 0.08f, tex, 42);
+  }
 
   InvObject* cam = tree_field_get_obj(nav, "cam");
   if (cam) {
-    const float zoom = tree_field_get_float(nav, "zoom");
+    // Host lookat stand-in for PE cam bone write (SetLocalMatrix @
+    // 0x483096) — PE never calls lookat. offsetX/Z are world-cm *deltas*
+    // (PE @ 0x482DF2–0x482E39: world = car + prior), not absolute eye.
+    // Absolute ox/oz→eye broke once Cars.cpp stored PE deltas.
+    // Mode0 Java xz = world * flt_5F0C20 (0.01) @ loc_483067 (PE matrix
+    // *0.1 / setMatrix *10). Mode1 @ 0x482FD2: eye = world*0.01 +
+    // Ypr_forward*DEF_ZOOM → at = world*0.01.
+    // Dynamarker yaw: PE @ 0x48314B Engine_queryGameRefChannel(GII_DIR=4)
+    // → int° * flt_5F13BC. Host getInfo(GII_DIR) now returns int° (W8A);
+    // Cars seed prefers that path when non-zero.
+    constexpr float kScale01 = 0.01f;  // flt_5F0C20 @ 0x005F0C20
+    constexpr float kDefZoom = 4.5f;   // flt_5F13C0 @ 0x005F13C0
     const float ox = tree_field_get_float(nav, "offsetX");
     const float oz = tree_field_get_float(nav, "offsetZ");
-    render_d3d9_camera_lookat(cam, ox, zoom > 0.f ? zoom : 4.5f, oz, ox, 0.f,
-                              oz);
+    const float at_x = (fx + ox) * kScale01;
+    const float at_z = (fz + oz) * kScale01;
+
+    float ex = at_x, ey = 0.f, ez = at_z;
+    if (InvObject* bp = java_util_resource_RenderRef_getPos(cam)) {
+      float bx = 0.f, by = 0.f, bz = 0.f;
+      vec3_get(bp, &bx, &by, &bz);
+      // Prefer bone from updateNavigator setMatrix_1 (mode0≈at, mode1
+      // orbit). show() before first update: getPos may be 0 → keep at+zoom.
+      if (bx != 0.f || by != 0.f || bz != 0.f) {
+        ex = bx;
+        ey = by;
+        ez = bz;
+      }
+    }
+    if (ey <= 0.f) {
+      ey = tree_field_get_float(nav, "zoom");
+      if (ey <= 0.f) ey = kDefZoom;
+    }
+    render_d3d9_camera_lookat(cam, ex, ey, ez, at_x, 0.f, at_z);
   }
 }
 
@@ -7056,29 +8710,7 @@ InvObject* game_state_return_to_garage(InvObject* state) {
   return section_return_to_garage(state);
 }
 
-void java_game_Navigator_updateNavigator(InvObject* self, InvObject* car,
-                                         int32_t mode) {
-  // PE @ 0x00482D30 size 0x6c4. Unbox this/car/mode. cam+vp are Navigator
-  // fields, not Unbox args. jz silent exit: cam==null (0x00482D6F, hide()),
-  // cam handle+8==0, carHandle+8==0, vp==0 (0x00482DB4). No Mighty ERROR.
-  // Java car==null / handle 0: PE deref [0+8] crash; host keeps if (!car).
-  // Body 0x6c4 (mode 0 map clamp / mode 1 yaw+pitch -1.5 bone00 / markers)
-  // not ported. PE does not write Java `mode`.
-  if (!self) return;
-  if (!tree_field_get_obj(self, "cam") || !tree_field_get_obj(self, "vp"))
-    return;
-  tree_field_set_int(self, "mode", mode);
-  if (!car) return;
-  const float cx = tree_field_get_float(car, "pos_x");
-  const float cz = tree_field_get_float(car, "pos_z");
-  tree_field_set_float(self, "offsetX", cx * 0.01f);
-  tree_field_set_float(self, "offsetZ", cz * 0.01f);
-  tree_field_set_float(self, "follow_x", cx);
-  tree_field_set_float(self, "follow_z", cz);
-  tree_field_set_int(self, "update_count",
-                     tree_field_get_int(self, "update_count") + 1);
-  navigator_paint(self);
-}
+// java_game_Navigator_updateNavigator — body in Cars.cpp (PE @ 0x00482D30).
 
 namespace {
 
@@ -7217,7 +8849,7 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
   {
     InvObject* tinst = nullptr;
     {
-      std::lock_guard<std::mutex> lock(g_mu);
+      std::lock_guard<std::mutex> lock(g_gr_mu);
       GroundTrafficState& g = ground(map);
       if (!g.traffic_cars.empty()) tinst = g.traffic_cars.back();
     }
@@ -7236,7 +8868,7 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
   {
     InvObject* tinst = nullptr;
     {
-      std::lock_guard<std::mutex> lock(g_mu);
+      std::lock_guard<std::mutex> lock(g_gr_mu);
       GroundTrafficState& g = ground(map);
       if (!g.traffic_cars.empty()) tinst = g.traffic_cars.front();
     }
@@ -7269,16 +8901,35 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
   }
   // PE remTrafficCar @ 0x00484A90: Bot.leaveTraffic. Traffic_destroy pool,
   // not GameRef.destroy. id==0 / unknown id = no-op (no count bump).
+  // W30D: rem → deactivate → Traffic_pool_sort_compact drops dead slot.
+  // W31D: sort_compact also soft-scores/ticks (rem budget=0 → keep live).
+  // W32D: Engine_tickPhysTraffic @ 0x463AC0 wires a2=1 via
+  // valocity_simulate (not rem).
   {
     const int32_t before = tree_field_get_int(map, "traffic_count");
+    const int32_t pool_before = tree_field_get_int(map, "traffic_pool_n");
     InvObject* tinst = gameref_new();
     const int32_t tid =
         java_util_resource_GroundRef_addTrafficCar(map, tinst, nullptr);
+    // PE notifyTrafficCar @ 0x00484AF0: Valocity.enter notify(id,1) after
+    // addTrafficCar dummycar — write +0xDD, ret MOVSX (must stay live=1).
+    const int32_t nret =
+        java_util_resource_GroundRef_notifyTrafficCar(map, tid, 1);
+    const int32_t nflag = tree_field_get_int(tinst, "traffic_flag_221");
+    const int32_t nact = tree_field_get_int(tinst, "traffic_active");
+    const int32_t notify_ok =
+        (tid != 0 && nret == 1 && nflag == 1 && nact == 1) ? 1 : 0;
+    tree_field_set_int(map, "notify_car_smoke", notify_ok);
+    tree_field_set_int(city, "notify_car_smoke", notify_ok);
+    std::printf("  traffic notifyTrafficCar ok=%d id=%d ret=%d flag=%d act=%d\n",
+                notify_ok, tid, nret, nflag, nact);
+    const int32_t pool_mid = tree_field_get_int(map, "traffic_pool_n");
     java_util_resource_GroundRef_setTrafficCarBehaviour(map, tid, 2);
     java_util_resource_GroundRef_remTrafficCar(map, 0);
     const int32_t c0 = tree_field_get_int(map, "traffic_count");
     java_util_resource_GroundRef_remTrafficCar(map, tid);
     const int32_t c1 = tree_field_get_int(map, "traffic_count");
+    const int32_t pool_after = tree_field_get_int(map, "traffic_pool_n");
     java_util_resource_GroundRef_remTrafficCar(map, tid);
     const int32_t c2 = tree_field_get_int(map, "traffic_count");
     java_util_resource_GroundRef_setTrafficCarBehaviour(map, tid, 1);
@@ -7286,13 +8937,16 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
     const int32_t flag = tree_field_get_int(tinst, "traffic_flag_221");
     const int32_t rem_ok =
         (tid != 0 && c0 == before + 1 && c1 == before && c2 == before &&
-         bh == 2 && flag == 1)
+         bh == 2 && flag == 1 && pool_mid == pool_before + 1 &&
+         pool_after == pool_before)
             ? 1
             : 0;
     tree_field_set_int(map, "rem_car_smoke", rem_ok);
     tree_field_set_int(city, "rem_car_smoke", rem_ok);
-    std::printf("  traffic remTrafficCar ok=%d id=%d c=%d/%d/%d bh=%d live=%d\n",
-                rem_ok, tid, c0, c1, c2, bh, flag);
+    std::printf(
+        "  traffic remTrafficCar ok=%d id=%d c=%d/%d/%d bh=%d live=%d "
+        "pool=%d/%d/%d\n",
+        rem_ok, tid, c0, c1, c2, bh, flag, pool_before, pool_mid, pool_after);
   }
   // PE delTraffic @ 0x00484B50: Track.exit → GroundMap_delTraffic. Count 0,
   // addTrafficCar GameRef stays (not ResourceRef.destroy). Own map so the
@@ -7938,7 +9592,7 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
     InvObject* part = gameref_new();
     InvObject* vt = gameref_new();
     {
-      std::lock_guard<std::mutex> lock(g_mu);
+      std::lock_guard<std::mutex> lock(g_gr_mu);
       bind_gameref(part, nullptr, "java.game.parts.Part", "part");
       bind_gameref(vt, nullptr, "java.game.VehicleType", "VehicleType");
     }
@@ -7965,7 +9619,7 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
       if (j->find_class(wheel_fqn)) {
         InvObject* wheel = gameref_new();
         {
-          std::lock_guard<std::mutex> lock(g_mu);
+          std::lock_guard<std::mutex> lock(g_gr_mu);
           bind_gameref(wheel, nullptr, wheel_fqn, "w");
         }
         inherit_ok =
@@ -7988,9 +9642,10 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
     tree_field_set_int(city, "isscripted_smoke", isscripted_ok);
     std::printf("  traffic isScripted ok=%d\n", isscripted_ok);
   }
-  // PE getScriptInstance @ 0x00486F30: handle 0 → null (no Mighty). No
-  // script → null. INSTANCE *(payload+0x50) / RESTYPE sub_404E20 not
-  // ported. Host: C++ .script; bind_gameref sets script=self.
+  // PE getScriptInstance @ 0x00486F30: handle 0 → null (no Mighty).
+  // type1 → *(payload+0x50); type8 → Class_boxObject stand-in
+  // (tree_host_new(script_class)); type0 → script.
+  // Host: type 0 after bind_gameref → .script (part_si==part smoke).
   {
     InvObject* null_si =
         java_util_resource_GameRef_getScriptInstance(nullptr);
@@ -7998,7 +9653,7 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
     InvObject* fresh_si = java_util_resource_GameRef_getScriptInstance(fresh);
     InvObject* part = gameref_new();
     {
-      std::lock_guard<std::mutex> lock(g_mu);
+      std::lock_guard<std::mutex> lock(g_gr_mu);
       bind_gameref(part, nullptr, "java.game.parts.Part", "part");
     }
     InvObject* part_si = java_util_resource_GameRef_getScriptInstance(part);
@@ -8037,9 +9692,72 @@ void valocity_spawn_traffic(InvObject* city, InvObject* map) {
     tree_field_set_int(city, "getvel_smoke", getvel_ok);
     std::printf("  traffic getVel ok=%d\n", getvel_ok);
   }
-  // PE setParent @ 0x0047E2D0 / sub_48ABA0 @ 0x0048ABA0: handle 0 → Mighty
-  // ERROR no write. parent null crashes; parent Native.ptr 0 → no-op (no
-  // detach). Stock Java always passes a live parent (map/player/raceBot).
+  // Soft pose/vel/phys sample: GetWorldPos ch=2 / GII_VEL ch=3 prefer
+  // chassis PhysicsRef (Vehicle.set Native.ptr). Write-through
+  // GameRefState. traffic_car_sample_pos under g_gr_mu Soft-samples phys
+  // without nesting GameRef_getPos (Resources mutex ≠ GameRef g_gr_mu).
+  {
+    InvObject* car = gameref_new();
+    InvObject* chassis = gameref_new();
+    tree_field_set_obj(car, "chassis", chassis);
+    java_util_resource_PhysicsRef_createBox(chassis, nullptr, 1.f, 0.5f, 2.f,
+                                            nullptr);
+    // Clear empty + seed stale GameRefState (1,2,3); Soft applyWorldXform
+    // also poses chassis. Then move phys only so Soft must prefer live.
+    java_util_resource_GameRef_setMatrix(car, vec3_new(1.f, 2.f, 3.f),
+                                         ypr_new(0.1f, 0.f, 0.f));
+    java_util_resource_PhysicsRef_setMatrix(
+        chassis, vec3_new(11.f, 22.f, 33.f), ypr_new(0.5f, 0.f, 0.f));
+    physics_set_velocity(chassis, 3.f, 0.f, 4.f);
+    InvObject* gp = java_util_resource_GameRef_getPos(car);
+    InvObject* gv = java_util_resource_GameRef_getVel(car);
+    InvObject* go = java_util_resource_GameRef_getOri(car);
+    float px = 0.f, py = 0.f, pz = 0.f;
+    float vx = 0.f, vy = 0.f, vz = 0.f;
+    float oy = 0.f, op = 0.f, or_ = 0.f;
+    if (gp) vec3_get(gp, &px, &py, &pz);
+    if (gv) vec3_get(gv, &vx, &vy, &vz);
+    if (go) ypr_get(go, &oy, &op, &or_);
+    float sx = 0.f, sy = 0.f, sz = 0.f;
+    float svx = 0.f, svy = 0.f, svz = 0.f;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      // PE sort_compact @ 0x581170 passes car+0x88 / +0xA8.
+      traffic_car_sample_pos(car, &sx, &sy, &sz, /*cursor_88=*/0.f,
+                             /*lane_a8=*/1.f);
+      // Soft vel ch=3 under g_gr_mu — PhysicsRef only, never nest getVel.
+      gameref_soft_phys_sample_vel(car, &svx, &svy, &svz);
+    }
+    float cx = 0.f, cy = 0.f, cz = 0.f;
+    {
+      std::lock_guard<std::mutex> lock(g_gr_mu);
+      auto it = g_refs.find(car);
+      if (it != g_refs.end()) {
+        cx = it->second.px;
+        cy = it->second.py;
+        cz = it->second.pz;
+      }
+    }
+    const int32_t soft_phys_ok =
+        (gp && gv && go && std::fabs(px - 11.f) < 0.01f &&
+         std::fabs(py - 22.f) < 0.01f && std::fabs(pz - 33.f) < 0.01f &&
+         std::fabs(vx - 3.f) < 0.01f && std::fabs(vy) < 0.01f &&
+         std::fabs(vz - 4.f) < 0.01f && std::fabs(oy - 0.5f) < 0.01f &&
+         std::fabs(sx - 11.f) < 0.01f && std::fabs(sy - 22.f) < 0.01f &&
+         std::fabs(sz - 33.f) < 0.01f && std::fabs(svx - 3.f) < 0.01f &&
+         std::fabs(svy) < 0.01f && std::fabs(svz - 4.f) < 0.01f &&
+         std::fabs(cx - 11.f) < 0.01f && std::fabs(cy - 22.f) < 0.01f &&
+         std::fabs(cz - 33.f) < 0.01f)
+            ? 1
+            : 0;
+    tree_field_set_int(map, "soft_phys_sample_smoke", soft_phys_ok);
+    tree_field_set_int(city, "soft_phys_sample_smoke", soft_phys_ok);
+    std::printf("  traffic soft phys sample ok=%d\n", soft_phys_ok);
+  }
+  // PE setParent @ 0x0047E2D0 / GameRef_setParent_inner @ 0x0048ABA0:
+  // handle 0 → Mighty ERROR no write. parent null crashes; parent
+  // Native.ptr 0 → no-op (no detach). Type 2/3: +0x30/+0x38 child lists
+  // (host vector stand-in). Stock Java always passes a live parent.
   {
     InvObject* car = gameref_new();
     InvObject* pmap = gameref_new();
@@ -9679,6 +11397,8 @@ void valocity_ensure_car_physics(InvObject* car) {
   valocity_ensure_car_mesh(car);
 }
 
+// engine_tick_phys_traffic — GroundRef_traffic.cpp
+
 void valocity_simulate(InvObject* city, float dt) {
   if (!city || dt <= 0.f) return;
   if (!tree_field_get_int(city, "entered")) return;
@@ -9834,6 +11554,12 @@ void valocity_simulate(InvObject* city, float dt) {
     java_game_Navigator_updateNavigator(nav, car, 0);
 
   valocity_update_camera(city);
+  // W32D/W33D — PE Engine_tickPhysTraffic @ 0x463AC0 (GII_ANIMATE mode28).
+  // Soft: sweep_dead → frame_update(dt) → sort_compact budget=1 after
+  // cam update (MainLoop fills Engine_camPosScratch; host lookat).
+  // dt ≡ *Engine_physWorld pushed @ 0x463c54.
+  if (InvObject* map = tree_field_get_obj(city, "map"))
+    engine_tick_phys_traffic(map, dt);
   valocity_update_hud(city);
 }
 
@@ -9981,637 +11707,10 @@ InvObject* valocity_return_to_garage(InvObject* city) {
   return game_logic_change_active_section(garage);
 }
 
-int32_t java_util_resource_GroundRef_addTrafficCar(InvObject* self, InvObject* instance,
-                                                   InvObject* pos) {
-  // PE @ 0x00484730: pos → Traffic_trySpawnNearCross (nearest junction +
-  // random empty path); null pos → Traffic_trySpawnOnRandomPath. Bind
-  // GameRef instance. Speed (rand15/32768*0.4+0.7)*27.777779. Return id.
-  if (!self || !instance) return 0;
-  int32_t on_path = 0;
-  if (pos) {
-    float x = 0.f, y = 0.f, z = 0.f;
-    vec3_get(pos, &x, &y, &z);
-    float cx = x, cy = y, cz = z;
-    if (InvObject* cross = physics_road_nearest_cross(x, y, z, 0.f))
-      vec3_get(cross, &cx, &cy, &cz);
-    float ox = cx, oy = cy, oz = cz, dx = 0.f, dy = 0.f, dz = 1.f;
-    if (physics_road_project(cx, cz, &ox, &oy, &oz, &dx, &dy, &dz)) {
-      java_util_resource_GameRef_setMatrix(
-          instance, vec3_new(ox, oy, oz), ypr_new(std::atan2(dx, dz), 0.f, 0.f));
-      on_path = 1;
-    } else {
-      java_util_resource_GameRef_setPos(instance, pos);
-    }
-  } else {
-    float px = 0.f, py = 0.f, pz = 0.f, yaw = 0.f;
-    if (physics_road_random_spawn(&px, &py, &pz, &yaw)) {
-      java_util_resource_GameRef_setMatrix(instance, vec3_new(px, py, pz),
-                                           ypr_new(yaw, 0.f, 0.f));
-      on_path = 1;
-    }
-  }
-  const int r1 = std::rand() & 0x7FFF;
-  const int r2 = std::rand() & 0x7FFF;
-  const float kRand15 = 1.f / 32768.f;
-  const float u1 = static_cast<float>(r1) * kRand15;
-  const float u2 = static_cast<float>(r2) * kRand15;
-  tree_field_set_float(instance, "traffic_speed", (u1 * 0.4f + 0.7f) * 27.777779f);
-  tree_field_set_float(instance, "traffic_scale", u2 * 0.4f + 0.7f);
-  tree_field_set_int(instance, "traffic_color", 0);
-  tree_field_set_int(instance, "traffic_flag_221", 1);
-  tree_field_set_int(instance, "spawned_on_path", on_path);
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& g = ground(self);
-  g.traffic_cars.push_back(instance);
-  const int32_t id = g.next_car_id++;
-  g.car_ids.push_back(id);
-  g.cars_by_id[id] = instance;
-  g.traffic_count += 1;
-  g.path_spawns += on_path;
-  ground_sync_fields(self);
-  return id;
-}
 
-void java_util_resource_GroundRef_remTrafficCar(InvObject* self, int32_t id) {
-  // PE @ 0x00484A90: Unbox I as traffic ptr; id==0 no-op. If +0x138 live,
-  // type 0x38=56 on +0x130 then Traffic_destroy @ 0x00578F20 (unlink path,
-  // return to pool). Java Bot.dummycar / City.startRace keep the GameRef —
-  // do not ResourceRef.destroy.
-  if (!self || id == 0) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& g = ground(self);
-  auto mit = g.cars_by_id.find(id);
-  if (mit == g.cars_by_id.end() || !mit->second) return;
-  InvObject* inst = mit->second;
-  g.cars_by_id.erase(mit);
-  g.car_behaviour.erase(id);
-  for (auto it = g.car_ids.begin(); it != g.car_ids.end(); ++it) {
-    if (*it == id) {
-      g.car_ids.erase(it);
-      break;
-    }
-  }
-  for (auto it = g.traffic_cars.begin(); it != g.traffic_cars.end(); ++it) {
-    if (*it == inst) {
-      g.traffic_cars.erase(it);
-      break;
-    }
-  }
-  if (g.traffic_count > 0) --g.traffic_count;
-  ground_sync_fields(self);
-}
+// → GroundRef_traffic.cpp
 
-int32_t java_util_resource_GroundRef_notifyTrafficCar(InvObject* self, int32_t id,
-                                                      int32_t state) {
-  // PE @ 0x00484AF0: UnboxArg; if obj==0 return 0; byte+221=0; return 0.
-  // Java `state` is unused.
-  (void)state;
-  if (!self || id == 0) return 0;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& g = ground(self);
-  auto it = g.cars_by_id.find(id);
-  if (it == g.cars_by_id.end() || !it->second) return 0;
-  tree_field_set_int(it->second, "traffic_flag_221", 0);
-  tree_field_set_int(it->second, "traffic_notified", 1);
-  return 0;
-}
-
-int32_t java_util_resource_GroundRef_addTrafficN(InvObject* self, InvObject* type,
-                                                 int32_t n, float lenBegin,
-                                                 float lenEnd, float wheelBase) {
-  (void)lenBegin;
-  (void)lenEnd;
-  (void)wheelBase;
-  if (!self || n <= 0) return 0;
-  // PE @ 0x00484050: density*20 clamped to 1 template GameRef, then at most
-  // one Traffic_trySpawnOnRandomPath. Return is spawned count — host keeps
-  // Java `n` so Valocity day/night smoke stays 847/183.
-  InvObject* wrapper = nullptr;
-  InvObject* inst = nullptr;
-  if (type) {
-    wrapper = gameref_new();
-    inst = java_util_resource_GameRef_create(
-        wrapper, self, type, string_new("0,-10000,0,0,0,0"),
-        string_new("traffic_car"));
-  }
-  int32_t on_path = 0;
-  if (inst) {
-    float px = 0.f, py = 0.f, pz = 0.f, yaw = 0.f;
-    if (physics_road_random_spawn(&px, &py, &pz, &yaw)) {
-      java_util_resource_GameRef_setMatrix(inst, vec3_new(px, py, pz),
-                                           ypr_new(yaw, 0.f, 0.f));
-      // addTrafficN after spawn: color, speed (rand15/32768 * 0.4+0.7)*19.444445
-      const int r0 = std::rand() & 0x7FFF;
-      const int r1 = std::rand() & 0x7FFF;
-      const int r2 = std::rand() & 0x7FFF;
-      const float kRand15 = 1.f / 32768.f;
-      const float u1 = static_cast<float>(r1) * kRand15;
-      const float u2 = static_cast<float>(r2) * kRand15;
-      tree_field_set_int(inst, "traffic_color", (0xFFFF * r0) / 0x8000);
-      tree_field_set_float(inst, "traffic_speed", (u1 * 0.4f + 0.7f) * 19.444445f);
-      tree_field_set_float(inst, "traffic_scale", u2 * 0.4f + 0.7f);
-      tree_field_set_int(inst, "spawned_on_path", 1);
-      on_path = 1;
-    }
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    GroundTrafficState& g = ground(self);
-    if (inst) g.traffic_cars.push_back(inst);
-    if (wrapper && wrapper != inst) g.traffic_cars.push_back(wrapper);
-    g.traffic_count += n;
-    g.traffic_streams += 1;
-    g.path_spawns += on_path;
-    ground_sync_fields(self);
-  }
-  return n;
-}
-
-int32_t java_util_resource_GroundRef_addTrafficP(InvObject* self, InvObject* type,
-                                                 InvObject* pos, int32_t n,
-                                                 float lenBegin, float lenEnd,
-                                                 float wheelBase) {
-  (void)n;
-  (void)lenBegin;
-  (void)lenEnd;
-  (void)wheelBase;
-  // PE @ 0x00484420: Unbox Vector3 x/y/z; loop once (v15<1 — Java n unused)
-  // Traffic_trySpawnNearCross @ 0x00581E00 with hardcoded 0, 1.0, 2.0, 4.0,
-  // 1.0 (not lenBegin/lenEnd/wheelBase). Color (0xFFFF*rand15)/0x8000.
-  // Speed (rand15/32768*0.4+0.7)*19.444445. Return spawned 0|1.
-  if (!self || !type || !pos) return 0;
-  InvObject* wrapper = gameref_new();
-  InvObject* inst = java_util_resource_GameRef_create(
-      wrapper, self, type, string_new("0,-10000,0,0,0,0"),
-      string_new("traffic_car"));
-  if (!inst) return 0;
-  float x = 0.f, y = 0.f, z = 0.f;
-  vec3_get(pos, &x, &y, &z);
-  float cx = x, cy = y, cz = z;
-  if (InvObject* cross = physics_road_nearest_cross(x, y, z, 0.f))
-    vec3_get(cross, &cx, &cy, &cz);
-  float ox = cx, oy = cy, oz = cz, dx = 0.f, dy = 0.f, dz = 1.f;
-  int32_t on_path = 0;
-  if (physics_road_project(cx, cz, &ox, &oy, &oz, &dx, &dy, &dz)) {
-    java_util_resource_GameRef_setMatrix(
-        inst, vec3_new(ox, oy, oz), ypr_new(std::atan2(dx, dz), 0.f, 0.f));
-    on_path = 1;
-    const int r0 = std::rand() & 0x7FFF;
-    const int r1 = std::rand() & 0x7FFF;
-    const int r2 = std::rand() & 0x7FFF;
-    const float kRand15 = 1.f / 32768.f;
-    const float u1 = static_cast<float>(r1) * kRand15;
-    const float u2 = static_cast<float>(r2) * kRand15;
-    tree_field_set_int(inst, "traffic_color", (0xFFFF * r0) / 0x8000);
-    tree_field_set_float(inst, "traffic_speed", (u1 * 0.4f + 0.7f) * 19.444445f);
-    tree_field_set_float(inst, "traffic_scale", u2 * 0.4f + 0.7f);
-    tree_field_set_float(inst, "traffic_len_begin", 1.f);
-    tree_field_set_float(inst, "traffic_len_end", 2.f);
-    tree_field_set_float(inst, "traffic_wheelbase", 4.f);
-    tree_field_set_int(inst, "spawned_on_path", 1);
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    GroundTrafficState& g = ground(self);
-    if (on_path) {
-      g.traffic_cars.push_back(inst);
-      if (wrapper && wrapper != inst) g.traffic_cars.push_back(wrapper);
-      g.traffic_count += 1;
-      g.traffic_streams += 1;
-      g.path_spawns += 1;
-    }
-    ground_sync_fields(self);
-  }
-  tree_field_set_int(self, "traffic_p_ok", on_path);
-  tree_field_set_float(self, "traffic_p_x", ox);
-  tree_field_set_float(self, "traffic_p_y", oy);
-  tree_field_set_float(self, "traffic_p_z", oz);
-  return on_path;
-}
-
-void java_util_resource_GroundRef_delTraffic(InvObject* self) {
-  // PE @ 0x00484B50: GroundMap type 0x39=57 then GroundMap_delTraffic
-  // @ 0x00581480: unbind type 56, Traffic_detach, zero occupancy, count=0.
-  // Does not ResourceRef.destroy. addTrafficCar GameRefs (cars_by_id) stay
-  // alive — Bot.dummycar. Host addTrafficN/P wrappers are native stand-ins
-  // and are destroyed to avoid leaking the 847-car spawn.
-  if (!self) return;
-  std::vector<InvObject*> cars;
-  std::vector<InvObject*> bound;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    GroundTrafficState& g = ground(self);
-    for (const auto& kv : g.cars_by_id) {
-      if (kv.second) bound.push_back(kv.second);
-    }
-    cars.swap(g.traffic_cars);
-    g.traffic_count = 0;
-    g.traffic_streams = 0;
-    g.path_spawns = 0;
-    g.car_ids.clear();
-    g.cars_by_id.clear();
-    g.car_behaviour.clear();
-    ground_sync_fields(self);
-  }
-  for (InvObject* c : cars) {
-    if (!c) continue;
-    bool keep = false;
-    for (InvObject* b : bound) {
-      if (b == c) {
-        keep = true;
-        break;
-      }
-    }
-    if (!keep) java_util_resource_ResourceRef_destroy(c);
-  }
-}
-
-void java_util_resource_GroundRef_setPedestrianDensityN(InvObject* self, float d) {
-  // PE @ 0x00484D30: Unbox F; type 0x3D=61 gate; Pedestrian_setDensity @
-  // 0x00589B80 stores d and d*1.1 (flt_5F0C6C) to g_pedestrianDensity /
-  // g_pedestrianDensityHi. Java already multiplied Config.pedestrianDensity.
-  if (!self) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& g = ground(self);
-  g.ped_density = d;
-  g.ped_density_hi = d * 1.1f;
-  ground_sync_fields(self);
-}
-
-void java_util_resource_GroundRef_addPedestrianType(InvObject* self, InvObject* g) {
-  // PE @ 0x00484D90: type 0x3D=61 gate; prep map native GameRef at this+0xC;
-  // Pedestrian_addType @ 0x00589940: 32-slot table, skip duplicate obj+8.
-  // Host: skip duplicate type_id; keep origin sample for pedestrianDistance
-  // (Phase 2.84). Mesh vtable / sub_5447D0 not mirrored.
-  if (!self) return;
-  const int32_t type_id = g ? java_util_resource_ResourceRef_id(g) : 0;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& st = ground(self);
-  if (st.ped_types >= 32) return;
-  for (const auto& s : st.ped_samples) {
-    if (s.type_id == type_id) return;
-  }
-  st.ped_types += 1;
-  GroundTrafficState::PedSample sample;
-  sample.type_id = type_id;
-  sample.x = sample.y = sample.z = 0.f;
-  st.ped_samples.push_back(sample);
-  ground_sync_fields(self);
-}
-
-void java_util_resource_GroundRef_remPedestrianType(InvObject* self, InvObject* g) {
-  // PE @ 0x00484E20: type 0x3D=61 on g; Pedestrian_remType @ 0x00589A20
-  // scans 32-slot table, no-op on miss, compact last into hole.
-  // Host: erase matching type_id (same key as add). List unlink +0x48
-  // not mirrored. Stock Valocity never calls this.
-  if (!self) return;
-  const int32_t type_id = g ? java_util_resource_ResourceRef_id(g) : 0;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& st = ground(self);
-  for (auto it = st.ped_samples.begin(); it != st.ped_samples.end(); ++it) {
-    if (it->type_id != type_id) continue;
-    st.ped_samples.erase(it);
-    if (st.ped_types > 0) --st.ped_types;
-    ground_sync_fields(self);
-    return;
-  }
-}
-
-void java_util_resource_GroundRef_setWater(InvObject* self, float level,
-                                          float density, float viscosity) {
-  // PE @ 0x004866C0 size 0xe6:
-  // GroundRef.setWater(FFF)V — table sig (FFF)V @ 0x0061659C (NOT Vector3).
-  // UnboxArg(ci, &this, &level→point.y, &density, &viscosity). Defaults
-  // before unbox: point=(0,-12,0) normal=(0,1,0) dens=300 visc=550
-  // (imm 0xC1400000 / 0x3F800000 / 0x43960000 / 0x44098000).
-  // Handle=*[vm_get_int_field(this, Native_ptr)+0xC]; null → early out.
-  // dens<=0 || visc<=0 → [Engine_simTime+0x80]=0 (no Engine_setWater);
-  // else Engine_setWater @ 0x0049B440 (ecx=Engine_simTime, dens, visc,
-  // &normal, &point, 0) writes dens/visc @ +0x1E4/+0x1E8, normal @ +0x1C4
-  // (normalize), point @ +0x1B8, frees water-limit array +0x1D0/+0x1D4=0;
-  // then flag=1.
-  // Contrast VVFF @ 0x004867B0: same gate + Engine_setWater + flag; but
-  // UnboxArg(this, point, normal, dens, visc) then vm_get_float_field x/y/z.
-  // Contrast addWaterLimit @ 0x00486920: Engine_addWaterLimit only — no
-  // dens/visc, no normalize, no [simTime+0x80].
-  if (!self) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& g = ground(self);
-  if (density <= 0.f || viscosity <= 0.f) {
-    tree_field_set_int(self, "water_enabled", 0);
-    return;
-  }
-  g.water_px = 0.f;
-  g.water_py = level;
-  g.water_pz = 0.f;
-  g.water_nx = 0.f;
-  g.water_ny = 1.f;
-  g.water_nz = 0.f;
-  g.water_density = density;
-  g.water_viscosity = viscosity;
-  g.water_plane = true;
-  g.water_level = level;
-  g.water_limits.clear();
-  tree_field_set_int(self, "water_enabled", 1);
-  ground_sync_fields(self);
-}
-
-void java_util_resource_GroundRef_setWater_1(InvObject* self, InvObject* point,
-                                            InvObject* normal, float density,
-                                            float viscosity) {
-  // PE @ 0x004867B0 size 0x16B:
-  // GroundRef.setWater(Ljava.lang.Vector3;Ljava.lang.Vector3;FF)V.
-  // Contrast FFF @ 0x004866C0: UnboxArg(this, level→point.y, dens, visc)
-  // with defaults point=(0,-12,0) normal=(0,1,0) — no vm_get_float_field.
-  // This overload: UnboxArg(this, point, normal, dens, visc); same defaults
-  // dens=300 visc=550; handle = *[vm_get_int_field(this, Native_ptr)+0xC];
-  // dens<=0 || visc<=0 → [Engine_simTime+0x80]=0 (no Engine_setWater);
-  // else read Vector3 x/y/z via vm_get_float_field, then Engine_setWater
-  // @ 0x0049B440 (ecx=Engine_simTime, dens, visc, &normal, &point, 0) which
-  // writes dens/visc @ +0x1E4/+0x1E8, normal @ +0x1C4 (normalize), point @
-  // +0x1B8, frees water-limit array +0x1D0/+0x1D4=0; then flag=1.
-  // Distinct from addWaterLimit @ 0x00486920.
-  if (!self) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& g = ground(self);
-  if (density <= 0.f || viscosity <= 0.f) {
-    tree_field_set_int(self, "water_enabled", 0);
-    return;
-  }
-  float px = 0.f, py = -12.f, pz = 0.f;
-  float nx = 0.f, ny = 1.f, nz = 0.f;
-  if (point) vec3_get(point, &px, &py, &pz);
-  if (normal) vec3_get(normal, &nx, &ny, &nz);
-  g.water_px = px;
-  g.water_py = py;
-  g.water_pz = pz;
-  g.water_nx = nx;
-  g.water_ny = ny;
-  g.water_nz = nz;
-  g.water_density = density;
-  g.water_viscosity = viscosity;
-  g.water_plane = true;
-  g.water_level = py;
-  g.water_limits.clear();
-  tree_field_set_int(self, "water_enabled", 1);
-  ground_sync_fields(self);
-}
-
-void java_util_resource_GroundRef_addWaterLimit(InvObject* self, InvObject* point,
-                                               InvObject* normal) {
-  // PE @ 0x00486920 size 0xF9:
-  // GroundRef.addWaterLimit(Ljava.lang.Vector3;Ljava.lang.Vector3;)V.
-  // Contrast setWater(FFF) @ 0x004866C0: UnboxArg(this, level→point.y, dens,
-  // visc) with same defaults point=(0,-12,0) normal=(0,1,0); dens<=0||visc<=0
-  // → [Engine_simTime+0x80]=0 else Engine_setWater @ 0x0049B440 (writes dens/
-  // visc @ +0x1E4/+0x1E8, normalizes normal @ +0x1C4, point @ +0x1B8, frees
-  // water-limit array +0x1D0/+0x1D4=0) then flag=1.
-  // This native: UnboxArg(this, point, normal); same defaults; handle =
-  // *[vm_get_int_field(this, Native_ptr)+0xC]; if handle: read Vector3 x/y/z
-  // via vm_get_float_field then Engine_addWaterLimit @ 0x0049B530
-  // (ecx=Engine_simTime) appends 24-byte {point,normal} to +0x1D0, ++count
-  // +0x1D4 — NO dens/visc, NO normalize, NO [simTime+0x80]. Ret index discarded.
-  if (!self) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState::WaterLimit lim;
-  if (point) vec3_get(point, &lim.px, &lim.py, &lim.pz);
-  if (normal) vec3_get(normal, &lim.nx, &lim.ny, &lim.nz);
-  ground(self).water_limits.push_back(lim);
-  ground_sync_fields(self);
-}
-
-void java_util_resource_GroundRef_setTrafficCarBehaviour(InvObject* self,
-                                                        int32_t id,
-                                                        int32_t mode) {
-  // PE @ 0x00487EC0: UnboxArg writes id over CallInfo; if (id && *(id+0x138))
-  // *(id+0x160)=mode. Java TC_ACTIVE=1 TC_PASSIVE=2. GroundRef unused after unbox.
-  if (!self || id == 0) return;
-  std::lock_guard<std::mutex> lock(g_mu);
-  GroundTrafficState& g = ground(self);
-  auto it = g.cars_by_id.find(id);
-  if (it == g.cars_by_id.end() || !it->second) return;
-  g.car_behaviour[id] = mode;
-  tree_field_set_int(it->second, "traffic_behaviour", mode);
-  tree_field_set_int(self, "traffic_behaviour_last", mode);
-}
-
-// PE Traffic_evictFromCross @ 0x0057BFA0: cars whose nearest junction is this
-// cross are despawned or Traffic_trySpawnNearCross(..., 100.0). Host: project
-// ~100 m away. Do not hold g_mu — getPos/setMatrix take it.
-static int32_t ground_evict_cars_at_cross(float cx, float cy, float cz,
-                                          const std::vector<InvObject*>& cars) {
-  int32_t cleared = 0;
-  for (InvObject* car : cars) {
-    if (!car) continue;
-    InvObject* cp = java_util_resource_GameRef_getPos(car);
-    float px = 0.f, py = 0.f, pz = 0.f;
-    if (cp) vec3_get(cp, &px, &py, &pz);
-    float nx = px, ny = py, nz = pz;
-    if (InvObject* nc = physics_road_nearest_cross(px, py, pz, 0.f))
-      vec3_get(nc, &nx, &ny, &nz);
-    const float ddx = nx - cx;
-    const float ddz = nz - cz;
-    if (ddx * ddx + ddz * ddz > 1.f) continue;
-    float tx = cx, ty = cy, tz = cz;
-    if (InvObject* farc = physics_road_nearest_cross(cx, cy, cz, 100.f))
-      vec3_get(farc, &tx, &ty, &tz);
-    float ox = tx, oy = ty, oz = tz, dx = 0.f, dy = 0.f, dz = 1.f;
-    if (physics_road_project(tx, tz, &ox, &oy, &oz, &dx, &dy, &dz)) {
-      java_util_resource_GameRef_setMatrix(
-          car, vec3_new(ox, oy, oz), ypr_new(std::atan2(dx, dz), 0.f, 0.f));
-      ++cleared;
-    }
-  }
-  return cleared;
-}
-
-void java_util_resource_GroundRef_haltTrafficCross(InvObject* self, InvObject* pos,
-                                                  float time) {
-  // PE @ 0x00484B90: GroundMap_findNearestCross(xyz, 0, 0) then
-  // GroundMap_haltCrossTraffic @ 0x0057C170 (duration=time, flag=1).
-  // cross+64 = now + duration. Traffic_evictFromCross @ 0x0057BFA0:
-  // despawn or Traffic_trySpawnNearCross(..., 100.0, ...).
-  if (!self) return;
-  float x = 0.f, y = 0.f, z = 0.f;
-  if (pos) vec3_get(pos, &x, &y, &z);
-  float cx = x, cy = y, cz = z;
-  if (InvObject* cross = physics_road_nearest_cross(x, y, z, 0.f))
-    vec3_get(cross, &cx, &cy, &cz);
-
-  std::vector<InvObject*> cars;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    GroundTrafficState& g = ground(self);
-    GroundTrafficState::HaltCross h;
-    h.x = cx;
-    h.y = cy;
-    h.z = cz;
-    h.time = time;
-    g.halt_crosses.push_back(h);
-    cars = g.traffic_cars;
-    ground_sync_fields(self);
-  }
-  tree_field_set_float(self, "halt_until", game_logic_time() + time);
-  tree_field_set_float(self, "halt_cx", cx);
-  tree_field_set_float(self, "halt_cz", cz);
-  tree_field_set_int(self, "halt_cleared",
-                     ground_evict_cars_at_cross(cx, cy, cz, cars));
-}
-
-void java_util_resource_GroundRef_haltTrafficPath(InvObject* self, InvObject* p1,
-                                                 InvObject* p2) {
-  // PE @ 0x004835E0: Unbox two V3; GroundMap type 0x39=57;
-  // GroundMap_haltTrafficPath @ 0x00583FD0: GroundMap_findRoute then per
-  // waypoint haltCrossTraffic(0.001, 1) + markPathOccupied (+196). Duration
-  // 0.001 evicts now; spawn skip is path+196 (host RoadSeg.occupied).
-  // Do not push halt_crosses — Phase 2.84 counts those from haltTrafficCross.
-  if (!self || !p1 || !p2) return;
-  float x1 = 0.f, y1 = 0.f, z1 = 0.f, x2 = 0.f, y2 = 0.f, z2 = 0.f;
-  vec3_get(p1, &x1, &y1, &z1);
-  vec3_get(p2, &x2, &y2, &z2);
-  std::vector<InvObject*> cars;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    GroundTrafficState::HaltPath h;
-    h.x1 = x1;
-    h.y1 = y1;
-    h.z1 = z1;
-    h.x2 = x2;
-    h.y2 = y2;
-    h.z2 = z2;
-    GroundTrafficState& g = ground(self);
-    g.halt_paths.push_back(h);
-    cars = g.traffic_cars;
-    ground_sync_fields(self);
-  }
-  physics_road_route_length(x1, y1, z1, x2, y2, z2);
-  struct PathCross {
-    float x = 0.f, y = 0.f, z = 0.f;
-  };
-  std::vector<PathCross> crosses;
-  auto add_cross = [&](float x, float y, float z) {
-    for (const PathCross& c : crosses) {
-      const float dx = c.x - x;
-      const float dz = c.z - z;
-      if (dx * dx + dz * dz <= 1.f) return;
-    }
-    crosses.push_back(PathCross{x, y, z});
-  };
-  const int32_t n = physics_road_last_route_count();
-  if (n <= 0) {
-    float cx = x1, cy = y1, cz = z1;
-    if (InvObject* c = physics_road_nearest_cross(x1, y1, z1, 0.f))
-      vec3_get(c, &cx, &cy, &cz);
-    add_cross(cx, cy, cz);
-    cx = x2;
-    cy = y2;
-    cz = z2;
-    if (InvObject* c = physics_road_nearest_cross(x2, y2, z2, 0.f))
-      vec3_get(c, &cx, &cy, &cz);
-    add_cross(cx, cy, cz);
-  } else {
-    for (int32_t i = 0; i < n; ++i) {
-      float rx = 0.f, ry = 0.f, rz = 0.f;
-      if (!physics_road_last_route_point(i, &rx, &ry, &rz)) continue;
-      float cx = rx, cy = ry, cz = rz;
-      if (InvObject* c = physics_road_nearest_cross(rx, ry, rz, 0.f))
-        vec3_get(c, &cx, &cy, &cz);
-      add_cross(cx, cy, cz);
-    }
-  }
-  int32_t cleared = 0;
-  for (const PathCross& c : crosses)
-    cleared += ground_evict_cars_at_cross(c.x, c.y, c.z, cars);
-  // PE zeros all path+196 then GroundMap_markPathOccupied per cross adj path.
-  // BFS of unmarked neighbors not mirrored.
-  physics_road_clear_occupied();
-  for (const PathCross& c : crosses)
-    physics_road_mark_occupied_at(c.x, c.y, c.z);
-  tree_field_set_int(self, "halt_path_cleared", cleared);
-  tree_field_set_int(self, "halt_path_crosses",
-                     static_cast<int32_t>(crosses.size()));
-  tree_field_set_int(self, "halt_path_occupied", physics_road_occupied_count());
-}
-
-float java_util_resource_GroundRef_pedestrianDistance(InvObject* self,
-                                                     InvObject* pos,
-                                                     int32_t typeID) {
-  // PE @ 0x00484C60: type 0x3D=61 gate else -1.0 (flt_5F0C70).
-  // Pedestrian_distance @ 0x00589BE0: live list this+0x3398; typeID==0 or
-  // ped+0xC0==typeID; min dist via sub_5862E0; empty/miss → -1.0.
-  // Host: ped_samples from addPedestrianType (origin placeholders).
-  // Spawn list / terrain transform not mirrored.
-  if (!self || !pos) return -1.f;
-  float px = 0, py = 0, pz = 0;
-  vec3_get(pos, &px, &py, &pz);
-  std::lock_guard<std::mutex> lock(g_mu);
-  const GroundTrafficState& g = ground(self);
-  float best = -1.f;
-  for (const auto& s : g.ped_samples) {
-    if (typeID != 0 && s.type_id != typeID) continue;
-    const float dx = px - s.x;
-    const float dy = py - s.y;
-    const float dz = pz - s.z;
-    const float d2 = dx * dx + dy * dy + dz * dz;
-    if (best < 0.f || d2 < best) best = d2;
-  }
-  if (best < 0.f) return -1.f;
-  return std::sqrt(best);
-}
-
-float java_game_Vehicle_getSpeedSquare(InvObject* self) {
-  // PE @ 0x00480500 size 0xa9. Unbox this. Native.ptr (dword_62E008)==0 →
-  // Mighty ERROR + return 0.0 (flt_5E73CC). Else thiscall
-  // sub_426470(ecx=dword_636338, handle, 3, out) — channel 3 = velocity
-  // (same as GameRef.getVel @ 0x0047DD15). Return vx²+vy²+vz².
-  // Vehicle.set(chassis) copies Native.ptr; host ResState is a copy so live
-  // physics vel is on chassis. Shape present → always physics (incl. 0), do
-  // not fall through to a stale GameRef vx. No physics → GameRef vx cache.
-  // Do not rename sub_426470 (164 xrefs).
-  if (!self) return 0.f;
-  InvObject* key = tree_field_get_obj(self, "chassis");
-  if (!key) key = self;
-  if (physics_shape(key) != 0) return physics_speed_square(key);
-  std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_refs.find(key);
-  if (it == g_refs.end()) it = g_refs.find(self);
-  if (it == g_refs.end()) return 0.f;
-  const auto& r = it->second;
-  return r.vx * r.vx + r.vy * r.vy + r.vz * r.vz;
-}
-
-int32_t java_game_Vehicle_getHorn(InvObject* self) {
-  // PE @ 0x0043DB60 size 0x93 (IDA Vehicle_getHorn). Unbox this.
-  // Native.ptr (dword_62E008)==0 → 0 (edi=0). NO Mighty.
-  // inner=*(handle+0xC)==0 → 0. [inner+0x4C]!=1 → vtbl+0x14(1.0f).
-  // sub_5447D0(ecx=inner, 0x80000000, 0.0, 0.0); test eax,80000000h → 0.
-  // vtbl+0xC(1.0f)==0 → 0; obj=*(eax+0x4C); setnz
-  // dword [16*[obj+0x1DCC]+[obj+0x1FBC]+0x83C] → 0/1. Engine slot, not TREE.
-  // Gaps: no Native.ptr/handle/inner; no vtbl+0x14/+0xC; no sub_5447D0;
-  // no +0x1DCC/+0x1FBC/+0x83C table (DO NOT invent). sethorn writer is
-  // queueEvent→sub_458C00 (not this native). Host GameRef.horn = sethorn
-  // parse stand-in (Bot.pressHorn / City.getHorn). Do not rename
-  // sub_5447D0 / dword_62E008 (high xref).
-  if (!self) return 0;
-  std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_refs.find(self);
-  if (it == g_refs.end()) return 0;
-  return it->second.horn ? 1 : 0;
-}
-
-float java_game_Vehicle_hasCrime(InvObject* self) {
-  // PE @ 0x00440BF0 size 0x81. Unbox this. Native.ptr (dword_62E008)==0 →
-  // -1.0 (local 0xBF800000). inner=*(handle+0xC)==0 → -1.0.
-  // [inner+0x4C]!=1 → vtbl+0x14(0). sub_5447D0(ecx=inner, 0xA0000000,
-  // 0.0, 0.0); test eax,80000000h → -1.0. vtbl+0xC(1.0f=0x3F800000);
-  // obj=*(eax+0x4C); return *(float*)(obj+0x2104). Engine zone limit m/s,
-  // not TREE. City: maxSpeed=hasCrime()*1.1; if (maxSpeed>=0) overspeed.
-  // Do not rename sub_5447D0 / dword_62E008 (high xref). Host crime_speed
-  // is the +0x2104 stand-in; unset/non-positive → -1.0 (PE fail).
-  if (!self) return -1.f;
-  const float stored = tree_field_get_float(self, "crime_speed");
-  if (stored > 0.f) return stored;
-  return -1.f;
-}
+// java_game_Vehicle_getSpeedSquare / getHorn / hasCrime — bodies in
+// runtime/Cars/Cars.cpp (PE @ 0x00480500 / 0x0043DB60 / 0x00440BF0).
 
 }  // namespace inv

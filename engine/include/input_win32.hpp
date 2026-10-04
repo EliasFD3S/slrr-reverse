@@ -18,8 +18,30 @@ void input_live_shutdown();
 void input_mouse_rel(float* dx, float* dy, float* dz);
 
 // Sample keyboard/mouse into input_set_axis / input_set_last_key.
-// Device 0: DIK scan codes (RCDIK_*). Device 1: mouse phys 0..4.
+// Device 0: DIK scan codes (RCDIK_*). Device 1: mouse phys 0..9 (PE).
+// Host frame pulse: also runs soft Input_tick — PE order before axis
+// consumers; Frontend checkHotkeys adjacency uses this poll.
 void input_live_poll();
+
+// Soft PE Input_tick @ 0x0054DDA0 size 0x46 (Engine_MainLoop @ 0x00428AAD).
+// frame_dt_sec ≡ Engine_frameDt @ 0x0063C534. Soft globals + deviceListHead
+// walk (next @ +0x2144) → Input_Device_tickAxes @ 0x0054DBE0.
+// Soft pollDevices @ 0x00556BC0 (kb+mouse; joy/FFB OOS) + soft
+// Input_readPhysicalAxis @ 0x00557430 (type 1/2).
+// OOS residual: Player+0x1C embed, full DI table stride 490 dwords @ 0x76F9B0,
+// Engine_MainLoop wiring (host uses input_live_poll adjacency).
+void input_tick(float frame_dt_sec);
+float input_frame_dt_ms();       // soft Input_frameDtMs @ 0x007686F4
+float input_poll_dt_ms();        // soft Input_pollDtMs @ 0x007686E4
+float input_qpc_dt_ms();         // soft Input_qpcDtMs @ 0x0076F9A0
+float input_mouse_sens_scale();  // soft Input_mouseSensScale @ 0x00777438
+uint32_t input_logical_eval_stamp();  // soft @ 0x007686EC
+uint32_t input_device_list_count();   // soft Input_deviceCount @ 0x007686F0
+// Soft Input_readPhysicalAxis @ 0x00557430 — DI table type 1/2; joy OOS→0.
+float input_read_physical_axis(int32_t device, int32_t axis);
+// Soft stand-in for Player+0x1C Push @ 0x00479959 — initAxesBlob@54D580 +
+// DeviceList_Push@54D5E0 (one blob if list empty). Called from live_enable.
+void input_device_list_ensure();
 
 // PE Input_lastKeyEvent @ 0x00556E00 — DI8 Acquire+GetDeviceData key-down;
 // return DIK scan | (ToAsciiEx ascii << 16), or 0.

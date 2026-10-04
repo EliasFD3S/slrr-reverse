@@ -1,4 +1,5 @@
 #include "tree_interp.hpp"
+#include "tree_interp_internal.hpp"
 #include "runtime.hpp"
 #include "rpak.hpp"
 #include "natives.hpp"
@@ -14,466 +15,6 @@
 #include <vector>
 
 namespace inv {
-namespace {
-
-struct FieldMap {
-  std::unordered_map<std::string, JvmValue> by_name;
-};
-std::unordered_map<InvObject*, FieldMap> g_fields;
-std::unordered_map<InvObject*, std::vector<InvObject*>> g_vectors;
-std::unordered_map<InvObject*, std::string> g_host_class;
-
-JvmValue* field_slot(InvObject* obj, const std::string& name, bool create) {
-  if (!obj || name.empty()) return nullptr;
-  auto& m = g_fields[obj].by_name;
-  auto it = m.find(name);
-  if (it == m.end()) {
-    if (!create) return nullptr;
-    it = m.emplace(name, JvmValue::make_int(0)).first;
-  }
-  return &it->second;
-}
-
-std::string strip_class_desc(const std::string& d) {
-  if (d.size() >= 2 && d[0] == 'L' && d.back() == ';')
-    return d.substr(1, d.size() - 2);
-  return d;
-}
-
-bool truthy(const JvmValue& v) {
-  if (v.tag == JvmTag::Obj) {
-    if (!v.v.o) return false;
-    // Opaque host objects (ResourceRef, FindFile, …) use InvString{nullptr}.
-    // Real Java Strings always have a non-null utf8 (possibly "").
-    const auto* s = reinterpret_cast<const InvString*>(v.v.o);
-    if (!s->utf8) return true;
-    return s->utf8[0] != '\0';
-  }
-  if (v.tag == JvmTag::Float) return v.v.f != 0.f;
-  if (v.tag == JvmTag::Int) return v.v.i != 0;
-  return false;
-}
-
-InvObject* concat_str(InvObject* a, InvObject* b) {
-  const char* sa = a ? string_cstr(a) : "";
-  const char* sb = b ? string_cstr(b) : "";
-  std::string out = std::string(sa ? sa : "") + (sb ? sb : "");
-  return string_new(out.c_str());
-}
-
-// OptionsDialog: `w + " X " + h` — operands may be Int/Float, not String.
-InvObject* value_as_string(const JvmValue& v) {
-  if (v.tag == JvmTag::Obj) return v.v.o ? v.v.o : string_new("");
-  char buf[64];
-  if (v.tag == JvmTag::Float)
-    std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(v.v.f));
-  else
-    std::snprintf(buf, sizeof(buf), "%d", v.v.i);
-  return string_new(buf);
-}
-
-float static_qm(const std::string& fname) {
-  // VehicleType static finals used by *_VT ctors (from sources).
-  struct Q {
-    const char* n;
-    float v;
-  };
-  static const Q k[] = {
-      {"qm_stock_Baiern_CoupeSport_2_5", 14.8294f},
-      {"qm_full_Baiern_CoupeSport_2_5", 12.6816f},
-      {"qm_stock_Baiern_CoupeSport_GT_III", 9.9572f},
-      {"qm_full_Baiern_CoupeSport_GT_III", 8.6888f},
-      {"qm_stock_Baiern_DevilSport", 12.5978f},
-      {"qm_full_Baiern_DevilSport", 10.921f},
-  };
-  for (const auto& e : k) {
-    if (fname == e.n) return e.v;
-  }
-  return 0.f;
-}
-
-int32_t static_vs(const std::string& fname) {
-  if (fname == "VS_DEMO") return 0x0001;
-  if (fname == "VS_USED") return 0x0002;
-  if (fname == "VS_STOCK") return 0x0004;
-  if (fname == "VS_DRACE") return 0x0008;
-  if (fname == "VS_NRACE") return 0x0010;
-  if (fname == "VS_RRACE") return 0x0020;
-  return -1;
-}
-
-int32_t static_rid_carcolor(const std::string& fname) {
-  // GameLogic.RID_CARCOLOR_* — small indices into CARCOLORS[].
-  static const struct {
-    const char* n;
-    int32_t v;
-  } k[] = {
-      {"RID_CARCOLOR_Baiern_Devils_eye_red", 0},
-      {"RID_CARCOLOR_Baiern_Spring_yellow", 1},
-      {"RID_CARCOLOR_Einvagen_Zucker", 2},
-      {"RID_CARCOLOR_Einvagen_Tornado_rot", 3},
-      {"RID_CARCOLOR_Einvagen_Nacht", 4},
-      {"RID_CARCOLOR_Einvagen_Smaragd", 5},
-      {"RID_CARCOLOR_Einvagen_Black_mage", 6},
-      {"RID_CARCOLOR_Einvagen_Hamvas_Grun", 7},
-      {"RID_CARCOLOR_Einvagen_Indigo", 8},
-      {"RID_CARCOLOR_Einvagen_Jazz", 9},
-      {"RID_CARCOLOR_Einvagen_Antracit", 10},
-      {"RID_CARCOLOR_Einvagen_Mercator_Blau", 11},
-      {"RID_CARCOLOR_Einvagen_Murano", 12},
-      {"RID_CARCOLOR_Einvagen_Champagner", 13},
-      {"RID_CARCOLOR_Einvagen_Ozean", 14},
-      {"RID_CARCOLOR_Einvagen_Reflex", 15},
-      {"RID_CARCOLOR_Einvagen_Saratoga", 16},
-      {"RID_CARCOLOR_Used_Rusty_Cherry", 17},
-      {"RID_CARCOLOR_Used_Rusty_Smaragd", 18},
-      {"RID_CARCOLOR_Used_Rusty_Nacht", 19},
-      {"RID_CARCOLOR_Used_Rusty_Zucker", 20},
-  };
-  for (const auto& e : k) {
-    if (fname == e.n) return e.v;
-  }
-  return -1;
-}
-
-int32_t resolve_rid_const(const JvmClass& cls, uint32_t imm) {
-  if (imm >= cls.const_int_valid.size() || !cls.const_int_valid[imm]) return 0;
-  const int32_t local = cls.const_ints[imm];
-  auto try_path = [&](std::string path) -> int32_t {
-    if (path.empty() || path.find(".rpk") == std::string::npos) return 0;
-    for (char& c : path)
-      if (c == '/') c = '\\';
-    std::string base = path;
-    const auto slash = base.find_last_of('\\');
-    if (slash != std::string::npos) base = base.substr(slash + 1);
-    const RpakPack* pack = rpak_find_by_name(base.c_str());
-    if (!pack) {
-      java_lang_System_openLib(string_new(path.c_str()));
-      pack = rpak_find_by_name(base.c_str());
-    }
-    if (!pack) return 0;
-    return rpak_make_id(pack->pack_id, static_cast<uint16_t>(local & 0xFFFF));
-  };
-  if (imm < cls.const_rid_pack.size() && !cls.const_rid_pack[imm].empty()) {
-    if (int32_t id = try_path(cls.const_rid_pack[imm])) return id;
-    // Garage icon RIDs: pack_idx often hits a non-.rpk Utf8; real pack
-    // (frontend.rpk) sits a few CONS entries before the RID.
-    for (int j = static_cast<int>(imm) - 1;
-         j >= 0 && j + 8 >= static_cast<int>(imm); --j) {
-      if (static_cast<size_t>(j) < cls.const_strings.size()) {
-        if (int32_t id = try_path(cls.const_strings[static_cast<size_t>(j)]))
-          return id;
-      }
-    }
-  }
-  return local;
-}
-
-}  // namespace
-
-void tree_field_set_int(InvObject* obj, const char* name, int32_t v) {
-  if (JvmValue* s = field_slot(obj, name, true)) *s = JvmValue::make_int(v);
-}
-
-int32_t tree_field_get_int(InvObject* obj, const char* name) {
-  if (JvmValue* s = field_slot(obj, name, false)) {
-    if (s->tag == JvmTag::Float) return static_cast<int32_t>(s->v.f);
-    return s->v.i;
-  }
-  return 0;
-}
-
-void tree_field_set_obj(InvObject* obj, const char* name, InvObject* v) {
-  if (JvmValue* s = field_slot(obj, name, true)) *s = JvmValue::make_obj(v);
-}
-
-InvObject* tree_field_get_obj(InvObject* obj, const char* name) {
-  if (JvmValue* s = field_slot(obj, name, false)) {
-    if (s->tag == JvmTag::Obj) return s->v.o;
-  }
-  return nullptr;
-}
-
-void tree_field_set_float(InvObject* obj, const char* name, float v) {
-  if (JvmValue* s = field_slot(obj, name, true)) *s = JvmValue::make_float(v);
-}
-
-float tree_field_get_float(InvObject* obj, const char* name) {
-  if (JvmValue* s = field_slot(obj, name, false)) {
-    if (s->tag == JvmTag::Int) return static_cast<float>(s->v.i);
-    return s->v.f;
-  }
-  return 0.f;
-}
-
-InvObject* tree_vector_new() {
-  InvObject* o = reinterpret_cast<InvObject*>(new InvString{nullptr});
-  g_vectors[o] = {};
-  g_host_class[o] = "java.util.Vector";
-  return o;
-}
-
-bool tree_vector_is(InvObject* vec) {
-  return vec && g_vectors.find(vec) != g_vectors.end();
-}
-
-InvObject* tree_array_new(int32_t length) {
-  return tree_array_new_desc(length, "[Ljava.lang.Object;");
-}
-
-InvObject* tree_array_new_desc(int32_t length, const char* desc) {
-  InvObject* o = reinterpret_cast<InvObject*>(new InvString{nullptr});
-  g_host_class[o] = (desc && desc[0]) ? desc : "[Ljava.lang.Object;";
-  if (length > 0)
-    g_vectors[o].assign(static_cast<size_t>(length), nullptr);
-  else
-    g_vectors[o] = {};
-  return o;
-}
-
-int32_t tree_vector_size(InvObject* vec) {
-  auto it = g_vectors.find(vec);
-  if (it == g_vectors.end()) return 0;
-  return static_cast<int32_t>(it->second.size());
-}
-
-void tree_vector_add(InvObject* vec, InvObject* elem) {
-  if (!vec) return;
-  g_vectors[vec].push_back(elem);
-}
-
-void tree_vector_remove(InvObject* vec, InvObject* elem) {
-  if (!vec || !elem) return;
-  auto it = g_vectors.find(vec);
-  if (it == g_vectors.end()) return;
-  auto& v = it->second;
-  v.erase(std::remove(v.begin(), v.end(), elem), v.end());
-}
-
-InvObject* tree_vector_element_at(InvObject* vec, int32_t idx) {
-  auto it = g_vectors.find(vec);
-  if (it == g_vectors.end()) return nullptr;
-  if (idx < 0 || static_cast<size_t>(idx) >= it->second.size()) return nullptr;
-  return it->second[static_cast<size_t>(idx)];
-}
-
-void tree_vector_set(InvObject* vec, int32_t idx, InvObject* elem) {
-  if (!vec || idx < 0) return;
-  auto& v = g_vectors[vec];
-  if (static_cast<size_t>(idx) >= v.size())
-    v.resize(static_cast<size_t>(idx) + 1, nullptr);
-  v[static_cast<size_t>(idx)] = elem;
-}
-
-void tree_vector_resize(InvObject* vec, int32_t n) {
-  if (!vec || n < 0) return;
-  g_vectors[vec].resize(static_cast<size_t>(n), nullptr);
-}
-
-InvObject* tree_host_new(const char* class_fqn) {
-  InvObject* o = reinterpret_cast<InvObject*>(new InvString{nullptr});
-  if (class_fqn) g_host_class[o] = class_fqn;
-  return o;
-}
-
-const char* tree_host_class(InvObject* obj) {
-  auto it = g_host_class.find(obj);
-  if (it == g_host_class.end()) return "";
-  return it->second.c_str();
-}
-
-// GameRef.queueEvent(ResourceRef,I,String)V @ 0x0047DA30
-// Java: queueEvent(null, EVENT_COMMAND=0x10, param). String often on top.
-static void pack_queue_event(std::vector<JvmValue>& stack,
-                             const std::vector<JvmValue>& locals,
-                             std::vector<JvmValue>& args, JvmValue* recv_out) {
-  auto is_str = [](const JvmValue& v) -> bool {
-    if (v.tag != JvmTag::Obj || !v.v.o) return false;
-    const char* c = tree_host_class(v.v.o);
-    return string_cstr(v.v.o) && (!c || !c[0] || std::strstr(c, "String"));
-  };
-  auto pop = [&]() -> JvmValue {
-    JvmValue v = stack.back();
-    stack.pop_back();
-    return v;
-  };
-  JvmValue param = JvmValue::make_obj(nullptr);
-  JvmValue ro = JvmValue::make_obj(nullptr);
-  JvmValue recv = JvmValue::make_obj(nullptr);
-  int32_t type = 0x10;
-  const bool jvm_order = !stack.empty() && is_str(stack.back());
-  if (jvm_order) {
-    param = pop();
-    if (!stack.empty() && (stack.back().tag == JvmTag::Int ||
-                           stack.back().tag == JvmTag::Float)) {
-      type = stack.back().tag == JvmTag::Int
-                 ? pop().v.i
-                 : static_cast<int32_t>(pop().v.f);
-    }
-    if (!stack.empty() && stack.back().tag == JvmTag::Obj) {
-      if (!stack.back().v.o)
-        ro = pop();
-      else if (is_str(stack.back()))
-        pop();
-      else
-        recv = pop();
-    }
-    if ((recv.tag != JvmTag::Obj || !recv.v.o) && !stack.empty() &&
-        stack.back().tag == JvmTag::Obj && stack.back().v.o &&
-        !is_str(stack.back()))
-      recv = pop();
-  } else {
-    if (!stack.empty() && stack.back().tag == JvmTag::Obj &&
-        stack.back().v.o && !is_str(stack.back()))
-      recv = pop();
-    if (!stack.empty() && is_str(stack.back())) param = pop();
-    if (!stack.empty() && (stack.back().tag == JvmTag::Int ||
-                           stack.back().tag == JvmTag::Float)) {
-      type = stack.back().tag == JvmTag::Int
-                 ? pop().v.i
-                 : static_cast<int32_t>(pop().v.f);
-    }
-    if (!stack.empty() && stack.back().tag == JvmTag::Obj) ro = pop();
-  }
-  if ((recv.tag != JvmTag::Obj || !recv.v.o) && !locals.empty())
-    recv = locals[0];
-  args.push_back(recv);
-  args.push_back(ro);
-  args.push_back(JvmValue::make_int(type));
-  args.push_back(param);
-  if (recv_out) *recv_out = recv;
-}
-
-static bool is_tree_renderref(InvObject* o) {
-  if (!o) return false;
-  const char* c = tree_host_class(o);
-  if (!c || !c[0]) return false;
-  if (std::strstr(c, "Camera")) return false;
-  return std::strstr(c, "RenderRef") != nullptr;
-}
-
-static bool is_tree_vector3(InvObject* o) {
-  if (!o) return false;
-  const char* c = tree_host_class(o);
-  if (c && std::strstr(c, "Vector3")) return true;
-  if (c && c[0]) return false;
-  if (string_cstr(o)) return false;
-  return vec3_is(o);
-}
-
-static bool is_tree_ypr(InvObject* o) {
-  if (!o) return false;
-  const char* c = tree_host_class(o);
-  if (c && std::strstr(c, "Ypr")) return true;
-  if (c && c[0]) return false;
-  return ypr_is(o);
-}
-
-static bool is_v3_binop_junk(InvObject* o) {
-  if (!o) return false;
-  const char* c = tree_host_class(o);
-  if (!c || !c[0]) return false;
-  return std::strstr(c, "Valocity") || std::strstr(c, "City") ||
-         std::strstr(c, "Track") || std::strstr(c, "RaceSetup") ||
-         std::strstr(c, "Garage") || std::strstr(c, "ResourceRef") ||
-         std::strstr(c, "GameRef") || std::strstr(c, "GroundRef") ||
-         std::strstr(c, "RenderRef");
-}
-
-// Vector3.add/mul/sub — Java TREE (not native). Recv often a leftover
-// ResourceRef from the enclosing method (smoke: ResourceRef.add argc=1).
-static void pack_vector3_binop(std::vector<JvmValue>& stack,
-                               const std::vector<JvmValue>& locals,
-                               std::vector<JvmValue>& args,
-                               JvmValue* recv_out) {
-  auto pop = [&]() -> JvmValue {
-    JvmValue v = stack.back();
-    stack.pop_back();
-    return v;
-  };
-  auto under_is_v3_or_num = [&]() -> bool {
-    if (stack.size() < 2) return false;
-    const JvmValue& u = stack[stack.size() - 2];
-    if (u.tag == JvmTag::Float || u.tag == JvmTag::Int) return true;
-    return u.tag == JvmTag::Obj && is_tree_vector3(u.v.o);
-  };
-  while (!stack.empty() && stack.back().tag == JvmTag::Obj &&
-         is_v3_binop_junk(stack.back().v.o) && under_is_v3_or_num())
-    pop();
-  JvmValue recv = JvmValue::make_obj(nullptr);
-  JvmValue arg = JvmValue::make_obj(nullptr);
-  if (!stack.empty() && (stack.back().tag == JvmTag::Float ||
-                         stack.back().tag == JvmTag::Int)) {
-    arg = pop();
-    while (!stack.empty() && stack.back().tag == JvmTag::Obj &&
-           is_v3_binop_junk(stack.back().v.o) && under_is_v3_or_num())
-      pop();
-  }
-  if (!stack.empty() && stack.back().tag == JvmTag::Obj &&
-      is_tree_vector3(stack.back().v.o))
-    recv = pop();
-  if (arg.tag != JvmTag::Float && arg.tag != JvmTag::Int && !stack.empty()) {
-    if (stack.back().tag == JvmTag::Float || stack.back().tag == JvmTag::Int)
-      arg = pop();
-    else if (stack.back().tag == JvmTag::Obj &&
-             (is_tree_vector3(stack.back().v.o) || !stack.back().v.o))
-      arg = pop();
-  }
-  if (recv.tag == JvmTag::Obj && recv.v.o && !is_tree_vector3(recv.v.o) &&
-      arg.tag == JvmTag::Obj && is_tree_vector3(arg.v.o))
-    std::swap(recv, arg);
-  args.push_back(recv);
-  args.push_back(arg);
-  (void)locals;
-  if (recv_out) *recv_out = recv;
-}
-
-// RenderRef.create(ResourceRef,RenderRef,String)V @ 0x00480EE0
-// Java: create(parent, type|rid, alias). String often on top.
-static void pack_renderref_create(std::vector<JvmValue>& stack,
-                                  const std::vector<JvmValue>& locals,
-                                  std::vector<JvmValue>& args,
-                                  JvmValue* recv_out) {
-  auto is_str = [](const JvmValue& v) -> bool {
-    if (v.tag != JvmTag::Obj || !v.v.o) return false;
-    const char* c = tree_host_class(v.v.o);
-    return string_cstr(v.v.o) && (!c || !c[0] || std::strstr(c, "String"));
-  };
-  auto pop = [&]() -> JvmValue {
-    JvmValue v = stack.back();
-    stack.pop_back();
-    return v;
-  };
-  JvmValue alias = JvmValue::make_obj(nullptr);
-  JvmValue type = JvmValue::make_obj(nullptr);
-  JvmValue parent = JvmValue::make_obj(nullptr);
-  JvmValue recv = JvmValue::make_obj(nullptr);
-  const bool jvm_order = !stack.empty() && is_str(stack.back());
-  if (jvm_order) {
-    alias = pop();
-    if (!stack.empty()) type = pop();
-    if (!stack.empty() && stack.back().tag == JvmTag::Obj) parent = pop();
-    if (!stack.empty() && stack.back().tag == JvmTag::Obj &&
-        stack.back().v.o && !is_str(stack.back()))
-      recv = pop();
-  } else {
-    if (!stack.empty() && stack.back().tag == JvmTag::Obj &&
-        stack.back().v.o && !is_str(stack.back()))
-      recv = pop();
-    if (!stack.empty() && (is_str(stack.back()) ||
-                           (stack.back().tag == JvmTag::Obj && !stack.back().v.o)))
-      alias = pop();
-    if (!stack.empty()) type = pop();
-    if (!stack.empty() && stack.back().tag == JvmTag::Obj) parent = pop();
-  }
-  if ((recv.tag != JvmTag::Obj || !recv.v.o) && !locals.empty())
-    recv = locals[0];
-  args.push_back(recv);
-  args.push_back(parent);
-  args.push_back(type);
-  args.push_back(alias);
-  if (recv_out) *recv_out = recv;
-}
 
 JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                    std::vector<JvmValue> locals, std::string* err) {
@@ -556,9 +97,11 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
   auto mname_is_garbage = [&](const std::string& s) -> bool {
     if (s.empty()) return true;
     if (is_osd_invoke_name(s)) return false;
-    // Coords / tooltips / class descs leaked through empty mref slots.
-    if (s[0] == ' ' || s[0] == 'L' || s.find(',') != std::string::npos)
+    // Soft method fidelity: PE Object_callMethod @ 0x408A30 is name-only;
+    // descriptors / FQNs / coords leaked via empty mref are not methods.
+    if (s[0] == ' ' || s[0] == 'L' || s[0] == '(' || s[0] == '[')
       return true;
+    if (s.find(',') != std::string::npos) return true;
     if (s.find(' ') != std::string::npos) return true;
     if (s.find('.') != std::string::npos && s.find('(') == std::string::npos)
       return true;  // java.game.Scene etc.
@@ -788,6 +331,132 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
       return const_mref_name[imm];
     return cstr(imm);
   };
+  // Soft TREE field/method fidelity (PE VMThread_run @ 0x420FF0):
+  //   op29 @ 0x4214BC → Object_getField @ 0x408800 / Class_getFieldByName
+  //   @ 0x404820 — miss logs "illegal fieldaccess" (null.%s / unknown) and
+  //   still pushes null/0; never allocates a field slot (sub_403840 lookup).
+  //   Soft put may create a host bag slot (write path); soft get must not.
+  //   op33 @ 0x421254 → Object_callMethod @ 0x408A30 — name-only invoke;
+  //   descriptors / FQNs leaked via empty mref are not methods.
+  auto fname_is_garbage = [](const std::string& s) -> bool {
+    if (s.empty()) return true;
+    if (s[0] == '(' || s[0] == '[' || s[0] == 'L') return true;
+    if (s.find(' ') != std::string::npos || s.find(',') != std::string::npos)
+      return true;
+    // Simple field/method id only — FQN leaked from empty mref is not a name.
+    if (s.find('.') != std::string::npos) return true;
+    return false;
+  };
+  auto soft_getfield = [&](InvObject* self, const std::string& fname) {
+    // PE Object_getField miss → push null/0. Never create on get.
+    // Null receiver / garbage name → same (PE null.%s / unknown fieldname).
+    // op29 @ 0x4214BC: miss still ValueStack_push (null) then continue.
+    if (fname_is_garbage(fname) || !self) {
+      push(JvmValue::make_int(0));
+      return;
+    }
+    // Vector.length via tree_fields vector bag (call, don't rewrite fields).
+    if (fname == "length" && tree_vector_is(self)) {
+      push(JvmValue::make_int(tree_vector_size(self)));
+      return;
+    }
+    if (JvmValue* slot = tree_field_slot(self, fname, /*create=*/false))
+      push(*slot);
+    else
+      push(JvmValue::make_int(0));
+  };
+  auto soft_putfield = [&](InvObject* self, const std::string& fname,
+                           const JvmValue& val) {
+    // Soft put: invent host bag slot on write only (get never does).
+    if (fname_is_garbage(fname) || !self) return;
+    if (JvmValue* slot = tree_field_slot(self, fname, /*create=*/true)) *slot = val;
+  };
+  // Soft invoke name gate ≡ PE Object_callMethod name-only resolve.
+  auto soft_invoke_name_ok = [&](const std::string& mname) -> bool {
+    return !mname_is_garbage(mname);
+  };
+  // Soft expression results that Soft/pending VMThread consumers need on the
+  // stack (RunThreadsBudgeted → vmthread_run → TREE). PE VMThread_invokeMethod
+  // @ 0x41FBC0 always ValueStack_push on non-V return (native + empty body).
+  // OSD create* that poison 0x1a statement chains stay on the 0x12 keep path.
+  auto soft_invoke_is_expr = [](const std::string& m) -> bool {
+    return m == "getFirstChild" || m == "getNextChild" || m == "first" ||
+           m == "next" || m == "elementAt" || m == "size" || m == "intValue" ||
+           m == "exists" || m == "getPos" || m == "getOri" || m == "getVel" ||
+           m == "toString" || m == "id" || m == "enable" || m == "createMenu" ||
+           m == "beginGroup" || m == "endGroup" || m == "nextToken" ||
+           m == "countTokens" || m == "token" || m == "autoSave" ||
+           m == "displayModeName" || m == "numDisplayModes" ||
+           m == "currDisplayMode" || m == "getVolume" || m == "getRouteLength" ||
+           m == "getRoutePos" || m == "getRouteDist" || m == "getNearestCross" ||
+           m == "getStartDirection" || m == "getTime" || m == "getAxis" ||
+           m == "currentLine" || m == "add" || m == "mul" || m == "sub" ||
+           m == "diff" || m == "createCar" || m == "createQuickRaceBot";
+  };
+  // 0x12 OSD builders often omit POP — keep return; 0x1a statement form must not.
+  auto soft_invoke_is_osd_builder_result = [](const std::string& m) -> bool {
+    return m == "createButton" || m == "createText" || m == "createTextBox" ||
+           m == "createHotkey" || m == "display";
+  };
+  // PE @ 0x41FBC0: instance method + null a4 → "no instance" log, ret -1;
+  // op33 test eax / jnz continues — Soft must not abort the TREE frame.
+  auto soft_invoke_null_recv = [](bool is_static,
+                                  const std::vector<JvmValue>& args) -> bool {
+    if (is_static) return false;
+    if (args.empty()) return true;
+    return args[0].tag != JvmTag::Obj || args[0].v.o == nullptr;
+  };
+  // Commit Soft invoke result: pending_local store and/or stack keep.
+  // Void miss / null-recv on expr → push 0 (≡ PE empty-body default push).
+  // always_nonvoid: 0x19/0x25 PE always leave non-V on stack (not Soft 0x1a).
+  auto soft_invoke_commit = [&](const std::string& mname, JvmValue r,
+                                bool keep_extra,
+                                bool always_nonvoid = false) -> JvmValue {
+    const bool expr = soft_invoke_is_expr(mname);
+    if (r.tag == JvmTag::Void && (expr || pending_local >= 0))
+      r = JvmValue::make_int(0);
+    if (pending_local >= 0 && r.tag != JvmTag::Void) {
+      ensure_local(static_cast<size_t>(pending_local));
+      locals[static_cast<size_t>(pending_local)] = r;
+      if (name_local < 0) name_local = pending_local;
+      pending_local = -1;
+    } else if (r.tag != JvmTag::Void &&
+               (keep_extra || expr || always_nonvoid)) {
+      push(r);
+    }
+    return r;
+  };
+  // Soft call_by_name with PE null-recv / name gates. Does not invent bytecode.
+  auto soft_call_by_name = [&](const char* owner, const std::string& mname,
+                               const std::vector<JvmValue>& args,
+                               bool is_static) -> JvmValue {
+    if (!soft_invoke_name_ok(mname)) return JvmValue::make_void();
+    // PE Object_callInitIf @ 0x408A90: null clazz → ret 1, no Thread_callMethod.
+    // Soft <init> with empty owner ≡ that gate (continue, no abort).
+    if (mname == "<init>" && (!owner || !owner[0]))
+      return JvmValue::make_void();
+    if (soft_invoke_null_recv(is_static, args)) {
+      // PE Object_callMethod → Thread_callMethod → invokeMethod null a4 @
+      // 0x41FBC0: continue without nested frame (ret -1). Soft: no call.
+      return soft_invoke_is_expr(mname) ? JvmValue::make_int(0)
+                                        : JvmValue::make_void();
+    }
+    return host->call_by_name(owner, mname.c_str(), args, is_static);
+  };
+  // Soft ≡ PE Object_callInitIf @ 0x408A90 via op35 @ 0x4212A4:
+  //   clazz!=0 → Thread_callMethod "<init>"; else ret 1 (continue).
+  // Soft TREE keeps the gate local (no thr / vmthread_op35_* invent).
+  auto soft_init_clazz = [&](InvObject* self) -> const char* {
+    const char* cn = tree_host_class(self);
+    if (cn && cn[0]) return cn;
+    if (!pending_class.empty()) return pending_class.c_str();
+    return nullptr;  // ≡ PE a3==0
+  };
+  auto soft_call_init_if = [&](const char* clazz,
+                               const std::vector<JvmValue>& args) {
+    if (!clazz || !clazz[0]) return;  // ≡ PE ret 1 — no nested frame
+    host->call_by_name(clazz, "<init>", args, false);
+  };
 
   auto resolve_rid = [&](uint32_t imm) -> int32_t {
     if (imm >= const_int_valid.size() || !const_int_valid[imm]) return 0;
@@ -874,7 +543,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             tree.nodes[ip + 1].has_imm &&
             (tree.nodes[ip + 1].imm & 0x80000000u) == 0 && !stack.empty()) {
           const int32_t rel = static_cast<int32_t>(tree.nodes[ip + 1].imm);
-          if (!truthy(stack.back())) {
+          if (!tree_truthy(stack.back())) {
             if (pending_binop && *pending_binop == 7) pending_binop.reset();
             ip = ip + 1 + static_cast<size_t>(rel) - 1;
           } else {
@@ -887,7 +556,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         break;
       }
       case 0x05: {
-        // OR short-circuit: cmp; 0x05; 0x14 +N — if truthy, keep 1 and goto.
+        // OR short-circuit: cmp; 0x05; 0x14 +N — if tree_truthy, keep 1 and goto.
         // OptionsDialog keyText: if (i < 10 || i > 14). Not INSTANCEOF.
         if ((!pending_binop || *pending_binop != 32) &&
             ip + 1 < tree.nodes.size() && tree.nodes[ip + 1].op == 0x14 &&
@@ -895,7 +564,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             (tree.nodes[ip + 1].imm & 0x80000000u) == 0 && !stack.empty() &&
             stack.back().tag == JvmTag::Int) {
           const int32_t rel = static_cast<int32_t>(tree.nodes[ip + 1].imm);
-          if (truthy(stack.back())) {
+          if (tree_truthy(stack.back())) {
             ip = ip + 1 + static_cast<size_t>(rel) - 1;
           } else {
             pop();
@@ -943,7 +612,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             pending_binop.reset();
           }
         } else if (!t.empty() && (t[0] == 'L' || t.find('.') != std::string::npos)) {
-          pending_class = strip_class_desc(t);
+          pending_class = tree_strip_class_desc(t);
           if (pending_class == "java.render.osd.Rectangle")
             pending_class = "java.render.Rectangle";
           if (pending_local >= 0 && pending_class == "java.lang.String" &&
@@ -1013,7 +682,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             v = eval_instanceof();
             pending_binop.reset();
           } else if (!stack.empty()) {
-            v = truthy(pop()) ? 1 : 0;
+            v = tree_truthy(pop()) ? 1 : 0;
           }
           push(JvmValue::make_int(v ? 0 : 1));
         } else if (n.imm == 1) {
@@ -1063,6 +732,9 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
       case 0x08: {
         if (n.has_imm && n.imm == 34) {
           // Completes this()/super() started by 0x22 / 0x23.
+          // Soft ≡ PE op34 @ 0x4212C7 → Object_callMethod_init @ 0x408A70
+          // (always Thread_callMethod "<init>"; no callInitIf null gate).
+          // Clear pending always — never abort TREE.
           if (pending_special_init && !locals.empty() &&
               locals[0].tag == JvmTag::Obj && locals[0].v.o) {
             InvObject* self = locals[0].v.o;
@@ -1107,15 +779,18 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             args.push_back(JvmValue::make_obj(self));
             for (auto it = params.rbegin(); it != params.rend(); ++it)
               args.push_back(*it);
+            // op34 pushes frame class (+0x34) — Soft: this=cls_name / super.
             const char* target = cls_name.c_str();
             if (pending_special_init == 2 && !super_name.empty())
               target = super_name.c_str();
-            host->call_by_name(target, "<init>", args, false);
-            pending_special_init = 0;
+            if (target && target[0])
+              host->call_by_name(target, "<init>", args, false);
           }
+          pending_special_init = 0;
           break;
         }
         if (n.has_imm && n.imm == 35) {
+          // Soft imm 35 multiplexes local-store sugar + PE op35 callInitIf.
           // Local store sugar: `x = -0.4` → push val; load x; 0x08/35.
           // Must run before <init>/AASTORE — both also use imm 35.
           // Object assigns (`m = createMenu()`) are NOT handled here: both
@@ -1129,9 +804,11 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             locals[static_cast<size_t>(last_loaded_local)] = val;
             break;
           }
+          // Soft ≡ PE op35 @ 0x4212A4 → Object_callInitIf @ 0x408A90.
           // PUTFIELD is consumed via 0x1b lookahead. Leftover 0x08/35 is
           // INVOKESPECIAL <init>: stack = [..., arg0, arg1, recv].
           // Or AASTORE commit after 0x20 (value = recent_new / stack).
+          // Null clazz → continue (no nested frame); never abort TREE.
           if (pending_aastore) {
             InvObject* val = recent_new;
             // `arr[i] = null` leaves aconst_null on the stack; prefer it over a
@@ -1189,10 +866,8 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                 args.push_back(JvmValue::make_obj(val));
                 for (auto it = params.rbegin(); it != params.rend(); ++it)
                   args.push_back(*it);
-                const char* cn = tree_host_class(val);
-                if (!cn || !cn[0]) cn = pending_class.c_str();
-                if (cn && cn[0])
-                  host->call_by_name(cn, "<init>", args, false);
+                // Soft ≡ PE op35 Object_callInitIf — null clazz → skip, continue.
+                soft_call_init_if(soft_init_clazz(val), args);
               }
             }
             if (pending_aastore_arr)
@@ -1273,8 +948,8 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               // Java Vector3(FFF) / copy / native Vector3(Ypr) @ 0x00482020.
               if (!stack.empty() && stack.back().tag == JvmTag::Obj &&
                   stack.back().v.o &&
-                  (is_tree_vector3(stack.back().v.o) ||
-                   is_tree_ypr(stack.back().v.o))) {
+                  (tree_is_vector3(stack.back().v.o) ||
+                   tree_is_ypr(stack.back().v.o))) {
                 params.push_back(pop());
               } else {
                 while (params.size() < 3 && !stack.empty() &&
@@ -1322,18 +997,13 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             args.push_back(recv);
             for (auto it = params.rbegin(); it != params.rend(); ++it)
               args.push_back(*it);
-            const char* cn = tree_host_class(recv.v.o);
-            if (!cn || !cn[0]) {
-              cn = pending_class.empty() ? cls_name.c_str()
-                                         : pending_class.c_str();
-            }
-            host->call_by_name(cn, "<init>", args, false);
+            // Soft ≡ PE Object_callInitIf: host_class / pending_class only.
+            // Do NOT fall back to enclosing cls_name (freestyle ≠ PE clazz).
+            soft_call_init_if(soft_init_clazz(recv.v.o), args);
+            // Soft put after NEW+0x21+0x1B hint — same as PE putfield name gate.
             if (!pending_putfield.empty() && recv.tag == JvmTag::Obj &&
                 !locals.empty() && locals[0].tag == JvmTag::Obj) {
-              if (JvmValue* slot =
-                      field_slot(locals[0].v.o, pending_putfield, true)) {
-                *slot = recv;
-              }
+              soft_putfield(locals[0].v.o, pending_putfield, recv);
               pending_putfield.clear();
             }
           }
@@ -1356,7 +1026,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           }
           if (!locals.empty() && locals[0].tag == JvmTag::Obj) {
             if (JvmValue* slot =
-                    field_slot(locals[0].v.o, "prevalence", true)) {
+                    tree_field_slot(locals[0].v.o, "prevalence", true)) {
               *slot = sum;
             }
           }
@@ -1367,7 +1037,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           JvmValue r = JvmValue::make_int(a.v.i | b.v.i);
           if (!locals.empty() && locals[0].tag == JvmTag::Obj) {
             if (JvmValue* slot =
-                    field_slot(locals[0].v.o, "vehicleSetMask", true)) {
+                    tree_field_slot(locals[0].v.o, "vehicleSetMask", true)) {
               *slot = r;
             }
           }
@@ -1504,7 +1174,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             JvmValue right = pop();
             JvmValue left = pop();
             out.push_back(JvmValue::make_obj(
-                concat_str(value_as_string(left), value_as_string(right))));
+                tree_concat_str(tree_value_as_string(left), tree_value_as_string(right))));
           }
           // out is top-first; push deeper first so top matches Java arg order.
           for (auto it = out.rbegin(); it != out.rend(); ++it) push(*it);
@@ -1725,7 +1395,8 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         if (mname.find('.') != std::string::npos && mname.find('(') == std::string::npos) {
           break;
         }
-        if (mname_is_garbage(mname)) break;
+        // Soft invoke: PE Object_callMethod @ 0x408A30 — name-only; garbage → skip.
+        if (!soft_invoke_name_ok(mname)) break;
 
         auto argc_for_method = [&](const std::string& mname) -> int {
           // 0x12 <init>: recv on top after NEW+0x11. argc=0 was dropping
@@ -1760,14 +1431,14 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                 return 6;
               return 5;
             }
-            if (is_tree_vector3(stack.back().v.o) ||
+            if (tree_is_vector3(stack.back().v.o) ||
                 ((!hc || !hc[0]) &&
                  pending_class.find("Vector3") != std::string::npos)) {
               if (stack.size() >= 2 &&
                   stack[stack.size() - 2].tag == JvmTag::Obj &&
                   stack[stack.size() - 2].v.o &&
-                  (is_tree_vector3(stack[stack.size() - 2].v.o) ||
-                   is_tree_ypr(stack[stack.size() - 2].v.o)))
+                  (tree_is_vector3(stack[stack.size() - 2].v.o) ||
+                   tree_is_ypr(stack[stack.size() - 2].v.o)))
                 return 1;
               int nf = 0;
               for (size_t i = 1; i < 4 && i < stack.size(); ++i) {
@@ -1847,6 +1518,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           if (mname == "haltTrafficCross" || mname == "haltTrafficPath")
             return 2;
           if (mname == "startRace") return 3;
+          if (mname == "startRace2") return 0;
           if (mname == "mul" || mname == "add" || mname == "sub" ||
               mname == "setParent")
             return 1;
@@ -2365,6 +2037,9 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           auto is_self_method = [&](const std::string& m) {
             // changeMode is Garage/Dialog self OR Navigator (track.nav) —
             // never force RaceSetup/City this as recv.
+            // enter/exit/startRace*: GameState/City self (Java this) — PE
+            // Object_callMethod @ 0x408A30 name-only; Vector3/prev on top must
+            // not steal recv (Valocity.enter → startRace / exit INSTANCEOF path).
             return m == "createOSDObjects" || m == "lockCar" ||
                    m == "releaseCar" ||
                    m == "addSceneElements" || m == "remSceneElements" ||
@@ -2373,6 +2048,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                    m == "addTimer" || m == "addCustomGroups" ||
                    m == "enableAnimateHook" || m == "disableAnimateHook" ||
                    m == "createQuickRaceBot" || m == "destroyRaceBot" ||
+                   m == "enter" || m == "exit" || m == "startRace" ||
                    m == "startRace2";
           };
           auto is_osd_builder = [&](const std::string& m) {
@@ -2665,11 +2341,11 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             }
             args.insert(args.begin(), recv);
           } else if (mname == "queueEvent") {
-            pack_queue_event(stack, locals, args, &recv);
+            tree_pack_queue_event(stack, locals, args, &recv);
           } else if (mname == "create") {
-            pack_renderref_create(stack, locals, args, &recv);
+            tree_pack_renderref_create(stack, locals, args, &recv);
           } else if (mname == "add" || mname == "mul" || mname == "sub") {
-            pack_vector3_binop(stack, locals, args, &recv);
+            tree_pack_vector3_binop(stack, locals, args, &recv);
           } else {
             if (!stack.empty() && stack.back().tag == JvmTag::Obj)
               recv = pop();
@@ -2686,7 +2362,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           const char* hc = tree_host_class(recv.v.o);
           if (hc && hc[0]) owner = hc;
           if ((mname == "add" || mname == "mul" || mname == "sub") &&
-              recv.tag == JvmTag::Obj && is_tree_vector3(recv.v.o))
+              recv.tag == JvmTag::Obj && tree_is_vector3(recv.v.o))
             owner = "java.lang.Vector3";
           if (mname == "<init>" &&
               pending_class.find("Trigger") != std::string::npos) {
@@ -2853,50 +2529,30 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         }
 
         JvmValue r =
-            host->call_by_name(owner.c_str(), mname.c_str(), args, is_static_call);
+            soft_call_by_name(owner.c_str(), mname, args, is_static_call);
         if (mname == "createMenu" && r.tag == JvmTag::Obj && r.v.o)
           last_menu = r.v.o;
         if (mname == "addItem" && r.tag == JvmTag::Obj && r.v.o)
           last_menu_item = r.v.o;
         if (mname == "endGroup" && r.tag == JvmTag::Int)
           capture_endgroup_field(r.v.i, ip);
-        // MainMenuDialog.osdCommand if/else chain often lacks a clean GOTO end
-        // after changeActiveSection(garage) — stop before super.osdCommand.
+        // MainMenuDialog.osdCommand: after CAS left MainMenu (Garage/Valocity),
+        // stop before leftover super.osdCommand. PE Object_callMethod continues
+        // the frame — Soft only gates on actual section change, not hub
+        // freeride/new/exit pending flags (those skipped Soft world enter).
         if (mname == "changeActiveSection" && !locals.empty() &&
             locals[0].tag == JvmTag::Obj && locals[0].v.o) {
           const char* shc = tree_host_class(locals[0].v.o);
           if (shc && std::strstr(shc, "MainMenuDialog")) {
             InvObject* cur = game_logic_actual_state();
             const char* cn = cur ? tree_host_class(cur) : nullptr;
-            if (!cn || !std::strstr(cn, "MainMenu") ||
-                main_menu_cmd_new_cas_pending() ||
-                main_menu_cmd_freeride_cas_pending() ||
-                main_menu_cmd_exit_cas_pending())
+            if (!cn || !std::strstr(cn, "MainMenu"))
               return JvmValue::make_void();
           }
         }
-        if (pending_local >= 0 && r.tag != JvmTag::Void) {
-          ensure_local(static_cast<size_t>(pending_local));
-          locals[static_cast<size_t>(pending_local)] = r;
-          if (name_local < 0) name_local = pending_local;
-          pending_local = -1;
-        } else if (r.tag != JvmTag::Void) {
-          // Expression results (loops / chaining). Statement calls discard
-          // (stock TREE often omits POP after createBG/createHotkey).
-          if (mname == "getFirstChild" || mname == "getNextChild" ||
-              mname == "first" || mname == "next" || mname == "elementAt" ||
-              mname == "size" || mname == "intValue" || mname == "exists" ||
-              mname == "createButton" || mname == "createText" ||
-              mname == "createTextBox" || mname == "createHotkey" ||
-              mname == "createMenu" || mname == "beginGroup" ||
-              mname == "endGroup" || mname == "nextToken" ||
-              mname == "countTokens" || mname == "token" ||
-              mname == "display" || mname == "autoSave" ||
-              mname == "displayModeName" || mname == "numDisplayModes" ||
-              mname == "currDisplayMode" || mname == "getVolume") {
-            push(r);
-          }
-        }
+        // Soft commit ≡ PE invokeMethod non-V ValueStack_push @ 0x41FBC0.
+        soft_invoke_commit(mname, r,
+                           soft_invoke_is_osd_builder_result(mname));
         break;
       }
       case 0x14: {  // FIELD_REF_STATIC or relative GOTO when imm is negative
@@ -2963,7 +2619,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           }
         }
         const bool take_jump =
-            invert_display_eq0 ? truthy(cond) : !truthy(cond);
+            invert_display_eq0 ? tree_truthy(cond) : !tree_truthy(cond);
         if (take_jump && n.has_imm) {
           const int32_t rel = static_cast<int32_t>(n.imm);
           if (rel > 0) {
@@ -3005,9 +2661,9 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               argc = 1;
             else if (mname == "create") {
               if ((!stack.empty() && stack.back().tag == JvmTag::Obj &&
-                   is_tree_renderref(stack.back().v.o)) ||
+                   tree_is_renderref(stack.back().v.o)) ||
                   (!locals.empty() && locals[0].tag == JvmTag::Obj &&
-                   is_tree_renderref(locals[0].v.o)))
+                   tree_is_renderref(locals[0].v.o)))
                 argc = 3;
             }
             JvmValue recv = JvmValue::make_obj(nullptr);
@@ -3028,11 +2684,11 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               args.push_back(recv);
               args.push_back(arg);
             } else if (mname == "queueEvent") {
-              pack_queue_event(stack, locals, args, &recv);
+              tree_pack_queue_event(stack, locals, args, &recv);
             } else if (mname == "create" && argc == 3) {
-              pack_renderref_create(stack, locals, args, &recv);
+              tree_pack_renderref_create(stack, locals, args, &recv);
             } else if (mname == "add" || mname == "mul" || mname == "sub") {
-              pack_vector3_binop(stack, locals, args, &recv);
+              tree_pack_vector3_binop(stack, locals, args, &recv);
             } else {
               if (!stack.empty() && stack.back().tag == JvmTag::Obj)
                 recv = pop();
@@ -3050,10 +2706,12 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             const char* hc = tree_host_class(recv.v.o);
             if (hc && hc[0]) owner = hc;
             if ((mname == "add" || mname == "mul" || mname == "sub") &&
-                recv.tag == JvmTag::Obj && is_tree_vector3(recv.v.o))
+                recv.tag == JvmTag::Obj && tree_is_vector3(recv.v.o))
               owner = "java.lang.Vector3";
-            JvmValue r = host->call_by_name(owner, mname.c_str(), args, false);
-            if (r.tag != JvmTag::Void) push(r);
+            // Soft ≡ PE Object_callMethod @ 0x408A30 via op33 / oversized 0x19.
+            JvmValue r = soft_call_by_name(owner, mname, args, /*is_static=*/false);
+            soft_invoke_commit(mname, r, /*keep_extra=*/false,
+                               /*always_nonvoid=*/true);
           }
           break;
         }
@@ -3061,7 +2719,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         // createBG → 0x08/27 → 0x11 → 0x19), not a failed FindFile.first.
         if (stack.empty()) break;
         JvmValue cond = stack.back();
-        if (!truthy(cond)) {
+        if (!tree_truthy(cond)) {
           pop();
           if (!n.has_imm || n.imm >= tree.nodes.size()) {
             if (err) *err = "JMP target OOB";
@@ -3126,7 +2784,12 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                  // OptionsDialog.show video-mode loop (else 0x1a → false JMP).
                  m == "numDisplayModes" || m == "currDisplayMode" ||
                  m == "displayModeName" || m == "changeVideoMode" ||
-                 m == "startRace" || m == "haltTrafficCross" ||
+                 // PATH-TO-WORLD: Valocity/City enter·exit·startRace* must not
+                 // fall through as JMP when imm collides with a node index —
+                 // PE op33 Object_callMethod @ 0x408A30 is name-only invoke.
+                 m == "enter" || m == "exit" ||
+                 m == "startRace" || m == "startRace2" ||
+                 m == "haltTrafficCross" ||
                  m == "haltTrafficPath" || m == "setParent" ||
                  m == "getVel" || m == "createCar" ||
                  m == "createQuickRaceBot" || m == "addNotification" ||
@@ -3140,6 +2803,13 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         if (named_mref || (n.has_imm && n.imm >= tree.nodes.size())) {
           std::string mname = field_name(n.imm);
           if (mname.empty()) mname = cstr(n.imm);
+          // Soft invoke ≡ PE op33 Object_callMethod: name-only. Curated
+          // is_inline_mref (incl. "filter 2" GameRef cmds) stays trusted;
+          // out-of-table pool imm still goes through garbage gate.
+          if (!named_mref) {
+            mname = resolve_invoke_name(mname);
+            if (!soft_invoke_name_ok(mname)) break;
+          }
           if (!mname.empty()) {
             // NEW+ARRAY packing immediately before setEventMask/addTimer.
             if ((mname == "setEventMask" || mname == "clearEventMask" ||
@@ -3369,9 +3039,9 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               argc = 3;
             else if (mname == "create") {
               if ((!stack.empty() && stack.back().tag == JvmTag::Obj &&
-                   is_tree_renderref(stack.back().v.o)) ||
+                   tree_is_renderref(stack.back().v.o)) ||
                   (!locals.empty() && locals[0].tag == JvmTag::Obj &&
-                   is_tree_renderref(locals[0].v.o)))
+                   tree_is_renderref(locals[0].v.o)))
                 argc = 3;
             }
             else if (mname == "enter" || mname == "exit")
@@ -3401,6 +3071,8 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               argc = 2;
             else if (mname == "startRace")
               argc = 3;
+            else if (mname == "startRace2")
+              argc = 0;
             else if (mname == "mul" || mname == "add" || mname == "sub" ||
                      mname == "setParent")
               argc = 1;
@@ -3479,6 +3151,10 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             if (mname == "changeActiveSection") {
               // Stock GameLogic.changeActiveSection(state) — static. RaceSetup
               // osdCommand 0x1a otherwise binds Valocity argc=0 and skips CAS.
+              // PE Object_callMethod: pass stack operand only — do not invent
+              // Valocity/City lastState (that freestyle skipped RaceSetup /
+              // new-section enter). RaceSetup/Track → track|lastState matches
+              // stock RaceSetup.osdCommand CAS(track) when TREE left recv junk.
               JvmValue next = JvmValue::make_obj(nullptr);
               if (!stack.empty()) next = pop();
               if (next.tag != JvmTag::Obj || !game_logic_is_section(next.v.o)) {
@@ -3486,12 +3162,12 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                 if (!locals.empty() && locals[0].tag == JvmTag::Obj) {
                   InvObject* o = locals[0].v.o;
                   const char* lc = tree_host_class(o);
-                  // Only RaceSetup/Track `this.track` / lastState — not
-                  // MainMenuDialog CMD_EXIT (explicit null → System.exit).
+                  // RaceSetup.osdCommand / Track only — not MainMenuDialog
+                  // CMD_EXIT (explicit null → System.exit), not Valocity/City
+                  // CAS(racesetup|parent) invent.
                   if (lc && (std::strstr(lc, "RaceSetup") ||
-                             std::strstr(lc, "Valocity") ||
-                             std::strstr(lc, "Track") ||
-                             std::strstr(lc, "City"))) {
+                             (std::strstr(lc, "Track") &&
+                              !std::strstr(lc, "City")))) {
                     InvObject* t = tree_field_get_obj(o, "track");
                     if (!t) t = tree_field_get_obj(o, "lastState");
                     if (game_logic_is_section(t)) next = JvmValue::make_obj(t);
@@ -3500,6 +3176,18 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               }
               host->call_by_name("java.game.GameLogic", "changeActiveSection",
                                  {next}, true);
+              // Same post-CAS gate as 0x12: only when section left MainMenu
+              // (Garage/Valocity enter already ran). No hub-pending freestyle.
+              if (!locals.empty() && locals[0].tag == JvmTag::Obj &&
+                  locals[0].v.o) {
+                const char* shc = tree_host_class(locals[0].v.o);
+                if (shc && std::strstr(shc, "MainMenuDialog")) {
+                  InvObject* cur = game_logic_actual_state();
+                  const char* cn = cur ? tree_host_class(cur) : nullptr;
+                  if (!cn || !std::strstr(cn, "MainMenu"))
+                    return JvmValue::make_void();
+                }
+              }
               break;
             }
             // Input.cursor.enable(int): JVM order [MouseCursor, int] with int on
@@ -3775,19 +3463,22 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               recv = !locals.empty() ? locals[0] : JvmValue::make_obj(nullptr);
               args.insert(args.begin(), recv);
             } else if (mname == "queueEvent") {
-              pack_queue_event(stack, locals, args, &recv);
+              tree_pack_queue_event(stack, locals, args, &recv);
             } else if (mname == "create" && argc == 3) {
-              pack_renderref_create(stack, locals, args, &recv);
+              tree_pack_renderref_create(stack, locals, args, &recv);
             } else if (mname == "add" || mname == "mul" || mname == "sub") {
-              pack_vector3_binop(stack, locals, args, &recv);
+              tree_pack_vector3_binop(stack, locals, args, &recv);
             } else {
               // TREE convention: receiver on top (VT addElement, Osd.createBG…).
               auto is_self_method = [&](const std::string& m) {
+                // enter/exit/startRace*: City/Valocity/Garage self — same PE
+                // Object_callMethod name gate as 0x12 is_self_method.
                 return m == "createOSDObjects" || m == "lockCar" ||
                        m == "releaseCar" ||
                        m == "addSceneElements" || m == "remSceneElements" ||
                        m == "cameraSetup" || m == "giveWarning" ||
                        m == "createQuickRaceBot" || m == "destroyRaceBot" ||
+                       m == "enter" || m == "exit" || m == "startRace" ||
                        m == "startRace2";
               };
               if (is_self_method(mname) && !locals.empty() &&
@@ -3814,7 +3505,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             const char* hc = tree_host_class(recv.v.o);
             if (hc && hc[0]) owner = hc;
             if ((mname == "add" || mname == "mul" || mname == "sub") &&
-                recv.tag == JvmTag::Obj && is_tree_vector3(recv.v.o))
+                recv.tag == JvmTag::Obj && tree_is_vector3(recv.v.o))
               owner = "java.lang.Vector3";
             if (mname == "enable") owner = "java.io.MouseCursor";
             if (mname == "addElement" || mname == "elementAt" ||
@@ -3928,62 +3619,46 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             }
 
             JvmValue r =
-                host->call_by_name(owner, mname.c_str(), args, false);
+                soft_call_by_name(owner, mname, args, /*is_static=*/false);
             if (mname == "createMenu" && r.tag == JvmTag::Obj && r.v.o)
               last_menu = r.v.o;
             if (mname == "addItem" && r.tag == JvmTag::Obj && r.v.o)
               last_menu_item = r.v.o;
             if (mname == "endGroup" && r.tag == JvmTag::Int)
               capture_endgroup_field(r.v.i, ip);
+            // After Soft CAS left MainMenu → Garage/Valocity: stop leftover
+            // menu TREE. No hub freeride/new/exit pending abort (≠ PE continue).
             if (mname == "changeActiveSection" && !locals.empty() &&
                 locals[0].tag == JvmTag::Obj && locals[0].v.o) {
               const char* shc = tree_host_class(locals[0].v.o);
               if (shc && std::strstr(shc, "MainMenuDialog")) {
                 InvObject* cur = game_logic_actual_state();
                 const char* cn = cur ? tree_host_class(cur) : nullptr;
-                if (!cn || !std::strstr(cn, "MainMenu") ||
-                    main_menu_cmd_new_cas_pending() ||
-                    main_menu_cmd_freeride_cas_pending() ||
-                    main_menu_cmd_exit_cas_pending())
+                if (!cn || !std::strstr(cn, "MainMenu"))
                   return JvmValue::make_void();
               }
             }
-            if (r.tag != JvmTag::Void) {
-              bool keep =
-                  pending_local >= 0 || mname == "getFirstChild" ||
-                  mname == "getNextChild" || mname == "elementAt" ||
-                  mname == "size" || mname == "intValue" ||
-                  mname == "enable" || mname == "createMenu" ||
-                  mname == "beginGroup" || mname == "endGroup" ||
-                  mname == "token" || mname == "numDisplayModes" ||
-                  mname == "currDisplayMode" || mname == "displayModeName" ||
-                  mname == "autoSave";
-              // display(): push only when used in if(display()==0). Statement
-              // calls (PlayerSetupDialog.display()) must not leave 0 for a
-              // later IFEQ or CMD_NEW skips loadDefaults/CAS(garage).
-              if (mname == "display") {
-                // StringRequester: if (display()==0). PlayerSetup: statement.
-                keep = false;
-                if (!args.empty() && args[0].tag == JvmTag::Obj && args[0].v.o) {
-                  InvObject* d = args[0].v.o;
-                  const char* dhc = tree_host_class(d);
-                  if (InvObject* hint = tree_field_get_obj(d, "host_class_hint"))
-                    if (const char* hs = string_cstr(hint))
-                      if (hs && hs[0]) dhc = hs;
-                  if (dhc && std::strstr(dhc, "StringRequester")) keep = true;
-                }
-              }
-              // createBG/Header/addItem returns only when assigned; keep-push
-              // left Rectangle/Button on stack and poisoned the next addItem.
-              if (keep) push(r);
-              if (mname == "getFirstChild" || mname == "getNextChild") {
-                if (!locals.empty()) locals[0] = r;
+            // display(): push only when used in if(display()==0). Statement
+            // calls (PlayerSetupDialog.display()) must not leave 0 for a
+            // later IFEQ or CMD_NEW skips loadDefaults/CAS(garage).
+            bool keep_display = false;
+            if (mname == "display") {
+              if (!args.empty() && args[0].tag == JvmTag::Obj && args[0].v.o) {
+                InvObject* d = args[0].v.o;
+                const char* dhc = tree_host_class(d);
+                if (InvObject* hint = tree_field_get_obj(d, "host_class_hint"))
+                  if (const char* hs = string_cstr(hint))
+                    if (hs && hs[0]) dhc = hs;
+                if (dhc && std::strstr(dhc, "StringRequester"))
+                  keep_display = true;
               }
             }
-            if (pending_local >= 0 && r.tag != JvmTag::Void) {
-              ensure_local(static_cast<size_t>(pending_local));
-              locals[static_cast<size_t>(pending_local)] = r;
-              pending_local = -1;
+            // Soft commit ≡ PE op33/invokeMethod non-V push @ 0x41FBC0.
+            // createBG/Header/addItem stay statement-discard on 0x1a.
+            r = soft_invoke_commit(mname, r, keep_display);
+            if ((mname == "getFirstChild" || mname == "getNextChild") &&
+                !locals.empty() && r.tag != JvmTag::Void) {
+              locals[0] = r;
             }
           }
           break;
@@ -3998,7 +3673,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         }
         // Two codegen shapes:
         //  A) target is exit/cleanup → jump when falsy (File.delete)
-        //  B) target is continue (has relative GOTO) → jump when truthy (File.copy)
+        //  B) target is continue (has relative GOTO) → jump when tree_truthy (File.copy)
         bool target_continue = false;
         if (n.has_imm && n.imm < tree.nodes.size()) {
           for (size_t j = n.imm; j < tree.nodes.size() && j < n.imm + 5; ++j) {
@@ -4009,7 +3684,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             }
           }
         }
-        const bool do_jump = target_continue ? truthy(cond) : !truthy(cond);
+        const bool do_jump = target_continue ? tree_truthy(cond) : !tree_truthy(cond);
         if (do_jump) {
           if (!n.has_imm || n.imm >= tree.nodes.size()) {
             if (err) *err = "JMP target OOB";
@@ -4049,7 +3724,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           if (fname.empty() || fname[0] == '(' || fname.find('.') != std::string::npos) {
             fname = "CLUBS";
           }
-          const int32_t vs = static_vs(fname);
+          const int32_t vs = tree_static_vs(fname);
           if (vs >= 0) {
             push(JvmValue::make_int(vs));
             break;
@@ -4062,6 +3737,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         if (ip + 1 < tree.nodes.size()) {
           const TreeNode& next = tree.nodes[ip + 1];
           if (next.op == 0x28) {
+            // Soft get (PE Object_getField miss → null): no create.
             InvObject* self = nullptr;
             if (!stack.empty() && stack.back().tag == JvmTag::Obj) {
               self = pop().v.o;
@@ -4073,8 +3749,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             } else if (!locals.empty()) {
               self = locals[0].v.o;
             }
-            JvmValue* slot = field_slot(self, fname, true);
-            push(slot ? *slot : JvmValue::make_int(0));
+            soft_getfield(self, fname);
             ++ip;
             pending_binop.reset();
             break;
@@ -4082,7 +3757,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           if (next.op == 0x08 && next.has_imm && next.imm == 35) {
             // After NEW+0x21, 0x1B is a type/field hint before <init> — skip it.
             if (ip > 0 && tree.nodes[ip - 1].op == 0x21) {
-              pending_putfield = fname;
+              if (!fname_is_garbage(fname)) pending_putfield = fname;
               break;
             }
             // PUTFIELD: prefer JVM [objectref, value] when under is `this`.
@@ -4115,36 +3790,38 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                 self = locals[0].v.o;
               }
             }
-            if (JvmValue* slot = field_slot(self, fname, true)) *slot = val;
-            if (fname == "played" && val.tag == JvmTag::Int)
-              game_logic_set_played(val.v.i);
-            if (fname == "gameMode" && val.tag == JvmTag::Int)
-              game_logic_set_game_mode(val.v.i);
-            if (fname == "timeout" && val.tag == JvmTag::Int)
-              game_logic_set_timeout(val.v.i);
-            if ((fname == "carrerInProgress" || fname == "careerInProgress") &&
-                val.tag == JvmTag::Int)
-              game_logic_set_career_in_progress(val.v.i);
-            if (fname == "racesetup" && val.tag == JvmTag::Obj)
-              game_logic_set_racesetup(val.v.o);
+            soft_putfield(self, fname, val);
+            if (!fname_is_garbage(fname)) {
+              if (fname == "played" && val.tag == JvmTag::Int)
+                game_logic_set_played(val.v.i);
+              if (fname == "gameMode" && val.tag == JvmTag::Int)
+                game_logic_set_game_mode(val.v.i);
+              if (fname == "timeout" && val.tag == JvmTag::Int)
+                game_logic_set_timeout(val.v.i);
+              if ((fname == "carrerInProgress" || fname == "careerInProgress") &&
+                  val.tag == JvmTag::Int)
+                game_logic_set_career_in_progress(val.v.i);
+              if (fname == "racesetup" && val.tag == JvmTag::Obj)
+                game_logic_set_racesetup(val.v.o);
+            }
             ++ip;
             if (ip + 1 < tree.nodes.size() && tree.nodes[ip + 1].op == 0x29) ++ip;
             break;
           }
         }
         // Bare 0x1B: getstatic or getfield.
-        const int32_t vs = static_vs(fname);
+        const int32_t vs = tree_static_vs(fname);
         if (vs >= 0) {
           push(JvmValue::make_int(vs));
           break;
         }
-        const int32_t cc = static_rid_carcolor(fname);
+        const int32_t cc = tree_static_rid_carcolor(fname);
         if (cc >= 0) {
           push(JvmValue::make_int(cc));
           break;
         }
         if (fname.rfind("qm_", 0) == 0) {
-          push(JvmValue::make_float(static_qm(fname)));
+          push(JvmValue::make_float(tree_static_qm(fname)));
           break;
         }
         if (fname == "RID_GENERALBG" || fname == "RRT_HEADERBG" ||
@@ -4229,10 +3906,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             self = pop().v.o;
           else if (!locals.empty())
             self = locals[0].v.o;
-          if (JvmValue* slot = field_slot(self, fname, true))
-            push(*slot);
-          else
-            push(JvmValue::make_int(0));
+          soft_getfield(self, fname);
         }
         else if (fname == "player") {
           push(JvmValue::make_obj(game_logic_player()));
@@ -4555,9 +4229,6 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         else if (fname.rfind("SFX_", 0) == 0 || fname == "RID_CAMERA") {
           push(JvmValue::make_int(0));
         }
-        else if (fname == "EVENT_COMMAND") {
-          push(JvmValue::make_int(0x00000004));
-        }
         else if (fname == "MENUSET") {
           push(JvmValue::make_int(2));
         }
@@ -4615,9 +4286,9 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                  fname == "head_move_acc" || fname == "Sound_Mix_HW" ||
                  fname == "Sound_3D_HW" || fname == "version") {
           // Config.* getstatic → host Config mirror (OptionsDialog.show).
+          // Soft get ≡ PE getField miss → 0; never create Config slots here.
           InvObject* cfg = system_config_host();
-          JvmValue* slot = field_slot(cfg, fname, true);
-          if (slot)
+          if (JvmValue* slot = tree_field_slot(cfg, fname, /*create=*/false))
             push(*slot);
           else
             push(JvmValue::make_int(0));
@@ -4639,19 +4310,13 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           } else if (!locals.empty()) {
             self = locals[0].v.o;
           }
-          JvmValue* slot = field_slot(self, fname, true);
-          if (fname == "length" && self && g_vectors.count(self)) {
-            push(JvmValue::make_int(tree_vector_size(self)));
-          } else if (slot)
-            push(*slot);
-          else
-            push(JvmValue::make_int(0));
+          soft_getfield(self, fname);
         }
         break;
       }
       case 0x1c: {
         // GETFIELD (quick) — or PUTFIELD when followed by 0x08/35
-        // (Vector: elementData = new Object[n]).
+        // (Vector: elementData = new Object[n]). Soft ≡ PE field get/put.
         std::string fname = field_name(n.has_imm ? n.imm : 0);
         if (ip + 1 < tree.nodes.size() && tree.nodes[ip + 1].op == 0x08 &&
             tree.nodes[ip + 1].has_imm && tree.nodes[ip + 1].imm == 35) {
@@ -4667,7 +4332,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
                        ? locals[0].v.o
                        : nullptr;
           }
-          if (JvmValue* slot = field_slot(self, fname, true)) *slot = val;
+          soft_putfield(self, fname, val);
           ++ip;
           break;
         }
@@ -4677,12 +4342,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         } else if (!locals.empty()) {
           self = locals[0].v.o;
         }
-        if (fname == "length" && self && g_vectors.count(self)) {
-          push(JvmValue::make_int(tree_vector_size(self)));
-        } else {
-          JvmValue* slot = field_slot(self, fname, true);
-          push(slot ? *slot : JvmValue::make_int(0));
-        }
+        soft_getfield(self, fname);
         break;
       }
       case 0x21: {  // store last_new into pending_local
@@ -4766,9 +4426,9 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           argc = 3;
         else if (mname == "create") {
           if ((!stack.empty() && stack.back().tag == JvmTag::Obj &&
-               is_tree_renderref(stack.back().v.o)) ||
+               tree_is_renderref(stack.back().v.o)) ||
               (!locals.empty() && locals[0].tag == JvmTag::Obj &&
-               is_tree_renderref(locals[0].v.o)) ||
+               tree_is_renderref(locals[0].v.o)) ||
               pending_class.find("RenderRef") != std::string::npos)
             argc = 3;
         }
@@ -4787,6 +4447,8 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
           argc = 2;
         else if (mname == "startRace")
           argc = 3;
+        else if (mname == "startRace2")
+          argc = 0;
         else if (mname == "<init>") {
           // Trigger(map,null,pos,alias) / GameRef(parent,rid,params,alias).
           // this() inside Trigger.<init> has empty pending_class — use cls_name.
@@ -4863,11 +4525,19 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         if (n.op == 0x26) {
           recv = !locals.empty() ? locals[0] : JvmValue::make_obj(nullptr);
         } else if (mname == "queueEvent") {
-          // Mixed (null, I, String) — pack_queue_event pops recv itself.
+          // Mixed (null, I, String) — tree_pack_queue_event pops recv itself.
         } else if (mname == "create") {
-          // Mixed (parent, type, alias) — pack_renderref_create pops recv.
+          // Mixed (parent, type, alias) — tree_pack_renderref_create pops recv.
         } else if (mname == "add" || mname == "mul" || mname == "sub") {
-          // Vector3.add — pack_vector3_binop pops recv (skip ResourceRef junk).
+          // Vector3.add — tree_pack_vector3_binop pops recv (skip ResourceRef junk).
+        } else if (mname == "enter" || mname == "exit" || mname == "startRace" ||
+                   mname == "startRace2") {
+          // GameState/City self — PE Object_callMethod name-only; do not take
+          // prev_state / Vector3 as recv (Valocity.enter → startRace / exit).
+          recv = !locals.empty() ? locals[0] : JvmValue::make_obj(nullptr);
+          if (!stack.empty() && stack.back().tag == JvmTag::Obj &&
+              recv.tag == JvmTag::Obj && stack.back().v.o == recv.v.o)
+            pop();
         } else if (mname == "<init>" && n.op == 0x25 &&
                    cls_name.find("Trigger") != std::string::npos &&
                    pending_class.find("GameRef") == std::string::npos &&
@@ -4934,11 +4604,11 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
 
         std::vector<JvmValue> args;
         if (mname == "queueEvent") {
-          pack_queue_event(stack, locals, args, &recv);
+          tree_pack_queue_event(stack, locals, args, &recv);
         } else if (mname == "create" && argc == 3) {
-          pack_renderref_create(stack, locals, args, &recv);
+          tree_pack_renderref_create(stack, locals, args, &recv);
         } else if (mname == "add" || mname == "mul" || mname == "sub") {
-          pack_vector3_binop(stack, locals, args, &recv);
+          tree_pack_vector3_binop(stack, locals, args, &recv);
         } else {
           args.push_back(recv);
           for (int i = 0; i < argc; ++i) {
@@ -4956,7 +4626,7 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
             owner != "java.util.resource.RenderRef")
           owner = hc;
         if ((mname == "add" || mname == "mul" || mname == "sub") &&
-            recv.tag == JvmTag::Obj && is_tree_vector3(recv.v.o))
+            recv.tag == JvmTag::Obj && tree_is_vector3(recv.v.o))
           owner = "java.lang.Vector3";
 
         if (mname == "changeActiveSection") {
@@ -4967,16 +4637,20 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
               break;
             }
           }
-          JvmValue r = host->call_by_name("java.game.GameLogic",
-                                          "changeActiveSection", {next}, true);
-          if (r.tag != JvmTag::Void) push(r);
+          JvmValue r = soft_call_by_name("java.game.GameLogic",
+                                         "changeActiveSection", {next},
+                                         /*is_static=*/true);
+          soft_invoke_commit("changeActiveSection", r, /*keep_extra=*/false,
+                             /*always_nonvoid=*/true);
           break;
         }
 
+        // Soft ≡ PE Object_callMethod @ 0x408A30 (0x25 mref invoke).
         JvmValue r =
-            host->call_by_name(owner.c_str(), mname.c_str(), args, false);
+            soft_call_by_name(owner.c_str(), mname, args, /*is_static=*/false);
         // PlayerSetupDialog.display is 0x25 — discard return (statement).
-        if (mname != "display" && r.tag != JvmTag::Void) push(r);
+        soft_invoke_commit(mname, r, /*keep_extra=*/false,
+                           /*always_nonvoid=*/mname != "display");
         break;
       }
       case 0x27: {  // NEW
@@ -5043,9 +4717,13 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
         // TYPE-declare marker (File.delete / for-loop / checkcast sugar).
         // Value is stored later via 0x2d or NEW+0x21; keep pending_local.
         break;
-      case 0x2b:
+      case 0x2b: {
+        // Soft return ≡ PE VMThread_popFrameRestorePc @ 0x41F7B0 / op DONE
+        // sibling: empty operand stack → void (no abort). Soft pending TREE
+        // methods often end without an explicit value on void paths.
         if (stack.empty()) return JvmValue::make_void();
         return stack.back();
+      }
       case 0x2d:  // DUP2 — also commits stack top into pending_local
         if (pending_local >= 0 && !stack.empty()) {
           ensure_local(static_cast<size_t>(pending_local));
@@ -5109,3 +4787,4 @@ JvmValue tree_eval(TreeHost* host, const JvmClass& cls, const JvmMethod& method,
 }
 
 }  // namespace inv
+

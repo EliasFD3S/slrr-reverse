@@ -1,5 +1,6 @@
 #include "game_boot.hpp"
 
+#include "Resources.h"
 #include "host_objects.hpp"
 #include "input_win32.hpp"
 #include "natives.hpp"
@@ -24,6 +25,83 @@
 
 namespace inv {
 namespace {
+
+// Soft PE ResHandle (16B on stock): +8 remapped key, +0xC owner.
+// Host callers (GameRef_core) use a 16B scratch with int32 key @ +8 —
+// Engine_LoadGameInit gates *(wt+8)!=0 @ 0x53A640.
+using SoftBootRh = uint8_t[16];
+
+static void soft_boot_rh_set_key(SoftBootRh rh, int32_t key) {
+  std::memset(rh, 0, 16);
+  *reinterpret_cast<int32_t*>(rh + 8) = key;
+}
+
+// PE Engine_InitState@0x427980: Remap(system.rpk,4) → g_WorldTreeRoot@636460
+// Bind type=1; Remap(system.rpk,71) Bind type=8 → LoadGameInit(...,"Config").
+// PE Engine_MainLoop@0x428960: Config.init field → Bind type=8;
+// Engine_LoadGameInit(wt, typeRH, unk_63C560, "GameInit")@0x53A5E0 →
+// ResHandle_Link into EngineState+0xE8..+0xF4 before while(!quit).
+// Host: soft Remap + engine_load_game_init stand-in. Config.init→GameInit
+// type RH unknown without Config GameType payload — GameInit type_rh=0
+// (node+alias still created; THRD-CREATE attach when type mid present).
+struct GameInitPrologue {
+  uint32_t wt_key = 0;
+  uint32_t config_type_key = 0;
+  void* config_gi = nullptr;
+  void* gameinit_gi = nullptr;
+  int32_t config_rid = 0;
+  int32_t gameinit_rid = 0;
+};
+
+GameInitPrologue game_boot_mainloop_gameinit_prologue() {
+  GameInitPrologue out{};
+  out.wt_key = resource_engine_remap_from_path("system.rpk", /*local=*/4);
+  out.config_type_key =
+      resource_engine_remap_from_path("system.rpk", /*local=*/71);
+  if (out.wt_key == 0) {
+    std::printf(
+        "  PATH-TO-WORLD GameInit prologue: wt Remap(system.rpk,4)=0 "
+        "(skip LoadGameInit)\n");
+    return out;
+  }
+
+  alignas(4) SoftBootRh wt{};
+  soft_boot_rh_set_key(wt, static_cast<int32_t>(out.wt_key));
+
+  alignas(4) SoftBootRh config_type{};
+  soft_boot_rh_set_key(config_type, static_cast<int32_t>(out.config_type_key));
+  out.config_gi = engine_load_game_init(
+      wt,
+      out.config_type_key != 0 ? static_cast<void*>(config_type) : nullptr, "",
+      "Config");
+  if (out.config_gi) {
+    out.config_rid =
+        *reinterpret_cast<int32_t*>(reinterpret_cast<char*>(out.config_gi) +
+                                    0x50);
+  }
+
+  // Stock type RH = Config script field "init" (MainLoop@0x42899E..0x4289CD).
+  // Soft: nullptr type — InstanceNode alias "GameInit" still allocated.
+  out.gameinit_gi = engine_load_game_init(wt, nullptr, "", "GameInit");
+  if (out.gameinit_gi) {
+    out.gameinit_rid = *reinterpret_cast<int32_t*>(
+        reinterpret_cast<char*>(out.gameinit_gi) + 0x50);
+  }
+
+  std::printf(
+      "  PATH-TO-WORLD prologue: wt=0x%X Config(gi=%p rid=0x%X type=0x%X) "
+      "GameInit(gi=%p rid=0x%X) — PE LoadGameInit@0x53A5E0\n",
+      out.wt_key, out.config_gi, out.config_rid, out.config_type_key,
+      out.gameinit_gi, out.gameinit_rid);
+  return out;
+}
+
+// PE Engine_MainLoop frame tail: ResourceEngine_PumpLoadQueue@0x5378D0 +
+// PumpUnloadQueue@0x537B40 (after Sfx; before Present). Soft each host frame.
+void game_boot_mainloop_resource_pumps() {
+  (void)resource_engine_pump_load_queue();
+  (void)resource_engine_pump_unload_queue();
+}
 
 bool game_boot_warmup(Jvm& jvm, const char* game_root) {
   if (!game_root || !game_root[0]) {
@@ -115,6 +193,10 @@ int game_boot_run(Jvm& jvm, const char* game_root, const char* player_name,
       "note: SplashScreen.enter TREE-first; other GameState host-shim\n");
 
   if (!game_boot_warmup(jvm, game_root)) return 3;
+
+  // Soft InitState Config + MainLoop GameInit before Splash (stock order
+  // after FMV; --boot has no FMV so prologue sits post-warmup packs).
+  (void)game_boot_mainloop_gameinit_prologue();
 
   InvObject* ls_boot = frontend_loading_screen();
   if (Jvm* j = jvm_active()) {
@@ -553,19 +635,34 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
 
   // IDA Engine_boot @ 0x0058C700 size 0x2D2 (722). Xref: WinMain@0x5514A8.
   // ResourceEngine_Init@0x535E70 → LoadPack("system.rpk") fail 0xFFFF →
-  // Engine_InitState@0x427980 (JVM_bootstrap + Natives_Register*, BEFORE FMV)
-  // → Gfx/Sound → FMV DirectShow@0x55C470 (NOT GfxEngine.openVideo@0x47C330)
+  // Engine_InitState@0x427980 (JVM_bootstrap + Natives_Register* +
+  // LoadGameInit("Config"); BEFORE FMV)
+  // → Gfx/Sound → FMV_Boot_PlayPath_DirectShow@0x55C470
+  //   (NOT GfxEngine.openVideo@0x47C330)
   // Activision → Invictus → StreetLegal.avi (SL1 leftover; File_PathExists skip,
-  // no error) → Engine_MainLoop@0x428960 (GameInit + JVM; splash/menu HERE)
+  // no error) → Engine_MainLoop@0x428960:
+  //   LoadGameInit("GameInit")@0x53A5E0 + ResHandle_Link EngineState+0xE8
+  //   → while: Input/sim/Jvm_PumpFrame/RE pumps/Present (splash/menu/world)
   // → TextureLog_FlushWrite@0x53C940 AFTER the loop (texture.log, not JVM).
-  // Host: warmup/FMV then harness splash/menu (stand-in for MainLoop).
-  // FAIL fmv_n<2 is smoke for shipped Activision+Invictus, not a PE error.
+  // Host: warmup/FMV then GameInit prologue + harness splash/menu
+  // (stand-in for MainLoop). FAIL fmv_n<2 is smoke for shipped
+  // Activision+Invictus, not a PE error.
   const int32_t fmv_cap = (auto_new || max_frames > 0) ? 8 : 0;
   const int32_t fmv_n = video_fmv_play_boot_intros(fmv_cap);
   std::printf("  boot FMV clips=%d (Activision+Invictus)\n", fmv_n);
   if (fmv_n < 2) {
     std::printf("FAIL --game boot FMV intros (need Activision+Invictus)\n");
     return 5;
+  }
+
+  // MainLoop prologue (stock post-FMV, pre-while): Config was InitState;
+  // here spawn GameInit InstanceNode under wtroot.
+  const GameInitPrologue gi_boot = game_boot_mainloop_gameinit_prologue();
+  if (!gi_boot.gameinit_gi) {
+    std::printf(
+        "WARN PATH-TO-WORLD: GameInit LoadGameInit returned null "
+        "(wt=0x%X) — continuing Splash harness\n",
+        gi_boot.wt_key);
   }
 
   // Stock GameLogic ctor end: Frontend.loadingScreen.hide() — do not show() a
@@ -667,7 +764,9 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
   std::printf(
       "  live: ENTER=New Career  close window=quit  (ESC skips FMV only)\n");
   if (auto_new)
-    std::printf("  smoke: auto_new + garage + Valocity drive/return\n");
+    std::printf(
+        "  smoke PATH-TO-WORLD: auto_new → Garage → Hit the Street → "
+        "Valocity\n");
 
   // Drain residual ESC from FMV skip before AXIS_CANCEL is live.
 #ifdef _WIN32
@@ -733,6 +832,16 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
   int32_t valo_nav_upd = 0;
   int32_t valo_hud = 0;
   float valo_cam_behind = 0.f;
+  // Soft phys/aero/vehicle probes (post city_drive_smoke side-bands only).
+  int32_t valo_phys = 0;
+  int32_t valo_aero = 0;
+  int32_t valo_vehicle = 0;
+  float valo_phys_spd = 0.f;
+  float valo_aero_fmag = 0.f;
+  float valo_aero_cd = 0.f;
+  int32_t valo_aero_applied = 0;
+  int32_t valo_chassis_shape = 0;
+  int32_t valo_driveable = 0;
   int32_t traffic_p_ok = 0;
   int32_t traffic_bh_ok = 0;
   int32_t traffic_halt_ok = 0;
@@ -877,6 +986,10 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
     traffic_isscripted_ok = tree_field_get_int(city, "isscripted_smoke");
     traffic_getscript_ok = tree_field_get_int(city, "getscript_smoke");
     std::printf(
+        "  PATH-TO-WORLD: Valocity entered=%d map=0x%X (Garage CMD_HITTHESTREET "
+        "→ load into world)\n",
+        valo_entered, tree_field_get_int(city, "map_id"));
+    std::printf(
         "  Valocity live: UP=throttle G=garage ESC=quit  entered=%d "
         "via_tree=%d map=0x%X\n",
         valo_entered, tree_field_get_int(city, "enter_via_tree"),
@@ -937,11 +1050,55 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
     const float z1 = tree_field_get_float(starter_car, "pos_z");
     valo_dist = std::sqrt((x1 - x0) * (x1 - x0) + (z1 - z0) * (z1 - z0));
     valo_spd = tree_field_get_float(starter_car, "speed_sq");
+    // Soft deepen: observe phys/aero/vehicle side-bands after simulate.
+    // Body key mirrors Vehicle.getSpeedSquare @ 0x480500 + city_stop_car
+    // (chassis Native.ptr after Vehicle.set; no invent solve/drive).
+    InvObject* chassis = tree_field_get_obj(starter_car, "chassis");
+    InvObject* body = chassis ? chassis : starter_car;
+    if (physics_shape(body) == 0 && physics_shape(starter_car) != 0)
+      body = starter_car;
+    valo_chassis_shape = chassis ? physics_shape(chassis) : 0;
+    valo_shape = physics_shape(body);
+    if (valo_shape == 0) valo_shape = physics_shape(starter_car);
+    valo_phys_spd = (physics_shape(body) != 0) ? physics_speed_square(body) : 0.f;
+    if (valo_phys_spd <= 0.f && physics_shape(starter_car) != 0)
+      valo_phys_spd = physics_speed_square(starter_car);
     const float live_spd = java_game_Vehicle_getSpeedSquare(starter_car);
     if (live_spd > valo_spd) valo_spd = live_spd;
-    valo_shape = physics_shape(starter_car);
-    std::printf("  Valocity drive dist=%.1f spd=%.1f shape=%d\n", valo_dist,
-                valo_spd, valo_shape);
+    if (valo_phys_spd > valo_spd) valo_spd = valo_phys_spd;
+    // Chassis_physWheelTick aero soft @ 0x456a6b..0x456d2d TREE band.
+    valo_aero_applied =
+        chassis ? tree_field_get_int(chassis, "aero_applied") : 0;
+    valo_aero_fmag =
+        chassis ? tree_field_get_float(chassis, "aero_phys_20f4") : 0.f;
+    valo_aero_cd =
+        chassis ? tree_field_get_float(chassis, "force_update_drag_c") : 0.f;
+    if (valo_aero_cd == 0.f && chassis)
+      valo_aero_cd = tree_field_get_float(chassis, "C_drag");
+    const int32_t flags70 =
+        chassis ? tree_field_get_int(chassis, "force_update_flags70") : 0;
+    valo_driveable = vehicle_is_driveable(starter_car) ? 0 : 1;
+    valo_phys =
+        (valo_shape != 0 && valo_phys_spd > 1.f && valo_dist > 2.f) ? 1 : 0;
+    // Soft aero ok: applied⇒|F|>0; else PE skip gates (flags70&1 / cd<=0 /
+    // |v|^2<=1 @ 0x456a61/83/ac8) still coherent — no invent force.
+    if (!chassis) {
+      valo_aero = 0;
+    } else if (valo_aero_applied == 1) {
+      valo_aero = (valo_aero_fmag > 0.f) ? 1 : 0;
+    } else if ((flags70 & 1) != 0 || valo_aero_cd <= 0.f ||
+               valo_phys_spd <= 1.f) {
+      valo_aero = 1;
+    } else {
+      valo_aero = 0;
+    }
+    valo_vehicle =
+        (chassis && valo_driveable == 1 && live_spd > 1.f) ? 1 : 0;
+    std::printf(
+        "  Valocity drive dist=%.1f spd=%.1f shape=%d ch_shape=%d "
+        "phys_spd=%.1f aero_app=%d |F|=%.1f cd=%.3f driveable=%d\n",
+        valo_dist, valo_spd, valo_shape, valo_chassis_shape, valo_phys_spd,
+        valo_aero_applied, valo_aero_fmag, valo_aero_cd, valo_driveable);
   };
 
   auto city_cam_smoke = [&]() {
@@ -1003,6 +1160,8 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
     }
     // PE Engine_tickTimers @ 0x00427160 — EVENT_TIME oneshot queue.
     java_lang_GameType_pollTimers();
+    // PE MainLoop RE pumps @ 0x428CC9 / 0x428CD4 (soft stand-in).
+    game_boot_mainloop_resource_pumps();
     // Stock EXIT → changeActiveSection(null).
     if (!game_logic_actual_state()) break;
 
@@ -1049,6 +1208,9 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
                          (auto_new && frames == 9 && select >= 0.5f))) {
         InvObject* st = game_logic_actual_state();
         if (st && std::strstr(tree_host_class(st), "MainMenu")) {
+          std::printf(
+              "  PATH-TO-WORLD: CMD_NEW (MainMenuDialog.osdCommand=50) → "
+              "loadDefaults + career + Garage\n");
           main_menu_cmd_new(name);
           fired_new = true;
         }
@@ -1065,6 +1227,13 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
                                                                             : 0;
         osd = tree_field_get_obj(garage, "osd");
         if (!osd && mmd) osd = tree_field_get_obj(mmd, "osd");
+        std::printf(
+            "  PATH-TO-WORLD: Garage career=%d money=%d car=%d — next Hit "
+            "the Street → Valocity\n",
+            game_logic_career_in_progress(),
+            game_logic_player() ? tree_field_get_int(game_logic_player(), "money")
+                                : -1,
+            car_ok);
         std::printf(
             "  Garage live: M=mechanic P=paint T=test U=tune N=none "
             "I=install K=paintPart H=street ESC=quit  car=%d\n",
@@ -1511,6 +1680,9 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
               tree_field_set_obj(icur, "cursor", cgr);
             }
             InvObject* gt = tree_host_new("java.lang.GameType");
+            // Soft PE queueEvent_dispatch @ 0x426653: watcher GI+0x70 must
+            // include EVENT_CURSOR (Java Garage/Mechanic/Dialog setEventMask).
+            if (gt) java_lang_GameType_setEventMask(gt, kEventCursor);
             if (cgr)
               java_lang_GameType_addNotification(gt, cgr, kEventCursor, 0,
                                                  nullptr);
@@ -2314,10 +2486,23 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
   }
 
   const bool valo_ok =
-      !auto_new || (valo_entered == 1 && valo_shape == 1 && valo_dist > 2.f &&
+      !auto_new || (valo_entered == 1 && valo_shape != 0 && valo_dist > 2.f &&
                     valo_spd > 1.f);
   std::printf("boot valocity_live ok=%d entered=%d dist=%.1f spd=%.1f shape=%d\n",
               valo_ok ? 1 : 0, valo_entered, valo_dist, valo_spd, valo_shape);
+
+  // Soft deepen phys/aero/vehicle — report post-drive side-bands only.
+  const bool phys_boot_ok = !auto_new || (valo_phys == 1);
+  std::printf("boot phys ok=%d shape=%d ch_shape=%d spd=%.1f\n",
+              phys_boot_ok ? 1 : 0, valo_shape, valo_chassis_shape,
+              valo_phys_spd);
+  const bool aero_boot_ok = !auto_new || (valo_aero == 1);
+  std::printf("boot aero ok=%d applied=%d |F|=%.1f cd=%.3f\n",
+              aero_boot_ok ? 1 : 0, valo_aero_applied, valo_aero_fmag,
+              valo_aero_cd);
+  const bool vehicle_boot_ok = !auto_new || (valo_vehicle == 1);
+  std::printf("boot vehicle ok=%d driveable=%d chassis_shape=%d\n",
+              vehicle_boot_ok ? 1 : 0, valo_driveable, valo_chassis_shape);
 
   const bool valo_cam_ok = !auto_new || (valo_cam == 1);
   std::printf("boot valocity_cam ok=%d behind=%.1f nav_upd=%d hud=%d\n",
@@ -2539,6 +2724,15 @@ int game_interactive_run(Jvm& jvm, const char* game_root,
   }
   if (auto_new && !valo_ok) {
     std::printf("FAIL --game Valocity live\n");
+    return 5;
+  }
+  if (auto_new && !phys_boot_ok) {
+    std::printf("FAIL --game phys probe\n");
+    return 5;
+  }
+  // Aero is soft report-only (PE skip gates cd/flags/v2 remain valid).
+  if (auto_new && !vehicle_boot_ok) {
+    std::printf("FAIL --game vehicle probe\n");
     return 5;
   }
   if (auto_new && !valo_cam_ok) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Runtime/*/PROGRESS.md from native_registry.json + local .cpp symbols."""
+"""Generate runtime/*/PROGRESS.md from native_registry.json + local .cpp symbols."""
 from __future__ import annotations
 
 import json
@@ -13,25 +13,25 @@ REGISTRY = ROOT / "docs" / "native_registry.json"
 
 # Domain folder → java class prefixes (FQN startswith)
 DOMAINS: dict[str, list[str]] = {
-    "Runtime/System": [
+    "runtime/System": [
         "java.lang.",
         "java.util.Config",
         "java.util.Vector",
         "java.util.VideoMode",
     ],
-    "Runtime/IO": ["java.io."],
-    "Runtime/Resources": ["java.util.resource."],
-    "Runtime/Parts": ["java.game.parts."],
-    "Runtime/Parts/Body": ["java.game.parts.bodypart."],
-    "Runtime/Cars": [
+    "runtime/IO": ["java.io."],
+    "runtime/Resources": ["java.util.resource."],
+    "runtime/Parts": ["java.game.parts."],
+    "runtime/Parts/Body": ["java.game.parts.bodypart."],
+    "runtime/Cars": [
         "java.game.Vehicle",
         "java.game.GameLogic",
         "java.game.Painter",
         "java.game.Navigator",
         "java.game.Player",
     ],
-    "Runtime/Render": ["java.render."],
-    "Runtime/Audio": ["java.sound."],
+    "runtime/Render": ["java.render."],
+    "runtime/Audio": ["java.sound."],
 }
 
 FN_RE = re.compile(
@@ -133,7 +133,7 @@ def main() -> None:
         path = ENGINE / folder
         syms = collect_symbols(path)
         # Parts/Body symbols are only in Body; Parts scan excludes Body.
-        if folder == "Runtime/Parts":
+        if folder == "runtime/Parts":
             # Also count Body toward Parts rollup? Plan wants per-folder.
             # Keep separate: Parts folder only non-bodypart classes.
             ents = [
@@ -191,7 +191,7 @@ def main() -> None:
             p.relative_to(ENGINE).as_posix()
             for p in path.rglob("*.cpp")
             if not (
-                folder == "Runtime/Parts"
+                folder == "runtime/Parts"
                 and "Body" in p.relative_to(path).parts
             )
         )

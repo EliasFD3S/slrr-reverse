@@ -5,58 +5,68 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Unity-like layout:
-#   Runtime/  — domain natives (System, Cars, Parts, …)
-#   Core/     — JVM, TREE, script host, platform backends
+#   runtime/  — domain natives (System, Cars, Parts, …)
+#   core/     — JVM, TREE, script host, platform backends
 # Match original shipping binary: 32-bit first. On MSVC, configure with -A Win32.
 add_executable(slrr_engine
-  # --- Core ---
-  Core/Script/main.cpp
-  Core/Script/game_boot.cpp
-  Core/Script/game_script.cpp
-  Core/Script/tree_interp.cpp
-  Core/natives_registry.cpp
-  Core/natives_stubs.cpp
-  Core/Jvm/jvm_bridge.cpp
-  Core/Jvm/jvm.cpp
-  Core/Jvm/tufa.cpp
-  Core/Jvm/callinfo.cpp
-  Core/Jvm/runtime.cpp
-  Core/Platform/rpak.cpp
-  Core/Platform/render_d3d9.cpp
-  Core/Platform/video_fmv.cpp
-  Core/Platform/input_win32.cpp
-  Core/Platform/audio_win32.cpp
+  # --- core ---
+  core/Script/main.cpp
+  core/Script/game_boot.cpp
+  core/Script/game_script.cpp
+  core/Script/tree_fields.cpp
+  core/Script/tree_eval.cpp
+  core/natives_registry.cpp
+  core/natives_stubs.cpp
+  core/Jvm/jvm_bridge.cpp
+  core/Jvm/jvm.cpp
+  core/Jvm/jvm_register.cpp
+  core/Jvm/jvm_load.cpp
+  core/Jvm/jvm_vmthread.cpp
+  core/Jvm/tufa.cpp
+  core/Jvm/callinfo.cpp
+  core/Jvm/runtime.cpp
+  core/Platform/rpak.cpp
+  core/Platform/render_d3d9.cpp
+  core/Platform/video_fmv.cpp
+  core/Platform/input_win32.cpp
+  core/Platform/audio_win32.cpp
 
-  # --- Runtime / System ---
-  Runtime/System/System.cpp
-  Runtime/System/Lang.cpp
-  Runtime/System/Math3D.cpp
-  Runtime/System/GameType.cpp
+  # --- runtime / System ---
+  runtime/System/System.cpp
+  runtime/System/System_natives.cpp
+  runtime/System/Lang.cpp
+  runtime/System/Math3D.cpp
+  runtime/System/GameType.cpp
 
-  # --- Runtime / IO ---
-  Runtime/IO/IO.cpp
+  # --- runtime / IO ---
+  runtime/IO/IO.cpp
 
-  # --- Runtime / Resources ---
-  Runtime/Resources/Resources.cpp
-  Runtime/Resources/GameRef.cpp
-  Runtime/Resources/AnimationParticle.cpp
+  # --- runtime / Resources ---
+  runtime/Resources/Resources.cpp
+  runtime/Resources/PhysicsRef.cpp
+  runtime/Resources/GroundRef_route.cpp
+  runtime/Resources/GameRef.cpp
+  runtime/Resources/GameRef_core.cpp
+  runtime/Resources/GameRef_collision.cpp
+  runtime/Resources/GroundRef_traffic.cpp
+  runtime/Resources/AnimationParticle.cpp
 
-  # --- Runtime / Parts ---
-  Runtime/Parts/world_state.cpp
-  Runtime/Parts/Part.cpp
-  Runtime/Parts/WheelRef.cpp
-  Runtime/Parts/DynoData.cpp
-  Runtime/Parts/SfxTable.cpp
-  Runtime/Parts/Body/Chassis.cpp
+  # --- runtime / Parts ---
+  runtime/Parts/world_state.cpp
+  runtime/Parts/Part.cpp
+  runtime/Parts/WheelRef.cpp
+  runtime/Parts/DynoData.cpp
+  runtime/Parts/SfxTable.cpp
+  runtime/Parts/Body/Chassis.cpp
 
-  # --- Runtime / Cars ---
-  Runtime/Cars/Cars.cpp
+  # --- runtime / Cars ---
+  runtime/Cars/Cars.cpp
 
-  # --- Runtime / Render ---
-  Runtime/Render/RenderNatives.cpp
+  # --- runtime / Render ---
+  runtime/Render/RenderNatives.cpp
 
-  # --- Runtime / Audio ---
-  Runtime/Audio/Sound.cpp
+  # --- runtime / Audio ---
+  runtime/Audio/Sound.cpp
 )
 
 # Runtime data for host JVM smoke (class index + sample TUFA).

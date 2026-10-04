@@ -26,6 +26,36 @@ void resref_ensure(InvObject* self);
 InvObject* resref_find_by_id(int32_t id);
 void resref_set_parent(InvObject* self, InvObject* parent);
 
+// PE Native.ptr field (dword_62E008): ResourceRef_newNative @ 0x47CEA0
+// Engine_malloc(16) — +0/+4 links, +8 alive, +0xC node*.
+// Host side-map widens with attach block (≥0x40) for CameraCtrl
+// setParent_inner(block+0x30) @ 0x4385A2; mid+0x4C → attach (≠ handle*).
+struct HostNativeHandle;  // opaque; PE 16B head + host attach emb
+HostNativeHandle* native_ptr_get(InvObject* self);
+HostNativeHandle* native_ptr_ensure(InvObject* self);  // alloc + alive=1
+void native_ptr_clear(InvObject* self);
+// PE ResHandle_getPayload @ 0x00419860 — tag 0xA0000000 (= -1610612736).
+// Mid (≥0x17C): +0x0C leaf, +0x40 type(53), +0x44 nest, +0x4C block,
+// +0x84 fog, +0xBC bone flags, +0xF8 stamp, +0x12C bone-id walk,
+// +0x168/+0x178 own-list sentinel/head. Node +0xCC = type53 WT.
+// Leaf vtbl+0x20 = CameraCtrl/Chassis_attachSetParent.
+void* res_handle_get_payload(void* node, int32_t tag);
+void* native_ptr_node(InvObject* self);  // *(handle+0xC) or null
+// PE mid+0x4C CameraCtrl arg: attach block +0xC node / +0x30 emb handle.
+// Distinct from Native.ptr* so GameRef type1 setParent_inner(block+0x30).
+void* native_ptr_attach_block(InvObject* self);
+// PE ResHandle_orPayloadFlags @ 0x0048D1F0 / andNot @ 0x0048D210:
+// thiscall on Native.ptr handle; *(node+0x54) |= / &= ~flags. voidEvent
+// add_light/rem_light use 0x400000 on the type handle (not setLight/setFlare).
+int32_t res_handle_or_payload_flags(InvObject* self, int32_t flags);
+int32_t res_handle_and_not_payload_flags(InvObject* self, int32_t flags);
+int32_t res_handle_get_payload_flags(InvObject* self);
+// PE RenderRef_applyBoneId @ 0x0048BD30 — after RenderRef_bindBone @ 0x48BC40
+// (host getBoneId). add_linked/rem_linked bone00/01 path.
+int32_t render_ref_apply_bone_id(InvObject* self, int32_t bone_id);
+// PE Class_boxObject @ 0x00404E20 — fresh Class shell (not script instance).
+InvObject* class_box_object(const char* fqn);
+
 // GameLogic.initVehicleTypes host path (create+init all *_VT under cars:0x1000).
 int32_t game_logic_init_vehicle_types();
 InvObject* game_logic_vehicle_types();  // java.util.Vector of VehicleType hosts
@@ -70,6 +100,16 @@ InvObject* system_config_host_for_test();
 int32_t system_loading_peak_for_test();
 int32_t system_loading_opens_for_test();
 int32_t system_ld_priority_for_test();
+// PE Engine_MainLoop frame pulse: Engine_SimulateFrame @ 0x00428450
+// (Physics_Step → physics_integrate) → Sfx_ListenerSetPose @ 0x005508F0 →
+// Sfx_UpdateVoices @ 0x00550980 → GfxEngine_PresentFrame @ 0x00428CFE
+// (render_d3d9_flush) → SleepMs when ldWorkScale<=0 → PollWindowQuit
+// @ 0x005522A0 → EndFrame @ 0x00554DC0 (FileAsync drain stand-in).
+void system_mainloop_sfx_listener_update();
+// PE Sfx_ListenerSetPose writer for flt_768720/24/28 (Sound.cpp).
+void sfx_listener_set_pos(float x, float y, float z);
+// PE Sfx_UpdateVoices @ 0x00550980 — host stand-in (no DS voice table).
+void sfx_update_voices();
 
 // Phase 2.18 — host physics body (PhysicsRef + Vehicle speed).
 void physics_set_velocity(InvObject* self, float vx, float vy, float vz);

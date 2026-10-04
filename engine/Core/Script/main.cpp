@@ -1987,6 +1987,14 @@ int main(int argc, char** argv) {
     const int rc = game_interactive_run(jvm, game_root, player_name,
                                         game_auto_new, max_frames);
     if (render_d3d9_ready()) render_d3d9_close();
+    // Host static maps (WheelRef/world_state/GameRef) outlive JVM heap;
+    // CRT teardown can AV on corrupted cross-TU order. Stock process
+    // exits via ExitProcess — match that for --game smoke (race167).
+    if (!boot_wait) {
+      std::printf("EXIT=%d\n", rc);
+      std::fflush(stdout);
+      ::ExitProcess(rc < 0 ? 1 : static_cast<UINT>(rc));
+    }
     return rc;
   }
 
@@ -5477,6 +5485,8 @@ int main(int argc, char** argv) {
       }
 
       InvObject* gt = tree_host_new("java.lang.GameType");
+      // Soft PE @ 0x426653: handler GI+0x70 must include EVENT_CURSOR.
+      java_lang_GameType_setEventMask(gt, 0x00010000);
       java_lang_GameType_addNotification(gt, tree_field_get_obj(ic, "cursor"),
                                          0x00010000, 0, nullptr);
       input_syscursor_set_buttons(1);

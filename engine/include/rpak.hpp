@@ -22,6 +22,21 @@ struct RpakEntry {
   int32_t next_sibling_local = -1;
 };
 
+// Soft PE EnsureIndex dep record @ 0x54425E (0x40B) → TOC slot @ +0x5C.
+struct RpakDep {
+  uint16_t id_hi = 0;   // PE HIWORD(id) → table[+0] @ 0x54426A..0x54426D
+  uint32_t trailer = 0; // PE dword → table[+0x3E] @ 0x544292
+  std::string name;     // PE name[56] → table[+4] @ 0x544283
+};
+
+// Soft PE remap TOC slot — ResourcePack+0x5C stride 66 (0x42) @ 0x544217.
+// RemapLocalId @ 0x5445E2 reads u16 at slot+2 as ext pack HIWORD.
+struct RpakRemapSlot {
+  uint16_t id_hi = 0;    // +0
+  uint16_t pack_hi = 0;  // +2 — LoadPack AX / own pack idx (slot0)
+  uint32_t trailer = 0;  // +0x3E
+};
+
 struct RpakPack {
   // Small integer pack id (1, 2, …). Full resource ids are (pack_id<<16)|local.
   // Matches Catalog: (parts.id() >> 16) == System.openLib(...).
@@ -29,7 +44,12 @@ struct RpakPack {
   std::string path;
   std::string name;
   uint32_t version = 0;
-  std::vector<std::string> deps;
+  // PE file +8/+0xC → pack+0x54/+0x58; RemapLocalId lim = a+b @ 0x5445CC.
+  uint32_t toc_lim_a = 0;
+  uint32_t toc_lim_b = 0;
+  std::vector<RpakDep> deps;
+  // Soft PE *(pack+0x5C): slot0=self, slots1..=deps (EnsureIndex @ 0x544221).
+  std::vector<RpakRemapSlot> remap_toc;
   std::vector<RpakEntry> entries;
   bool is_registry = false;
   bool parsed_entries = false;
@@ -50,6 +70,10 @@ size_t rpak_count();
 // Decode resource id = (pack_id << 16) | type_id (entry.type_id).
 const RpakEntry* rpak_find_entry(int32_t res_id);
 const RpakPack* rpak_find_pack_for_res(int32_t res_id);
+
+// Soft PE ResPack_RemapLocalId @ 0x544590 — pack_id ≡ slot+8;
+// hi!=0 → remap_toc[hi].pack_hi << 16 | lo (table @ +0x5C).
+uint32_t rpak_remap_local_id(int32_t pack_id, uint32_t local_id);
 
 // Parent key for hierarchy: scripted car nodes use kind=0x2xxxx → parent is low 16 bits
 // (e.g. Baiern_VT kind=0x21000 → parent cars:0x1000).
