@@ -11,6 +11,8 @@ namespace inv {
 bool render_d3d9_ready();
 int32_t render_d3d9_width();
 int32_t render_d3d9_height();
+// Soft PE GfxDevice_presentCount @ 0x006495FC — frames Present'd this device.
+int32_t render_d3d9_present_count();
 
 // Create a visible Win32 window + D3D9 device. Returns false on failure.
 bool render_d3d9_open(int32_t width, int32_t height, const char* title);

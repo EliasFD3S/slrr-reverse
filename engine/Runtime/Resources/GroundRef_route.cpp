@@ -144,18 +144,23 @@ InvObject* java_util_resource_GroundRef_getNearestCross(InvObject* self,
 // PE @ 0x00483400 size 0x1d5 (469). GroundRef.getStartDirection(V,V)V3.
 // Unbox this+from+to. Native.ptr + Engine_queryGameRefChannel(handle,
 // 0x39=57,0) fail → null. Read from/to xyz; GroundMap_getStartDirection
-// @ 0x00583840: findNearestCross(from,0,filterY=1) + findNearestCross(to,
-// 0,filterY=1) → GroundMap_findRoute @ 0x005826F0; RouteSpline_paramAtXZ +
-// RouteSpline_evalTangent at start; free temp spline (cache untouched).
-// Miss → zero dir. JNI: |dir|==0 → null; else box NEGATED (-dx,-dy,-dz).
+// @ 0x00583840: findNearestCross(to/from, dist=0, filterY=a6=1) only to
+// set a8/a9 flags (also |query-node| ≤ node[+0x34]*flt_5F0B0C=0.7); then
+// GroundMap_findRoute @ 0x005826F0(from_orig,to_orig,flags) — PE does NOT
+// rewrite endpoint coords to the crosses. RouteSpline_paramAtXZ via
+// Vec3_packXZ @ 0x00436990 + RouteSpline_evalTangent @ start; free temp
+// spline (GroundRef_cachedRoute @ 0x6408D0 untouched). Miss → zero dir.
+// JNI: |dir|==0 → null; else box NEGATED (-dx,-dy,-dz).
 // PATH-TO-WORLD spawn: City.startRace / RaceSetup.enter loop until
 // getStartDirection(pStart,pFinish) non-null.
-// Host soft: g_res≈ch57; snap both ends via nearest_cross(0) then
-// physics_road_start_direction; negate; |dir|~0 → null.
+// Host soft: g_res≈ch57; pass original from/to (no nearest_cross snap —
+// prior Soft snapped, PE does not). physics_road_start_direction stand-in
+// (project+orient toward dest; does not clobber route cache). Soft lacks
+// findRoute a8/a9, filterY grid walk, node[+0x34]*0.7 radius. Negate.
 InvObject* java_util_resource_GroundRef_getStartDirection(InvObject* self,
                                                           InvObject* from,
                                                           InvObject* to) {
-  // PE @ 0x00483400 size 0x1d5 — soft spawn start dir (snap+route tan).
+  // PE @ 0x00483400 size 0x1d5 — soft start dir (orig coords + tan).
   if (!self) return nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -164,14 +169,8 @@ InvObject* java_util_resource_GroundRef_getStartDirection(InvObject* self,
   float fx = 0, fy = 0, fz = 0, tx = 0, ty = 0, tz = 0;
   if (from) vec3_get(from, &fx, &fy, &fz);
   if (to) vec3_get(to, &tx, &ty, &tz);
-  // Soft PE GroundMap_getStartDirection: snap both ends to nearest cross
-  // (dist=0; host lacks filterY=a6=1 |dy|<5 grid filter — 3D minimize).
-  if (physics_road_count() > 0) {
-    if (InvObject* c0 = physics_road_nearest_cross(fx, fy, fz, 0.f))
-      vec3_get(c0, &fx, &fy, &fz);
-    if (InvObject* c1 = physics_road_nearest_cross(tx, ty, tz, 0.f))
-      vec3_get(c1, &tx, &ty, &tz);
-  }
+  // Soft PE @ 0x00583840: keep originals for findRoute-shaped Soft;
+  // nearest_cross only feeds PE flags, not endpoint rewrite.
   InvObject* dir =
       physics_road_start_direction(fx, fy, fz, tx, ty, tz);
   if (!dir) return nullptr;

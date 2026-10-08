@@ -19,8 +19,13 @@ namespace {
 
 // Soft Valocity / arcade_body seed after PE create* (+156|=1 stand-in is
 // shape≠0 — do not OR into ResState.flags: that DWORD is GameRef +0x54).
+// PE createBox@0x4805B0 / createSphere@0x4806F0 → Physics_createPrimitive
+// @0x49AB60 then PhysicsHandle_bindPhysinst@0x48A1E0 →
+// Phys_allocBodyFromPrimitive@0x49B300 (fresh 536B body, vel slots 0).
 void phys_arcade_body_seed(ResState& r) {
   r.asleep = 0;
+  // PE mass=0 sets body+0x9C |=4 (inf mass) — Soft is_static stays 0
+  // (setStatic Soft-only gate; Valocity cars must remain movable).
   r.is_static = 0;
   r.airborne = 0;
   r.collide = 0;
@@ -52,6 +57,16 @@ void phys_arcade_body_seed(ResState& r) {
   r.pose_set = 1;
 }
 
+// PE fresh primitive body: linear+ang vel zero (createPrimitive ctor zeros +
+// Phys_allocBodyFromPrimitive@0x49B300). Re-assert after shape bind so a
+// recreate on a live ResState cannot keep prior arcade_drive vx/wx.
+void phys_arcade_body_zero_vel(ResState& r) {
+  r.vx = r.vy = r.vz = 0.f;
+  r.wx = r.wy = r.wz = 0.f;
+  r.asleep = 0;
+  r.is_static = 0;
+}
+
 }  // namespace
 
 void java_util_resource_PhysicsRef_create(InvObject* self, InvObject* parent,
@@ -60,7 +75,8 @@ void java_util_resource_PhysicsRef_create(InvObject* self, InvObject* parent,
   // Handle 0 OR parent==0 → Mighty ERROR ("!" @ 0x6131EC + "Mighty ERROR"
   // @ 0x6131F0). Host: !self ret; !parent still creates (smokes/TREE pass
   // nullptr; PE would log Mighty). typeRid: ResHandle_Relink → sub_536820;
-  // sub_49A990; body+0x9C |= 1; sub_48A1E0 → INSTANCE_PHYSICS=2.
+  // sub_49A990; body+0x9C |= 1; PhysicsHandle_bindPhysinst@0x48A1E0 →
+  // INSTANCE_PHYSICS=2.
   // Not createBox/createSphere (Physics_createPrimitive @ 0x0049AB60).
   if (!self) return;
   {
@@ -82,47 +98,53 @@ void java_util_resource_PhysicsRef_createBox(InvObject* self, InvObject* parent,
   // PE @ 0x004805B0 size 0x132 (306). Unbox this/parent/x/y/z/alias.
   // Handle via dword_62E008; handle==0 OR parent==null → Mighty ERROR
   // (void). Else identity ori + zero pos; Physics_createPrimitive @
-  // 0x0049AB60 type=5 with half-extents (x*flt_5F09D0,…) — Soft
-  // arcade_box_half_extent; *(body+0x9C)|=1 then sub_48A1E0 →
-  // INSTANCE_PHYSICS. Contrast createSphere @ 0x004806F0: type=1 radius
-  // RAW (no ×0.5). Host: create() typeRid=1; keep parent-null (probes);
-  // alias unused. Soft Valocity: arcade_body seed (gear/wheel/asleep).
+  // 0x0049AB60 type=5 with half-extents (x*flt_5F09D0=0.5,…) — Soft
+  // arcade_box_half_extent; *(body+0x9C)|=1 then
+  // PhysicsHandle_bindPhysinst @ 0x0048A1E0 → INSTANCE_PHYSICS.
+  // Contrast createSphere @ 0x004806F0: type=1 radius RAW (no ×0.5).
+  // Host: create() typeRid=1; keep parent-null (probes); alias unused.
+  // Soft: arcade_body seed + explicit zero vel after shape (PE fresh body).
   (void)alias;
   if (!self) return;
   java_util_resource_PhysicsRef_create(self, parent, 1, nullptr);
   std::lock_guard<std::mutex> lock(g_mu);
   auto& r = R(self);
-  r.shape = 1;
+  r.shape = 1;  // Soft stand-in PE body+0x9C |= 1
   r.hx = arcade_box_half_extent(x);
   r.hy = arcade_box_half_extent(y);
   r.hz = arcade_box_half_extent(z);
+  phys_arcade_body_zero_vel(r);
 }
 void java_util_resource_PhysicsRef_createSphere(InvObject* self, InvObject* parent,
                                                 float radius, InvObject* alias) {
-  // PE @ 0x004806F0 size 0xFF. Unbox this/parent/r/alias. Handle 0 OR parent
-  // 0 → Mighty ERROR. Physics_createPrimitive type=1, radius RAW (no
-  // flt_5F09D0 ×0.5). Contrast createBox @ 0x004805B0 type=5 half-extents.
-  // *(body+0x9C)|=1 then sub_48A1E0. Host: create() typeRid=2
-  // (INSTANCE_PHYSICS), not primitive type 1. Keep parent-null (probes).
+  // PE @ 0x004806F0 size 0xFF (255). Unbox this/parent/r/alias. Handle 0 OR
+  // parent 0 → Mighty ERROR. Physics_createPrimitive type=1, radius RAW
+  // (no flt_5F09D0 ×0.5). Contrast createBox @ 0x004805B0 type=5
+  // half-extents. *(body+0x9C)|=1 then PhysicsHandle_bindPhysinst @
+  // 0x0048A1E0. Host: create() typeRid=2 Soft marker (not primitive type 1).
+  // Keep parent-null (probes). Soft: zero vel after shape like createBox.
   (void)alias;
+  if (!self) return;
   java_util_resource_PhysicsRef_create(self, parent, 2, nullptr);
   std::lock_guard<std::mutex> lock(g_mu);
   auto& r = R(self);
-  r.shape = 2;
+  r.shape = 2;  // Soft stand-in PE body+0x9C |= 1
   r.hx = radius;
   r.hy = r.hz = 0;
+  phys_arcade_body_zero_vel(r);
 }
 void java_util_resource_PhysicsRef_setMatrix(InvObject* self, InvObject* pos,
                                              InvObject* ori) {
-  // PE @ 0x00480920: Unbox this+Vector3+Ypr. Handle 0 → Mighty ERROR.
-  // Null Vector3 → pos 0,0,0 (stores before jz). Vec3_store(0,0,0) zeros
-  // YPR; Ypr fields overwrite if non-null. Veh_ensureSceneBound @
-  // 0x0048AEA0; pos into both ping-pong slots at base+212*index+100;
-  // Ypr_toMatrix @ 0x54ECD0; sub_54FF20; sub_4986F0 (AABB only — callees
-  // confirm no vel wipe). No asleep here. Null,null = origin pose.
-  // Soft host: stop linear+angular only on null,null (smoke origin reset).
-  // Real pose writes preserve vx/wx so Valocity ensure/rebind does not
-  // kill arcade_drive mid-tick. Static bodies keep vel frozen at 0.
+  // PE @ 0x00480920 size 0x1DC (476): Unbox this+Vector3+Ypr. Handle 0 →
+  // Mighty ERROR. Null Vector3 → pos 0,0,0 (stores before jz).
+  // Vec3_store(0,0,0) zeros YPR; Ypr fields overwrite if non-null.
+  // Veh_ensureSceneBound @ 0x0048AEA0; pos into both ping-pong slots at
+  // base+212*index+100; Ypr_toMatrix @ 0x54ECD0; sub_54FF20;
+  // sub_4986F0 (AABB only — no vel wipe). No asleep here.
+  // Null,null = origin pose; PE keeps prior body vel.
+  // Soft: zero vel only on null,null (smoke origin reset) or is_static.
+  // Non-null pose writes preserve vx/wx so Valocity ensure/rebind does
+  // not kill arcade_drive mid-tick.
   if (!self) return;
   float x = 0.f, y = 0.f, z = 0.f;
   if (pos) vec3_get(pos, &x, &y, &z);
@@ -147,9 +169,11 @@ void java_util_resource_PhysicsRef_setMatrix(InvObject* self, InvObject* pos,
   render_d3d9_mesh_set_transform(self, x, y, z, yaw, pitch, roll, 1.f, 1.f, 1.f);
 }
 void java_util_resource_PhysicsRef_setStatic(InvObject* self, int32_t mode) {
-  // Soft host-only: no setStatic in Natives_RegisterAll (only create/
-  // createBox/createSphere/setMatrix/getPos/getOri). Java declares it.
-  // Soft PE arcade_drive/integrate gate: is_static blocks motion
+  // Soft host-only — NOT in stock Natives_RegisterAll @ 0x00487F20.
+  // IDA PhysicsRef block @ 0x00489CA2..0x00489D42 registers only create /
+  // createBox / createSphere / setMatrix / getPos / getOri (0 setStatic
+  // string hits). Java PhysicsRef.java still declares native setStatic.
+  // Soft arcade_drive/integrate gate: is_static blocks motion
   // (arcade_motion_allowed). mode≠0 → freeze vel; mode==0 → wake for
   // Valocity re-enter after garage park (setStatic(1) @ return).
   if (!self) return;

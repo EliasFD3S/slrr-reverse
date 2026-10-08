@@ -27,6 +27,20 @@
 
 namespace inv {
 
+// PE JVM load / compile gate (ticket jvm_load_host; ticket VA 0x00416000 is
+// mid-body of JVM_compileHook, not a function entry):
+//   java.lang.System.compileAll @ 0x0047C080
+//     → JVM_compileAllDir @ 0x00418EB0 (recurse *; *.java → compileSource)
+//     → JVM_compileSource @ 0x004165A0 (TUFA hdr magic/ver/build check;
+//        may parse .java via sub_408F60 then JVM_compileHook @ 0x00412B10)
+//   JVM_getClass @ 0x00410890
+//     → JVM_findLoadedClass @ 0x00411610 (hash)
+//     → JVM_loadClassByFqn @ 0x00410630
+//         → Classpath_resolvePackageDir @ 0x0041D290
+//         → JavaMachine_loadClass @ 0x00410430 (compileSource + read .class
+//            → JVM_addClass_fromChunks @ 0x00411B20)
+// Soft: load existing TUFA .class (no .java→TREE compiler / compileHook emit).
+
 std::vector<std::string> jvm_split_ws(const std::string& s) {
   std::istringstream iss(s);
   std::vector<std::string> out;
@@ -43,6 +57,9 @@ bool jvm_file_exists(const char* path) {
   return false;
 }
 
+// Soft stand-in for Classpath_resolvePackageDir @ 0x0041D290 + path join used
+// by JVM_loadClassByFqn @ 0x00410630 → JavaMachine_loadClass @ 0x00410430
+// (`{dir}\\{simple}.class`). Package→filesystem map is kClasspathMap.
 bool resolve_classpath_file(const char* game_root, const char* fqn,
                             std::string* out_path) {
   if (!game_root || !fqn || !out_path) return false;
@@ -170,6 +187,8 @@ bool Jvm::load_index(const char* path) {
   return !classes_.empty();
 }
 
+// Soft: FilePool_ReadEntireFile + JVM_addClass_fromChunks @ 0x00411B20 side of
+// JavaMachine_loadClass @ 0x00410430 (skips PE compileSource refresh).
 bool Jvm::load_class_file(const char* path) {
   std::vector<JvmClass> all;
   std::string err;
@@ -181,6 +200,9 @@ bool Jvm::load_class_file(const char* path) {
   return !all.empty();
 }
 
+// Soft gate for JVM_getClass @ 0x00410890 miss path:
+// find_class ≈ JVM_findLoadedClass @ 0x00411610; else resolve + load_class_file
+// ≈ JVM_loadClassByFqn @ 0x00410630 → JavaMachine_loadClass @ 0x00410430.
 bool Jvm::load_class(const char* fqn) {
   if (fqn && std::strcmp(fqn, "java.render.osd.Rectangle") == 0)
     fqn = "java.render.Rectangle";
@@ -273,6 +295,10 @@ std::string join_root(const std::string& root, const char* rel) {
 
 }  // namespace
 
+// Soft ≈ JVM_compileAllDir @ 0x00418EB0 (from System.compileAll @ 0x0047C080).
+// PE walks *.java → JVM_compileSource @ 0x004165A0 → JVM_compileHook @ 0x00412B10
+// (TUFA emit @ ~0x00416000). Soft has no .java compiler: recurse and load
+// existing TUFA *.class via load_class_file; return successful load count.
 int32_t Jvm::compile_all(const char* rel_path) {
   if (game_root_.empty()) return 0;
   const char* rel = (rel_path && rel_path[0]) ? rel_path : ".";

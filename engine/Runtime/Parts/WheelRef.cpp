@@ -23,6 +23,8 @@ namespace inv {
 // Host stand-in for PE phys wheel table (*[veh+0x13E4] + id*0x2B4).
 // Always-new WheelRef wrappers share this slot so setters survive getWheel.
 // Stride/wear/apply: world_state::kWheelPhysStride / wheel_apply_* (W34-19).
+// Soft deepen (wheel_phys_host): allocCamBlob wheel-fill gate @ 0x44B000
+// / arm+hub+opp @ 0x44B2A8 — LEA sidemap only; Phys_* bodies OOS.
 static std::unordered_map<InvObject*, std::array<WheelRefState, 8>>
     g_chassis_phys_wheels;
 
@@ -77,6 +79,59 @@ WheelPhysExtra& extra_eff(InvObject* self) {
   if (ch && id >= 0 && id < 8)
     return g_chassis_phys_extra[ch][static_cast<size_t>(id)];
   return orphan;
+}
+
+// Soft PE arm/hub/opp side-map: PE offs + id*0x2B4 LEA into Soft table.
+// Twin of allocCamBlob wheel-fill @ 0x44B2A8..0x44B36c (after wheelbone
+// gate @ 0x44B000): arm[+0x234], opp LEA *[veh+0x13E4]+id*0x2B4 →
+// [+0x250] (id<0→0 @ 0x44B2EA), hub[+0x254]. Soft: LEA arithmetic only —
+// never invent Phys_allocChildBody("hub"/"a_arm") or raw *[veh+0x13E4].
+void wheel_soft_arm_hub_sidemap(InvObject* self, InvObject* chassis,
+                                int32_t id) {
+  const int32_t stride = world_state::kWheelPhysStride;  // 0x2B4
+  const int32_t lea = (id >= 0) ? (id * stride) : 0;
+  auto publish = [&](InvObject* dst) {
+    if (!dst) return;
+    tree_field_set_int(dst, "phys_wheel_stride", stride);
+    tree_field_set_int(dst, "phys_wheels_table_off",
+                       world_state::kChassisWheelTableOff);  // PE +0x13E4
+    tree_field_set_int(dst, "phys_off_arm_234",
+                       world_state::wheel_off::arm0);       // 0x234
+    tree_field_set_int(dst, "phys_off_opp_250",
+                       world_state::wheel_off::opp_wheel);  // 0x250
+    tree_field_set_int(dst, "phys_off_hub_254",
+                       world_state::wheel_off::hub0);       // 0x254
+    // PE tmpl walk stride @ 0x44B3EF (ebx+=0xC8) — Soft advertise only.
+    tree_field_set_int(dst, "phys_wheel_tmpl_stride", 0xC8);
+    if (id >= 0) {
+      tree_field_set_int(dst, "native_ptr_lea", lea);
+      tree_field_set_int(dst, "phys_arm_lea_234",
+                         lea + world_state::wheel_off::arm0);
+      tree_field_set_int(dst, "phys_opp_lea_250",
+                         lea + world_state::wheel_off::opp_wheel);
+      tree_field_set_int(dst, "phys_hub_lea_254",
+                         lea + world_state::wheel_off::hub0);
+    }
+  };
+  publish(self);
+  if (chassis && id >= 0 && id < 8) {
+    char lk[40], a234[48], o250[48], h254[48];
+    std::snprintf(lk, sizeof(lk), "phys_wheel_lea_%d", static_cast<int>(id));
+    std::snprintf(a234, sizeof(a234), "phys_arm_lea_234_%d",
+                  static_cast<int>(id));
+    std::snprintf(o250, sizeof(o250), "phys_opp_lea_250_%d",
+                  static_cast<int>(id));
+    std::snprintf(h254, sizeof(h254), "phys_hub_lea_254_%d",
+                  static_cast<int>(id));
+    tree_field_set_int(chassis, "phys_wheel_stride", stride);
+    tree_field_set_int(chassis, "phys_wheels_table_off",
+                       world_state::kChassisWheelTableOff);
+    tree_field_set_int(chassis, "phys_wheel_tmpl_stride", 0xC8);
+    tree_field_set_int(chassis, lk, lea);
+    tree_field_set_int(chassis, a234, lea + world_state::wheel_off::arm0);
+    tree_field_set_int(chassis, o250, lea + world_state::wheel_off::opp_wheel);
+    tree_field_set_int(chassis, h254, lea + world_state::wheel_off::hub0);
+  }
 }
 
 // Soft PE setBrake/setHBrake side-map: PE field offs (wheel_off) + id*0x2B4
@@ -382,6 +437,9 @@ WheelRefState& chassis_phys_wheel_slot(InvObject* chassis, int32_t id) {
   // Publish current Soft derived brake slots (PE +0xD0/+0xD8 / +0xD4/+0xDC).
   wheel_mirror_brake_tree(nullptr, chassis, id, table[static_cast<size_t>(id)],
                           ex);
+  // Soft PE deepen: allocCamBlob wheel-fill @ 0x44B2A8 arm/hub/opp LEA
+  // sidemap (stride 0x2B4 / tmpl 0xC8) — Soft table only.
+  wheel_soft_arm_hub_sidemap(nullptr, chassis, id);
   return table[static_cast<size_t>(id)];
 }
 
@@ -654,6 +712,8 @@ void java_game_parts_WheelRef_finalize(InvObject* self) {
   tree_field_set_float(self, "brake_scale_k", 0.f);
   tree_field_set_float(self, "scratch164", 0.f);
   tree_field_set_float(self, "bearing_f0", 0.f);
+  tree_field_set_float(self, "arm_len", 0.f);
+  tree_field_set_float(self, "hub_len", 0.f);
   tree_field_set_int(self, "contact30", 0);
   tree_field_set_int(self, "phys_off_brake_d0", 0);
   tree_field_set_int(self, "phys_off_hbrake_d4", 0);
@@ -661,14 +721,21 @@ void java_game_parts_WheelRef_finalize(InvObject* self) {
   tree_field_set_int(self, "phys_off_hbrake_dc", 0);
   tree_field_set_int(self, "phys_off_scratch164", 0);
   tree_field_set_int(self, "phys_off_pos_x", 0);
+  tree_field_set_int(self, "phys_off_arm_234", 0);
+  tree_field_set_int(self, "phys_off_opp_250", 0);
+  tree_field_set_int(self, "phys_off_hub_254", 0);
   tree_field_set_int(self, "phys_wheel_stride", 0);
   tree_field_set_int(self, "phys_wheels_table_off", 0);
+  tree_field_set_int(self, "phys_wheel_tmpl_stride", 0);
   tree_field_set_int(self, "native_ptr_lea", 0);
   tree_field_set_int(self, "phys_brake_lea_d0", 0);
   tree_field_set_int(self, "phys_brake_lea_d8", 0);
   tree_field_set_int(self, "phys_hbrake_lea_d4", 0);
   tree_field_set_int(self, "phys_hbrake_lea_dc", 0);
   tree_field_set_int(self, "phys_pos_lea_78", 0);
+  tree_field_set_int(self, "phys_arm_lea_234", 0);
+  tree_field_set_int(self, "phys_opp_lea_250", 0);
+  tree_field_set_int(self, "phys_hub_lea_254", 0);
   tree_field_set_int(self, "opp_wheel", -1);
   tree_field_set_int(self, "opp_wheel_ptr", 0);
   tree_field_set_int(self, "opp_wheel_lea", 0);
@@ -1238,18 +1305,24 @@ void java_game_parts_WheelRef_setOppWheel(InvObject* self, int32_t id) {
   // Native.ptr==0 → silent ret. ASM @ 0x441a42: id<0 (test/jl) →
   // [handle+0x250]=0. id≥0 → LEA id*0x2B4; esi=[handle+0x22C];
   // ecx=[esi+0x13E4]; [handle+0x250]=ecx+edx — wheel* address, NO bounds
-  // vs +0x1F40 (contrast getWheel jge). race125 PARTIAL: LEA via
-  // phys_wheels_base + id*0x2B4 (unbounded arithmetic like PE); id∈[0,8)
-  // also touches slot so +0x22C/base stay live.
+  // vs +0x1F40 (contrast getWheel jge). Construction twin:
+  // Chassis_allocCamBlob @ 0x44B2E3..0x44B30D (id<0→0; else
+  // *[veh+0x13E4]+id*0x2B4). Soft: LEA via phys_wheels_base + id*0x2B4
+  // (unbounded arithmetic like PE); id∈[0,8) also touches slot so
+  // +0x22C/base stay live. No raw *[veh+0x13E4] invent.
   if (!self) return;
   WR_eff(self).opp_wheel = id;
   tree_field_set_int(self, "opp_wheel", id);
   WheelPhysExtra& me = extra_eff(self);
+  InvObject* ch = tree_field_get_obj(self, "chassis");  // Java mirror
+  if (!ch) ch = me.veh;  // PE handle+0x22C stand-in
+  const int32_t self_id = tree_field_get_int(self, "wheel_id");
   if (id < 0) {
     me.opp_ptr = 0;
     tree_field_set_int(self, "opp_wheel_ptr", 0);
     tree_field_set_int(self, "opp_wheel_lea", 0);
     tree_field_set_int(self, "phys_opp_lea", 0);
+    tree_field_set_int(self, "phys_opp_lea_250", 0);
     tree_field_set_int(self, "phys_opp_brake_lea_d8", 0);
     tree_field_set_int(self, "phys_opp_hbrake_lea_dc", 0);
     tree_field_set_int(self, "phys_brake_opp_src", 0);
@@ -1258,12 +1331,12 @@ void java_game_parts_WheelRef_setOppWheel(InvObject* self, int32_t id) {
     tree_field_set_float(self, "phys_brake_opp_self", 0.f);
     tree_field_set_float(self, "phys_hbrake_opp_self", 0.f);
     tree_field_set_float(self, "phys_brake_torque_sum", 0.f);
+    // Soft: still publish arm/hub/opp offs (opp LEA cleared).
+    wheel_soft_arm_hub_sidemap(self, ch, self_id);
     return;
   }
   const int32_t lea = id * world_state::kWheelPhysStride;
   tree_field_set_int(self, "opp_wheel_lea", lea);
-  InvObject* ch = tree_field_get_obj(self, "chassis");  // Java mirror
-  if (!ch) ch = me.veh;  // PE handle+0x22C stand-in
   uintptr_t base = 0;
   if (ch) {
     // Ensure table + phys_wheels_base (*[veh+0x13E4] stand-in).
@@ -1278,8 +1351,9 @@ void java_game_parts_WheelRef_setOppWheel(InvObject* self, int32_t id) {
   me.opp_ptr = base ? (base + static_cast<uintptr_t>(lea)) : 0;
   tree_field_set_int(self, "opp_wheel_ptr",
                      static_cast<int32_t>(me.opp_ptr));
+  // Soft PE deepen: arm/hub/opp LEA sidemap (allocCamBlob @ 0x44B304).
+  wheel_soft_arm_hub_sidemap(self, ch, self_id);
   // Soft PE: re-publish opp×self + brake_torque_sum (0x455c21 / 0x455c47).
-  const int32_t self_id = tree_field_get_int(self, "wheel_id");
   wheel_soft_phys_publish(self, ch, self_id, /*rederive=*/false,
                           /*accumulate_bearing=*/false);
 }
@@ -1290,6 +1364,8 @@ void java_game_parts_WheelRef_setArm(InvObject* self, float len, float px, float
   // Stores: +0x234=len; +0x244..+0x24C = p + pos(+0x78..+0x80) with Y
   // bias −(+0x38++0x3C) unknown on host → use pos only; +0x238..+0x240 =
   // n̂ if ‖n‖≠0 else leave (host zeros then writes). Same pos slots as setPos.
+  // Construction twin: allocCamBlob @ 0x44B2A8..0x44B2E0 copies tmpl →
+  // wheel[+0x234/+0x238/+0x244] (no Phys_*). Soft: WR.arm + LEA sidemap.
   if (!self) return;
   auto& w = WR_eff(self);
   w.arm[0] = len;
@@ -1308,6 +1384,12 @@ void java_game_parts_WheelRef_setArm(InvObject* self, float len, float px, float
   w.arm[2] = py + w.py;  // PE also −(+0x38++0x3C); not in WheelRefState
   w.arm[3] = pz + w.pz;
   w.has_arm = true;
+  InvObject* ch = tree_field_get_obj(self, "chassis");
+  if (!ch) ch = extra_eff(self).veh;
+  const int32_t wid = tree_field_get_int(self, "wheel_id");
+  if (ch && wid >= 0 && wid < 8) (void)chassis_phys_wheel_slot(ch, wid);
+  tree_field_set_float(self, "arm_len", w.arm[0]);  // PE +0x234
+  wheel_soft_arm_hub_sidemap(self, ch, wid);
 }
 
 void java_game_parts_WheelRef_setHub(InvObject* self, float len, float p1x, float p1y,
@@ -1320,7 +1402,9 @@ void java_game_parts_WheelRef_setHub(InvObject* self, float len, float p1x, floa
   // pc'→[+0x270..+0x278]. If len==0 (exact): unit p2 if ‖p2‖≠0;
   // pc' −= p1. len≠0 (incl. −1 sentinel): store only. Twin setArm
   // @ 0x00441770: same pos/Y-bias on adjusted point.
-  // Host hub[10] = PE block order; Y-bias slots absent → 0; pos from WR.
+  // Construction twin: allocCamBlob @ 0x44B313..0x44B36c copies tmpl →
+  // hub[+0x254..] (after opp LEA). Soft: WR.hub + LEA sidemap; no
+  // Phys_allocChildBody("hub") invent.
   if (!self) return;
   auto& w = WR_eff(self);
   float pc_x = pcx + (w.has_pos ? w.px : 0.f);
@@ -1350,6 +1434,12 @@ void java_game_parts_WheelRef_setHub(InvObject* self, float len, float p1x, floa
     w.hub[9] -= w.hub[3];
   }
   w.has_hub = true;
+  InvObject* ch = tree_field_get_obj(self, "chassis");
+  if (!ch) ch = extra_eff(self).veh;
+  const int32_t wid = tree_field_get_int(self, "wheel_id");
+  if (ch && wid >= 0 && wid < 8) (void)chassis_phys_wheel_slot(ch, wid);
+  tree_field_set_float(self, "hub_len", w.hub[0]);  // PE +0x254
+  wheel_soft_arm_hub_sidemap(self, ch, wid);
 }
 
 }  // namespace inv

@@ -97,7 +97,7 @@ void store_ypr(InvObject* o, float y, float p, float r) {
 // Soft PE Mat3x4 cluster — float stand-in of PE 3x4 stride 0x10 (cols
 // right/up/fwd at +0/+4/+8 per row; row pitch 0x10). Used by Vector3/Ypr
 // natives only (no java.lang.Matrix JNI). PE Ypr_toMatrix / fromAxisAngle
-// leave cells [3]/[7]/[11] unwritten; Soft zeros them on write.
+// / setIdentity leave cells [3]/[7]/[11] unwritten; Soft zeros them on write.
 
 // Soft PE Vec3_store @ 0x00551C70 size 0x17: *this={a,b,c}. Used by
 // Vector3.rotate(Ypr) / Vector3.<init>(Ypr) to pack y/p/r before toMatrix.
@@ -105,6 +105,26 @@ void soft_vec3_store(float out[3], float a, float b, float c) {
   out[0] = a;
   out[1] = b;
   out[2] = c;
+}
+
+// Soft PE Mat3x4_setIdentity @ 0x0054E1D0 size 0x22 (int_convert 34).
+// thiscall ecx=&M00. xor eax; edx=0x3F800000 (1.0f). Writes only rot
+// cells (+0/+4/+8/+10h/+14h/+18h/+20h/+24h/+28h); leaves pad +0C/+1C/+2C
+// unwritten. Soft: zero pad (deterministic stand-in, same as mulLeft Soft).
+void mat34_set_identity(float m[12]) {
+  const float one = bits_f32(0x3F800000u);
+  m[0] = one;
+  m[1] = 0.f;
+  m[2] = 0.f;
+  m[3] = 0.f;
+  m[4] = 0.f;
+  m[5] = one;
+  m[6] = 0.f;
+  m[7] = 0.f;
+  m[8] = 0.f;
+  m[9] = 0.f;
+  m[10] = one;
+  m[11] = 0.f;
 }
 
 // Soft PE Ypr_toMatrix @ 0x0054ECD0 size 0xc1: R=Ry(yaw)*Rx(pitch)*Rz(roll).
@@ -184,8 +204,9 @@ void mat34_mul_left(float th[12], const float a[12]) {
   std::memcpy(th, o, sizeof(o));
 }
 
-// Soft PE deepen — Mat3x4 * Vector3 (rows 0/1/2 at stride 4). Same formula
-// as Vector3.rotate(Ypr) @ 0x004821E7 and rotate(V,F) @ 0x0048234D.
+// Soft PE Mat3x4_mulVec @ 0x00436880 size 0x6f — out = M * v (rows 0/1/2
+// stride 4; no translation). Same formula as Vector3.rotate(Ypr) @
+// 0x004821E7 and rotate(V,F) @ 0x0048234D (inlined).
 void mat34_mul_vec(const float m[12], float x, float y, float z, float& ox,
                    float& oy, float& oz) {
   ox = m[0] * x + m[1] * y + m[2] * z;
@@ -355,19 +376,25 @@ void java_lang_Vector3_normalize(InvObject* self) {
 // Unbox this+ypr. Soft PE deepen: PE get ypr y/p/r @ 0x6133C4/C8/CC then
 // this z/y/x @ 0x6133D0/D4/D8; Vec3_store @ 0x00551C70 + Ypr_toMatrix
 // → M*this; ALWAYS set x/y/z @ 0x6133DC/E0/E4. Returns this (JNI; host
-// TREE void). Soft: null self→ret; null ypr → identity.
+// TREE void). Soft: null self→ret; null ypr → Mat3x4_setIdentity
+// @ 0x0054E1D0 (PE null-ypr crashes get_float_field).
 void java_lang_Vector3_rotate(InvObject* self, InvObject* ypr) {
   // PE @ 0x00482110 size 0x165 — Vector3.rotate(Ypr)Ljava.lang.Vector3;
-  // Soft helpers: Vec3_store @ 0x00551C70, Ypr_toMatrix @ 0x0054ECD0; M*this.
+  // Soft helpers: Vec3_store @ 0x00551C70, Ypr_toMatrix @ 0x0054ECD0 /
+  // Mat3x4_setIdentity @ 0x0054E1D0; M*this via Mat3x4_mulVec @ 0x00436880.
   if (!self) return;
   float x = 0.f, y = 0.f, z = 0.f;
   load_vec3(self, x, y, z);
-  float yaw = 0.f, pitch = 0.f, roll = 0.f;
-  if (ypr) load_ypr(ypr, yaw, pitch, roll);
-  float ypr_pack[3];
-  soft_vec3_store(ypr_pack, yaw, pitch, roll);
   float m[12];
-  ypr_to_mat34(m, ypr_pack[0], ypr_pack[1], ypr_pack[2]);
+  if (ypr) {
+    float yaw = 0.f, pitch = 0.f, roll = 0.f;
+    load_ypr(ypr, yaw, pitch, roll);
+    float ypr_pack[3];
+    soft_vec3_store(ypr_pack, yaw, pitch, roll);
+    ypr_to_mat34(m, ypr_pack[0], ypr_pack[1], ypr_pack[2]);
+  } else {
+    mat34_set_identity(m);
+  }
   float ox = 0.f, oy = 0.f, oz = 0.f;
   mat34_mul_vec(m, x, y, z, ox, oy, oz);
   store_vec3(self, ox, oy, oz);
@@ -400,20 +427,24 @@ void java_lang_Vector3_rotate_1(InvObject* self, InvObject* axis,
 // Soft PE deepen: Unbox dest0=this, dest1=v; get this y/p/r then v y/p/r;
 // Soft Ypr_toMatrix both → Soft Mat3x4_mulLeft(M_this,M_v) → Soft
 // Ypr_fromMatrix into ypr pack; ALWAYS set y/p/r. Soft: null self→ret;
-// null v→identity.
+// null v → Mat3x4_setIdentity @ 0x0054E1D0 (PE null-v crashes).
 void java_lang_Ypr_mul(InvObject* self, InvObject* other) {
   // PE @ 0x004826C0 size 0x10d — java.lang.Ypr.mul(Ypr)V
-  // Soft helpers: Ypr_toMatrix @ 0x0054ECD0, Mat3x4_mulLeft @ 0x0054EAB0,
-  // Ypr_fromMatrix @ 0x00551C90; ALWAYS set y/p/r.
+  // Soft helpers: Ypr_toMatrix @ 0x0054ECD0 / Mat3x4_setIdentity @
+  // 0x0054E1D0, Mat3x4_mulLeft @ 0x0054EAB0, Ypr_fromMatrix @ 0x00551C90.
   if (!self) return;
   float y = 0.f, p = 0.f, r = 0.f;
   load_ypr(self, y, p, r);
-  float oy = 0.f, op = 0.f, ov = 0.f;
-  if (other) load_ypr(other, oy, op, ov);
   float m_this[12] = {};
   float m_v[12] = {};
   ypr_to_mat34(m_this, y, p, r);
-  ypr_to_mat34(m_v, oy, op, ov);
+  if (other) {
+    float oy = 0.f, op = 0.f, ov = 0.f;
+    load_ypr(other, oy, op, ov);
+    ypr_to_mat34(m_v, oy, op, ov);
+  } else {
+    mat34_set_identity(m_v);
+  }
   mat34_mul_left(m_this, m_v);
   ypr_from_mat34(m_this, y, p, r);
   store_ypr(self, y, p, r);
@@ -422,18 +453,23 @@ void java_lang_Ypr_mul(InvObject* self, InvObject* other) {
 // Soft PE @ 0x00482020 — Vector3.<init>(Ypr) size 0xe3.
 // Soft PE deepen: Unbox dest0=this, dest1=ypr; get ypr y/p/r; Soft
 // Vec3_store+Ypr_toMatrix; result=-fwd (*flt_5F0C70=0xBF800000): -m[2/6/10];
-// ALWAYS set x/y/z. Soft: null self→ret; null ypr → (0,0,-1).
+// ALWAYS set x/y/z. Soft: null self→ret; null ypr → Mat3x4_setIdentity
+// @ 0x0054E1D0 then -fwd → (0,0,-1).
 void java_lang_Vector3_init_Ypr(InvObject* self, InvObject* ypr) {
   // PE @ 0x00482020 size 0xe3 — Vector3.<init>(Ypr)
-  // Soft helpers: Vec3_store @ 0x00551C70, Ypr_toMatrix @ 0x0054ECD0;
-  // result=-fwd (*flt_5F0C70): -m[2/6/10]; ALWAYS set x/y/z.
+  // Soft helpers: Vec3_store @ 0x00551C70, Ypr_toMatrix @ 0x0054ECD0 /
+  // Mat3x4_setIdentity @ 0x0054E1D0; result=-fwd (*flt_5F0C70): -m[2/6/10].
   if (!self) return;
-  float yaw = 0.f, pitch = 0.f, roll = 0.f;
-  if (ypr) load_ypr(ypr, yaw, pitch, roll);
-  float ypr_pack[3];
-  soft_vec3_store(ypr_pack, yaw, pitch, roll);
   float m[12];
-  ypr_to_mat34(m, ypr_pack[0], ypr_pack[1], ypr_pack[2]);
+  if (ypr) {
+    float yaw = 0.f, pitch = 0.f, roll = 0.f;
+    load_ypr(ypr, yaw, pitch, roll);
+    float ypr_pack[3];
+    soft_vec3_store(ypr_pack, yaw, pitch, roll);
+    ypr_to_mat34(m, ypr_pack[0], ypr_pack[1], ypr_pack[2]);
+  } else {
+    mat34_set_identity(m);
+  }
   const float kNeg1 = bits_f32(0xBF800000u);  // flt_5F0C70
   store_vec3(self, m[2] * kNeg1, m[6] * kNeg1, m[10] * kNeg1);
 }

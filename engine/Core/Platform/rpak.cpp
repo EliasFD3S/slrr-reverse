@@ -114,12 +114,50 @@ bool read_pe_name(const std::vector<uint8_t>& data, size_t name_off,
   return true;
 }
 
+// Soft PE makeTexture @ 0x0047FFE0 / File_SdatType2_RemountTextures @ 0x485190
+// / Resource_loadSourcefilePayload @ 0x538840: texture TOC payload is often
+// text "sourcefile <path>\r\nflags <n>\r\n" (space or '=' after keyword).
+// Returns first path; normalizes '\\' → '/'.
+bool extract_sourcefile_path(const uint8_t* blob, size_t n, std::string* path) {
+  if (!blob || n < 10 || !path) return false;
+  size_t i = 0;
+  while (i < n) {
+    size_t line_end = i;
+    while (line_end < n && blob[line_end] != '\n' && blob[line_end] != '\r')
+      ++line_end;
+    std::string line(reinterpret_cast<const char*>(blob + i), line_end - i);
+    while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
+      line.pop_back();
+    size_t start = 0;
+    while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+      ++start;
+    line = line.substr(start);
+    if (line.size() >= 10 &&
+        std::strncmp(line.c_str(), "sourcefile", 10) == 0) {
+      size_t p = 10;
+      if (p < line.size() && line[p] == '=') ++p;
+      while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+      if (p < line.size()) {
+        path->assign(line.substr(p));
+        for (char& c : *path) {
+          if (c == '\\') c = '/';
+        }
+        return !path->empty();
+      }
+    }
+    i = line_end;
+    while (i < n && (blob[i] == '\n' || blob[i] == '\r')) ++i;
+  }
+  return false;
+}
+
 // Soft PE TOC walk — EnsureIndex @ 0x54431C..0x544341 + ParseChildRecord size.
 // Layout per record (a2 in ParseChildRecord):
 //   +0  kind/parent u32   +4  type_id u32
 //   +8  restype u8        +9  flags u8 (bit0 → 12f transform)
 //   +10 pad u16+u32       +14 file_off u32  +18 file_sz u32
 //   +22 namelen u8        +23 name[namelen]  [+48 if flags&1]
+// PE ParseChildRecord @ 0x544085: desc[0]=rec[8] restype (7=texture).
 bool parse_entries_pe(const std::vector<uint8_t>& data, size_t off,
                       uint32_t nentries, size_t toc_end,
                       std::vector<RpakEntry>* out) {
@@ -130,6 +168,7 @@ bool parse_entries_pe(const std::vector<uint8_t>& data, size_t off,
       uint32_t kind = 0, type_id = 0;
       std::memcpy(&kind, data.data() + off, 4);
       std::memcpy(&type_id, data.data() + off + 4, 4);
+      const uint8_t restype = data[off + 8];  // @ 0x544085 desc[0]
       const uint8_t flags = data[off + 9];
       uint32_t file_off = 0, file_sz = 0;
       std::memcpy(&file_off, data.data() + off + 14, 4);
@@ -152,6 +191,16 @@ bool parse_entries_pe(const std::vector<uint8_t>& data, size_t off,
       e.type_id = static_cast<int32_t>(type_id);
       e.name = name;
       e.path = name;
+      // Soft PE makeTexture@47FFE0 / RemountTextures@485190 restype==7:
+      // prefer sourcefile path as entry_path for DDS resolve/upload.
+      if (file_off != 0 && file_sz != 0 &&
+          (restype == 7u ||
+           (file_sz >= 10 &&
+            std::memcmp(data.data() + file_off, "sourcefile", 10) == 0))) {
+        std::string src;
+        if (extract_sourcefile_path(data.data() + file_off, file_sz, &src))
+          e.path = std::move(src);
+      }
       e.offset = file_off;
       e.size = file_sz;
       out->push_back(std::move(e));
@@ -435,7 +484,8 @@ uint32_t rpak_remap_local_id(int32_t pack_id, uint32_t local_id) {
 
 // Soft PE sourcefile load path: entry blob is often text
 // "sourcefile <path>\r\n..." (EnsureIndex TOC off/size → File_SlotRead of
-// pack; consumers like sub_538840 / ResourceRef.load parse the lines).
+// pack; consumers Resource_loadSourcefilePayload @ 0x538840 /
+// ResourceRef.load / makeTexture@47FFE0 upload parse the lines).
 // Host returns the raw TOC payload — offsets now PE-accurate.
 bool rpak_read_entry(int32_t res_id, std::vector<uint8_t>* out) {
   if (!out) return false;

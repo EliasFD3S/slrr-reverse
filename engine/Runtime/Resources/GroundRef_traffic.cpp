@@ -29,6 +29,95 @@
 
 namespace inv {
 
+// traffic_spawn_host — PE Traffic_pool_alloc @ 0x0057C380 on
+// g_CarContainer_trafficCars @ 0x798A08. Layout: +0 pages**, +4 page_n,
+// +8 next_i, +0xC cap, +0x10 freelist. Freelist pop else grow
+// cap+=0x400, Engine_realloc(4*page_n), Engine_malloc(0x59000=1024*356),
+// return pages[i/1024]+356*(i%1024). Callers: trySpawnOnRandomPath
+// @ 0x57b479, trySpawnFacingPath @ 0x5823ba, GroundMap_delTraffic
+// default eng+0x3118 @ 0x58172d. Soft: SoftTrafficCarBlob stand-in
+// (PE 356B body / ResHandle / path dllist OOS); bind InvObject host.
+constexpr int32_t kTrafficPoolPageSlots = 1024;  // PE add 0x400 @ 0x57c399
+
+struct SoftTrafficCarBlob {
+  SoftTrafficCarBlob* freelist_next = nullptr;  // PE +0 when free
+  InvObject* host = nullptr;                    // Soft InvObject bind
+  int32_t serial = 0;  // PE live +0 ← ++g_TrafficCarSerial @ 0x798A0C
+  int32_t in_use = 0;
+};
+
+struct SoftTrafficCarsPool {
+  std::vector<SoftTrafficCarBlob*> pages;  // PE +0
+  int32_t page_n = 0;                      // PE +4
+  int32_t next_i = 0;                      // PE +8
+  int32_t cap = 0;                         // PE +0xC
+  SoftTrafficCarBlob* freelist = nullptr;  // PE +0x10
+};
+
+static SoftTrafficCarsPool g_soft_traffic_cars;
+static SoftTrafficCarBlob* g_soft_default_car = nullptr;  // eng+0x3118
+static std::unordered_map<InvObject*, SoftTrafficCarBlob*> g_soft_car_blob;
+static int32_t g_soft_traffic_serial = 0;  // g_TrafficCarSerial @ 0x798A0C
+
+// PE @ 0x0057C380 — thiscall pool; Soft file-local g_soft_traffic_cars.
+static SoftTrafficCarBlob* traffic_pool_alloc() {
+  SoftTrafficCarsPool& p = g_soft_traffic_cars;
+  if (p.freelist) {
+    SoftTrafficCarBlob* r = p.freelist;
+    p.freelist = r->freelist_next;  // PE @ 0x57c38c
+    r->freelist_next = nullptr;
+    return r;
+  }
+  if (p.next_i == p.cap) {
+    // PE @ 0x57c399..0x57c3cc: cap+=1024; ++page_n; realloc; malloc page.
+    p.cap += kTrafficPoolPageSlots;
+    ++p.page_n;
+    p.pages.push_back(new SoftTrafficCarBlob[kTrafficPoolPageSlots]);
+  }
+  const int32_t i = p.next_i++;  // PE @ 0x57c3d0..0x57c3d6
+  return &p.pages[static_cast<size_t>(i / kTrafficPoolPageSlots)]
+              [static_cast<size_t>(i % kTrafficPoolPageSlots)];
+}
+
+// PE freelist push inline @ trySpawn reject 0x57b899 / Traffic_destroy
+// @ 0x57902f: *blob = freelist; freelist = blob.
+static void traffic_pool_free(SoftTrafficCarBlob* blob) {
+  if (!blob) return;
+  blob->host = nullptr;
+  blob->serial = 0;
+  blob->in_use = 0;
+  blob->freelist_next = g_soft_traffic_cars.freelist;
+  g_soft_traffic_cars.freelist = blob;
+}
+
+// PE Traffic_car_ctor @ 0x00575C30 — Soft serial + in_use only
+// (path/RH/float defaults OOS; spawn TREE seeds elsewhere).
+static SoftTrafficCarBlob* traffic_car_ctor(SoftTrafficCarBlob* blob) {
+  if (!blob) return nullptr;
+  blob->freelist_next = nullptr;
+  blob->host = nullptr;
+  blob->serial = ++g_soft_traffic_serial;  // PE ++g_TrafficCarSerial
+  blob->in_use = 1;
+  return blob;
+}
+
+static void traffic_pool_bind_host(InvObject* car, SoftTrafficCarBlob* blob) {
+  if (!car || !blob) return;
+  blob->host = car;
+  g_soft_car_blob[car] = blob;
+  tree_field_set_int(car, "traffic_blob_serial", blob->serial);
+}
+
+static void traffic_pool_unbind_host(InvObject* car) {
+  if (!car) return;
+  auto it = g_soft_car_blob.find(car);
+  if (it == g_soft_car_blob.end()) return;
+  SoftTrafficCarBlob* blob = it->second;
+  g_soft_car_blob.erase(it);
+  traffic_pool_free(blob);
+  tree_field_set_int(car, "traffic_blob_serial", 0);
+}
+
 void ground_sync_fields(InvObject* self) {
   if (!self) return;
   GroundTrafficState& g = ground(self);
@@ -46,6 +135,18 @@ void ground_sync_fields(InvObject* self) {
   // W29/30D — eng+0x3110 stand-in (push count; compact rewrites).
   tree_field_set_int(self, "traffic_pool_n",
                      static_cast<int32_t>(g.pool_slots.size()));
+  // Soft Traffic_pool_alloc @ 0x57C380 (g_CarContainer_trafficCars).
+  int32_t blob_free = 0;
+  for (SoftTrafficCarBlob* n = g_soft_traffic_cars.freelist; n;
+       n = n->freelist_next)
+    ++blob_free;
+  tree_field_set_int(self, "traffic_blob_live_n",
+                     static_cast<int32_t>(g_soft_car_blob.size()));
+  tree_field_set_int(self, "traffic_blob_free_n", blob_free);
+  tree_field_set_int(self, "traffic_blob_page_n", g_soft_traffic_cars.page_n);
+  tree_field_set_int(self, "traffic_blob_next_i", g_soft_traffic_cars.next_i);
+  tree_field_set_int(self, "traffic_default_car",
+                     g_soft_default_car ? 1 : 0);
   // W34 — eng+0x98 live / eng+0xAC freelist counts (soft owned).
   int32_t pn_live = 0, pn_free = 0;
   for (auto* n = g.pathnodes_live; n; n = n->list_next) ++pn_live;
@@ -452,6 +553,13 @@ static void traffic_activate_apply(InvObject* car, GroundTrafficState& g) {
   tree_field_set_int(car, "traffic_active", 1);
   ++g.pool_active;
   ++g.activate_n;
+  // Soft PE Traffic_pool_alloc @ 0x57C380 + Traffic_car_ctor @ 0x575C30
+  // (trySpawn* @ 0x57b479 before activate). Soft bind after gates —
+  // 356B PE body OOS; serial via g_TrafficCarSerial @ 0x798A0C.
+  if (g_soft_car_blob.find(car) == g_soft_car_blob.end()) {
+    SoftTrafficCarBlob* blob = traffic_car_ctor(traffic_pool_alloc());
+    traffic_pool_bind_host(car, blob);
+  }
   // PE @ 0x5790e7 Traffic_pool_push(dword_798A54, car).
   traffic_pool_push(car, g);
   // W35-04 soft arm: PE spawn paths call Traffic_timer_heap_push;
@@ -478,6 +586,8 @@ static void traffic_deactivate_apply(InvObject* car, GroundTrafficState& g) {
   tree_field_set_float(car, "traffic_frame_stamp", 0.f);  // W35-05 +0xE8
   if (g.pool_active > 0) --g.pool_active;
   ++g.deactivate_n;
+  // Soft PE Traffic_destroy freelist push @ 0x57902f (pool+0x10).
+  traffic_pool_unbind_host(car);
   // PE: no pool array pop here — dead slots linger until
   // Traffic_pool_sweep_dead (W33D) / Traffic_pool_sort_compact.
 }
@@ -847,6 +957,17 @@ void java_util_resource_GroundRef_delTraffic(InvObject* self) {
     g.path_spawns = 0;
     g.pool_active = 0;  // W28D: g_TrafficPoolActive stand-in
     g.pool_slots.clear();  // W29D: eng+0x310C / +0x3110 (CarContainer_ctor zero)
+    // Soft PE Traffic_destroy freelist @ 0x57902f for bound blobs; then
+    // GroundMap_delTraffic @ 0x58172d: Traffic_pool_alloc+car_ctor → +0x3118.
+    for (auto& kv : g_soft_car_blob) {
+      if (kv.second) traffic_pool_free(kv.second);
+    }
+    g_soft_car_blob.clear();
+    if (g_soft_default_car) {
+      traffic_pool_free(g_soft_default_car);
+      g_soft_default_car = nullptr;
+    }
+    g_soft_default_car = traffic_car_ctor(traffic_pool_alloc());
     // W35-04 — eng+0/+4 timer heap zero (CarContainer teardown stand-in).
     g.timer_heap.clear();
     g.timer_heap_pops = 0;

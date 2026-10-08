@@ -3,6 +3,8 @@
 // W35-14 Soft PE: residual sfx+0x48 intrusive list + vol@+0x244 (IDA 2026-09-26).
 // W36-14 Soft PE: full sample slot 0x24 floats + count@+0x240 (IDA 2026-10-01).
 // W37-14 Soft PE: Chassis_SfxTable_play @ 0x0048F0E0 + addItem order (IDA 2026-10-01).
+// W38 Soft PE: sfxtable_soft_play → nplay @ 0x00480D40 with Vector3 pos
+// (PE Chassis float* a5; Soft nplay stand-in — IDA 2026-10-04).
 #include "natives.hpp"
 #include "host_objects.hpp"
 #include "runtime.hpp"
@@ -254,8 +256,9 @@ void java_game_parts_SfxTable_addItem(InvObject* self, InvObject* sfx,
 
 // Soft PE Chassis_SfxTable_play @ 0x0048F0E0 size 0x177 (375). IDA rename
 // from sub_48F0E0. thiscall this=SfxTable blob. Args: rpm, vol_scale,
-// flags, pos_xyz|0, instance, radius, a8=0, a9=0 (retn 0x20).
-// rpm_eff = rpm * [this+0x244] (table vol, ctor 1.0f). If pos!=0:
+// flags, pos_xyz|0, instance, radius, a8, a9 (retn 0x20). Xrefs×4 from
+// sub_4518C0 @ 0x451A3B/0x451CD8/0x451D93/0x451F66 (tables +0xF8/+0x340/
+// +0x588). rpm_eff = rpm * [this+0x244] (table vol, ctor 1.0f). If pos!=0:
 // Sfx_3DListenerCull(pos,radius)<0 → ret. Loop i=0..count-1 (@+0x240) or
 // until slot+0x0C==0: if rpm_eff in [pmin,pmax] (@+0x14/+0x18):
 //   t=(rpm_eff-pmin)/(pmax-pmin); vol_lerp=(1-t)*vmin+t*vmax;
@@ -263,8 +266,12 @@ void java_game_parts_SfxTable_addItem(InvObject* self, InvObject* sfx,
 //     w=(rpm_eff-pmin)/(prev.pmax-pmin); if i<count-1 && rpm_eff>=next.pmin
 //     && (pmax-next.pmin)>0: w=1-(rpm_eff-next.pmin)/(pmax-next.pmin);
 //   if w>0: Sfx_PlayWithListenerCull(this=slot RH, pitch=rpm_eff*inv_pitch,
-//     vol=w*vol_lerp*vol_scale, …). Soft: soft embeds + rows[i].sfx →
-//     SfxRef.nplay (PE plays ResHandle embed directly — Soft no DS RH).
+//     vol=w*vol_lerp*vol_scale, flags, pos=a5, instance, radius, a8, a9).
+// Soft: soft embeds + rows[i].sfx → SfxRef.nplay @ 0x00480D40 (PE plays
+// ResHandle embed directly — Soft no DS RH). nplay then:
+//   vol*=Sound_volumeEffects @ 0x612C58; pos null→flags|=4; else stack xyz
+//   → Sfx_PlayWithListenerCull @ 0x0048CFB0 (2nd cull). Soft a8/a9=0 always
+//   (nplay pushes 0,0 — PE Chassis can pass non-null; Chassis wire OOS).
 void sfxtable_soft_play(InvObject* self, float rpm, float vol_scale,
                         int32_t flags, const float* pos_xyz, int32_t instance,
                         float radius) {
@@ -278,6 +285,19 @@ void sfxtable_soft_play(InvObject* self, float rpm, float vol_scale,
   if (pos_xyz != nullptr) {
     if (sfx_3d_listener_cull(pos_xyz[0], pos_xyz[1], pos_xyz[2], radius) < 0)
       return;
+  }
+  // Soft bridge: PE float* a5 → nplay Vector3 (JVM_vm_get_float_field x/y/z
+  // @ 0x480D9A..0x480DC1). Reuse one host Vector3; null a5 → nplay nullptr
+  // → PlayWithListenerCull flags|=4 @ 0x48D0AA.
+  InvObject* pos_obj = nullptr;
+  if (pos_xyz != nullptr) {
+    static InvObject* s_nplay_pos = nullptr;
+    if (!s_nplay_pos) s_nplay_pos = vec3_new(0.f, 0.f, 0.f);
+    vec3_set(s_nplay_pos, pos_xyz[0], pos_xyz[1], pos_xyz[2]);
+    tree_field_set_float(s_nplay_pos, "x", pos_xyz[0]);
+    tree_field_set_float(s_nplay_pos, "y", pos_xyz[1]);
+    tree_field_set_float(s_nplay_pos, "z", pos_xyz[2]);
+    pos_obj = s_nplay_pos;
   }
   auto rit = g_sfxtables.find(self);
   const std::vector<SfxItem>* rows =
@@ -312,16 +332,14 @@ void sfxtable_soft_play(InvObject* self, float rpm, float vol_scale,
     if (!(w > kSfxTableFltZero)) continue;
     const float play_vol = w * vol_lerp * vol_scale;
     const float play_pitch = rpm_eff * slot.inv_pitch;
-    // Soft: InvObject from row mirror → nplay (PE: PlayWithListenerCull RH).
+    // Soft: InvObject from row mirror → nplay @ 0x480D40 (PE: PlayWithListenerCull
+    // on slot RH @ 0x48F23A — Soft no DS RH).
     InvObject* sfx_obj = nullptr;
     if (rows && static_cast<size_t>(i) < rows->size())
       sfx_obj = (*rows)[static_cast<size_t>(i)].sfx;
     if (!sfx_obj) continue;
-    // pos: PE passes float*; nplay takes Vector3 InvObject — Soft null pos
-    // when table play had xyz (TREE Vector3 OOS here); nplay still 2D|=4.
-    (void)java_util_resource_SfxRef_nplay(sfx_obj, nullptr, radius,
-                                          play_pitch, play_vol, flags,
-                                          instance);
+    (void)java_util_resource_SfxRef_nplay(sfx_obj, pos_obj, radius, play_pitch,
+                                          play_vol, flags, instance);
   }
 }
 

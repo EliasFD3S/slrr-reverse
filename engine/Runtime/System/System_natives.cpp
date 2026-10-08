@@ -563,9 +563,13 @@ int32_t java_lang_System_isLoading() {  // PE @ 0x0047C3B0
 // race124: EndFrame FileAsync_Malloc @ 0x0054F6E0 was misnamed
 //   CompletePending/CloseHandle — IDA: CRT heap alloc (size>0).
 // race126: Present via render_d3d9_flush. SimulateFrame @ 0x00428450 OOS.
-// race127: EndFrame FileAsync host stand-in — ring layout PE-clear
-//   (64×71 dwords @ 0x76AA30..0x76F130); drain state4→Malloc→state1 +
-//   WakeSem no-op. No worker/enqueue/disk IO. SimulateFrame still OOS.
+// race127 / endframe_fileasync_hosted: Engine_MainLoop_EndFrame @
+//   0x00554DC0 size 0x44 Soft-hosted — FileAsync_Ring@76AA30 walk +71
+//   to ThreadHandle@76F130; *slot==4 → FileAsync_Malloc@54F6E0(size[67])
+//   → buf[1], *slot=1; Engine_ReleaseSemaphore(WakeSem@61AC3C). Soft
+//   engine_mainloop_endframe + worker_pump_all (WakeSem stand-in).
+//   FlushHandlesForPath@555550 / real LockSem / worker-thread shutdown
+//   are outside this VA (OOS residual — not EndFrame callees).
 // W16C: FileAsync_EnqueuePath@5553B0 / EnqueueRead@555470 hosted (ring
 //   fill + Active + WakeSem no-op).
 // W17C: WorkerThread@554EA0 map+IDA rename; host pump (prio/RR) after
@@ -754,7 +758,9 @@ void system_mainloop_sfx_listener_update() {
   render_d3d9_pump(0);
   if (render_d3d9_quit_requested()) request_exit();
 
-  // PE @ 0x00428F6B Engine_MainLoop_EndFrame @ 0x00554DC0.
+  // PE @ 0x00428F6B → Engine_MainLoop_EndFrame @ 0x00554DC0 size 0x44
+  // (callees: FileAsync_Malloc@54F6E0, Engine_ReleaseSemaphore@559880).
+  // Soft: ring state4→alloc→queued + WakeSem no-op + sync worker pump.
   engine_mainloop_endframe();
 
   // Soft Engine_frameDt ← wall ms (PE PerfTimerEnd(7) @ 0x428ECB..0x428ED0).

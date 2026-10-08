@@ -11,6 +11,7 @@
 #include "System.h"
 #include "GameRef.h"
 #include "GameRef_internal.hpp"
+#include "Resources_internal.hpp"
 #include "../Parts/Body/Chassis.h"
 
 #include <algorithm>
@@ -152,6 +153,122 @@ bool gameref_soft_apply_world_xform(InvObject* self, InvObject* p,
   }
   (void)hop_ok;
   return false;
+}
+
+// Soft PE Ypr_toMatrix @ 0x0054ECD0 / Mat3x4_setIdentity @ 0x0054E1D0.
+// 3x4 rot cells; pads [3]/[7]/[11] left 0 (PE setIdentity leaves pads
+// unwritten — Soft zeros for deterministic TREE publish).
+void soft_ypr_basis_or_identity(float m[12], bool have_ori, float yaw,
+                                float pitch, float roll) {
+  std::memset(m, 0, 12 * sizeof(float));
+  if (!have_ori) {
+    m[0] = m[5] = m[10] = 1.f;  // 0x3F800000
+    return;
+  }
+  const float sy = std::sin(yaw), cy = std::cos(yaw);
+  const float sp = std::sin(pitch), cp = std::cos(pitch);
+  const float sr = std::sin(roll), cr = std::cos(roll);
+  const float sr_sp = sr * sp;
+  const float cr_sp = cr * sp;
+  m[0] = sr_sp * sy + cr * cy;
+  m[1] = cr_sp * sy - sr * cy;
+  m[2] = cp * sy;
+  m[4] = sr * cp;
+  m[5] = cr * cp;
+  m[6] = -sp;
+  m[8] = sr_sp * cy - cr * sy;
+  m[9] = cr_sp * cy + sr * sy;
+  m[10] = cp * cy;
+}
+
+// Soft PE Mat3x4_setBasis_posScaled10 @ 0x0054F4C0 size 0x76:
+// ecx=dest 4x4, arg0=Ypr/id basis 3x4, arg1=pos.
+// flt_Mat3x4_posScale10 @ 0x005F37A0 = 10.0f (bytes 00 00 20 41) →
+// dest+0x30/34/38 = pos*10; dest+0x3C = 1.0. Rot rows = transpose of
+// basis columns (a2[0/4/8], a2[1/5/9], a2[2/6/10]).
+void soft_mat3x4_set_basis_pos_scaled10(float dest[16], const float basis[12],
+                                        float px, float py, float pz) {
+  constexpr float kPosScale10 = 10.f;  // PE flt_Mat3x4_posScale10
+  dest[0] = basis[0];
+  dest[1] = basis[4];
+  dest[2] = basis[8];
+  dest[3] = 0.f;
+  dest[4] = basis[1];
+  dest[5] = basis[5];
+  dest[6] = basis[9];
+  dest[7] = 0.f;
+  dest[8] = basis[2];
+  dest[9] = basis[6];
+  dest[10] = basis[10];
+  dest[11] = 0.f;
+  dest[12] = px * kPosScale10;
+  dest[13] = py * kPosScale10;
+  dest[14] = pz * kPosScale10;
+  dest[15] = 1.f;
+}
+
+// Soft PE identity gate @ 0x0048C029 inside SetBoneMatrixParentLink:
+// bone+0x54/0x68/0x7C == 1.0f and bone+0x84/0x88/0x8C == 0 → +0x3C |= 2
+// else &= ~2. Offsets relative to bone base → float idx 0/5/10/12/13/14.
+bool soft_bone54_matrix_is_identity(const float m[16]) {
+  return m[0] == 1.f && m[5] == 1.f && m[10] == 1.f && m[12] == 0.f &&
+         m[13] == 0.f && m[14] == 0.f;
+}
+
+// Soft PE SetBoneMatrixParentLink @ 0x0048BF50 matrix slice only:
+//   findBone → Ypr_toMatrix|setIdentity → Mat3x4_setBasis_posScaled10 →
+//   qmemcpy 0x40 to bone+0x54 @ 0x48C020; bone+0xF0=1; identity → +0x3C|=2;
+//   HEAD insert + payload+0xBC|=0x1800 when a4!=0.
+// Host: TREE bone_m0..15 (= PE bone+0x54 4x4 *10) + ResState bone_* mirror.
+// HostPeBoneNode.raw+0x54 / mid HEAD list remain OOS (Resources.cpp
+// RenderRef_setMatrix pe_bone path). LinkOrUnlinkBone OOS here.
+void gameref_soft_bone54_pos_scaled10_slice(InvObject* self, InvObject* p,
+                                            InvObject* o) {
+  if (!self || !p) return;  // PE: matrix body gated on a4!=0 @ 0x48BFFD
+  float px = 0.f, py = 0.f, pz = 0.f;
+  vec3_get(p, &px, &py, &pz);
+  float yaw = 0.f, pitch = 0.f, roll = 0.f;
+  const bool have_ori = (o != nullptr);
+  if (have_ori) ypr_get(o, &yaw, &pitch, &roll);
+
+  float basis[12];
+  soft_ypr_basis_or_identity(basis, have_ori, yaw, pitch, roll);
+  float dest[16];
+  soft_mat3x4_set_basis_pos_scaled10(dest, basis, px, py, pz);
+  const bool identity = soft_bone54_matrix_is_identity(dest);
+
+  for (int i = 0; i < 16; ++i) {
+    char key[16];
+    std::snprintf(key, sizeof(key), "bone_m%d", i);
+    tree_field_set_float(self, key, dest[i]);
+  }
+  tree_field_set_int(self, "bone_pose_set", 1);  // PE bone+0xF0 @ 0x48C02B
+  {
+    const int32_t prev = tree_field_get_int(self, "bone_flag_bits");
+    tree_field_set_int(self, "bone_flag_bits",
+                       identity ? (prev | 2) : (prev & ~2));
+  }
+  tree_field_set_int(self, "bone_link_flags",
+                     tree_field_get_int(self, "bone_link_flags") | 0x1800);
+  float wx = 0.f, wy = 0.f, wz = 0.f;
+  render_d3d9_mesh_world_origin(self, &wx, &wy, &wz);
+  tree_field_set_float(self, "world_px", wx);
+  tree_field_set_float(self, "world_py", wy);
+  tree_field_set_float(self, "world_pz", wz);
+  tree_field_set_int(self, "mesh_world_posed", 1);
+
+  resref_ensure(self);
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto& rs = R(self);
+    rs.bone_pose_set = 1;
+    if (identity)
+      rs.bone_flag_bits |= 2;
+    else
+      rs.bone_flag_bits &= ~2;
+    rs.bone_link_flags |= 0x1800;  // PE payload+0xBC @ 0x48C0B3
+    rs.bone_stamp = 1;             // PE payload+0xF8 ← g_Engine_frameStamp
+  }
 }
 
 }  // namespace
@@ -743,6 +860,11 @@ void java_util_resource_GameRef_setMatrix(InvObject* self, InvObject* p, InvObje
   render_d3d9_mesh_set_transform(self, x, y, z, yaw, pitch, roll, 1.f, 1.f, 1.f);
   // Soft PE applyWorldXform @ 0x48B440 — see gameref_soft_apply_world_xform.
   (void)gameref_soft_apply_world_xform(self, p, o);
+  // Soft PE SetBoneMatrixParentLink @ 0x0048BF50 matrix slice:
+  // Mat3x4_setBasis_posScaled10 → bone+0x54 (*flt_Mat3x4_posScale10=10).
+  // PE GameRef_setMatrix does not call that VA — Soft publishes the proven
+  // *10 4x4 + flags for mesh_world_pose readers (HostPeBoneNode OOS).
+  gameref_soft_bone54_pos_scaled10_slice(self, p, o);
 }
 
 void java_util_resource_GameRef_setParent(InvObject* self, InvObject* newparent) {

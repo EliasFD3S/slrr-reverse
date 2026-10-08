@@ -55,6 +55,8 @@ mm_*.txt
 *_prev.png
 *_preview.png
 native_engine_controls.tmp
+_census*.txt
+*_err.txt
 
 # IDE / agent
 .cursor/

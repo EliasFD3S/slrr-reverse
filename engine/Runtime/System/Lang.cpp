@@ -14,6 +14,16 @@
 namespace inv {
 namespace {
 
+// lang_host PE gate: ticket seed VA 0x0047B000 is mid-body of
+// Player_handleEvent @ 0x0047A920 size 0x8F4 (int_convert 2292) — not
+// java.lang. Soft targets in this TU (already-unboxed):
+//   Math.randomize @ 0x0047C7D0 / setrandseed @ 0x0047C7F0 /
+//   random @ 0x0047C820 / sqrt @ 0x0047C850
+//   String.token @ 0x00481CF0 … length @ 0x00481FE0 / finalize @ 0x00486190
+//   Float.toString @ 0x00481DD0; Integer.toString @ 0x00481E30 /
+//   toHexString @ 0x00481E80
+// System/Thread/Object/GameType natives live outside Lang.cpp (OOS).
+
 // PE StringBuffer pool (StringBuffer_intern @ 0x0041E610 /
 // StringBuffer_findInstance @ 0x0041EB70 / JVM_InternCString @ 0x0041E800):
 // hash = 0 if len==0; else if len<=3 *cstr; else
@@ -218,16 +228,18 @@ InvObject* java_lang_String_append(InvObject* self, int32_t ascii) {
 }
 
 InvObject* java_lang_String_token(InvObject* self, int32_t n, InvObject* delimiters) {
-  // PE @ 0x00481CF0 size 0xDD. UnboxArg dests: this (var_104), n
-  // (var_108), delim_cstr (var_10C) — L String already unboxed to
-  // Native.ptr cstr (no get_int_field on delim). this cstr =
-  // JVM_vm_get_int_field(this, dword_62E008); need=strlen+1 (repne
-  // scasb); if need<=0x100 stack else Engine_malloc; Util_strncpy_n
+  // PE @ 0x00481CF0 size 0xDD (int_convert 221). UnboxArg dests: this
+  // (var_104), n (var_108), delim_cstr (var_10C) — L String already
+  // unboxed to Native.ptr cstr (no get_int_field on delim). this cstr
+  // = JVM_vm_get_int_field @ 0x0042AB50 (this, Native_ptr_field_id
+  // dword_62E008); need=strlen+1; if need<=0x100 stack else
+  // Engine_malloc @ 0x0054F560; Util_strncpy_n @ 0x00551120
   // (dst,src,need). Util_strtok @ 0x00551200 → CRT_strtok_s @
   // 0x00554C70 (a1==0 → *ctx; bitset delim). Loop: if (n-- == 0)
   // break else next — PE re-pushes ctx value as a1 (≡ nullptr since
-  // *ctx already advanced). JVM_String_from_cstr(tok): nullptr in →
-  // nullptr out. Engine_free if heap. Host: InvString::utf8 ≡
+  // *ctx already advanced). JVM_String_from_cstr @ 0x004174A0(tok):
+  // nullptr in → nullptr out. Engine_free @ 0x0054F5B0 if heap.
+  // Register Natives_RegisterAll @ 0x0048826B. Host: InvString::utf8 ≡
   // Native.ptr; null delim ≠ string_cstr("<null>").
   const char* src =
       self ? reinterpret_cast<InvString*>(self)->utf8 : nullptr;
@@ -317,15 +329,15 @@ InvObject* java_lang_Float_toString(float f, InvObject* fmt) {
 // --- Math ---
 
 float java_lang_Math_random() {
-  // PE @ 0x0047C820 size 0x2a. Static ()F — no UnboxArg, no this/args
-  // (push ecx scratch only). CRT_rand @ 0x005D7408 (LCG TLS+0x14 →
-  // HIWORD&0x7FFF) → and 0x7FFF (int_convert: 32767); cmp/jz → store
-  // 0x7FFE (32766) if max; else keep. fild dword; fmul
-  // flt_Math_random_1div32767 @ 0x005F1388 (LE 00 01 00 38 = IEEE
-  // 0x38000100 ≡ 1/32767.0f); pop ecx; retn ST0 → [0, 1). Contrast
-  // setrandseed @ 0x0047C7F0: UnboxArg int → CRT_srand @ 0x005D73FB.
-  // Contrast randomize @ 0x0047C7D0: wall-ms → same CRT_srand.
-  // Host: std::rand + same clamp/scale.
+  // PE @ 0x0047C820 size 0x2A (int_convert 42). Static ()F — no
+  // UnboxArg, no this/args (push ecx scratch only). CRT_rand @
+  // 0x005D7408 (LCG TLS+0x14 → HIWORD&0x7FFF) → and 0x7FFF
+  // (int_convert 32767); cmp/jz → store 0x7FFE (32766) if max; else
+  // keep. fild dword; fmul flt_Math_random_1div32767 @ 0x005F1388
+  // (LE 00 01 00 38 = IEEE 0x38000100 ≡ 1/32767.0f); pop ecx; retn
+  // ST0 → [0, 1). Contrast setrandseed @ 0x0047C7F0: UnboxArg int →
+  // CRT_srand @ 0x005D73FB. Contrast randomize @ 0x0047C7D0: wall-ms
+  // → same CRT_srand. Host: std::rand + same clamp/scale.
   int v = std::rand() & 0x7fff;
   if (v == 0x7fff) {
     v = 0x7ffe;
@@ -342,11 +354,12 @@ float java_lang_Math_sqrt(float a) {
 }
 
 void java_lang_Math_randomize() {
-  // PE @ 0x0047C7D0 size 0x12. Static ()V; no UnboxArg; no this/args.
-  // call sub_5516C0 → QPC (now-epoch)/freq * flt_5F0910 @ 0x005F0910
-  // (0x447A0000 = 1000.0) → wall ms on ST0; sub_5D6750 fistp chop
-  // (RC=11) → EAX seed; push EAX; CRT_srand @ 0x005D73FB → TLS+0x14;
-  // pop ecx; retn.
+  // PE @ 0x0047C7D0 size 0x12 (int_convert 18). Static ()V; no
+  // UnboxArg; no this/args. Engine_GetTimeMs @ 0x005516C0 → QPC
+  // (now-epoch)/freq * flt_5F0910 @ 0x005F0910 (0x447A0000 = 1000.0)
+  // → wall ms on ST0; Engine_ftol @ 0x005D6750 fistp chop (RC=11) →
+  // EAX seed; push EAX; CRT_srand @ 0x005D73FB → TLS+0x14; pop ecx;
+  // retn. Register Natives_RegisterAll @ 0x0048864B.
   // Contrast setrandseed @ 0x0047C7F0: UnboxArg int → same CRT_srand.
   // Contrast random @ 0x0047C820: CRT_rand consume (no reseed).
   // Host: time_current() = wall seconds ≡ stock ms*0.001; seed =

@@ -33,8 +33,10 @@ namespace inv {
 //   hash = 73 * sum(methodName bytes) + sum(classFqn bytes);  // IDA 73=0x49
 //   bucket = hash & 0x7F on table at *(JVM+0xC) (12B=0xC slots × 128);
 //   find → chain next; strcmp NativeRec +0xC/+0x10;
-//   NativeSigDesc_sameIntern @ 0x0041DED0 (Method.sig ptr == SigDesc+4).
-// Soft: 128-bucket index over kNativeTable (append = register order).
+//   NativeSigDesc_sameIntern @ 0x0041DED0 (Method.sig+4 ptr == SigDesc+4).
+// Soft: 128-bucket index over kNativeTable — PE insert order @ 0x416BC7..0x416D23:
+//   empty bucket → primary slot; occupied → overflow node prepended after primary
+//   (find order: first-registered, then LIFO among later same-hash).
 //
 // PE NativeRec 0x18 (vtbl NativeRec_vftable @ 0x5F08FC):
 //   +0x00 vtbl | +0x04 JVM* | +0x08 nativeImpl
@@ -43,6 +45,7 @@ namespace inv {
 //   +0 JVM* | +4 interned JNI via JVM_InternCString @ 0x0041E800
 //   NativeSigDesc_getJni @ 0x0041DEF0 returns +4 (full "(..)X" from register).
 // PE NativeHash cursor dword @ table+0x628 (this+394 dwords).
+// PE overflow freelist/slabs @ +0x600..+0x624 (Engine_malloc/realloc) — Soft OOS.
 uint32_t pe_native_hash(const char* class_fqn, const char* method_name) {
   // PE RegisterNative @ 0x416B84..0x416BB0: sum(method) first, then class.
   uint32_t sum_m = 0;
@@ -63,7 +66,8 @@ uint32_t pe_native_hash(const char* class_fqn, const char* method_name) {
 }
 
 bool pe_jni_sig_equal(const char* registered_java_sig, const char* want_jni) {
-  // Soft NativeSigDesc_sameIntern @ 0x41DED0 (PE: interned ptr eq).
+  // Soft stand-in for NativeSigDesc_sameIntern @ 0x0041DED0
+  // (PE: *(want+4) == *(this+1) interned JNI ptr equality).
   if (!want_jni || !want_jni[0]) return true;
   if (!registered_java_sig || !registered_java_sig[0]) return false;
   if (std::strcmp(registered_java_sig, want_jni) == 0) return true;
@@ -96,7 +100,7 @@ struct SoftNativeHashTable {
 
 SoftNativeHashTable g_soft_native_hash;
 
-// Soft RegisterNative insert (bucket append ≈ first-registered-first-found).
+// Soft RegisterNative insert @ 0x416BC7..0x416DE2 (PE primary + overflow prepend).
 void soft_native_hash_ensure() {
   if (g_soft_native_hash.built) return;
   for (size_t i = 0; i < kNativeTableCount; ++i) {
@@ -106,9 +110,16 @@ void soft_native_hash_ensure() {
     auto node = std::make_unique<SoftNativeHashNode>();
     node->hash = h;
     node->table_index = i;
-    SoftNativeHashNode** slot = &g_soft_native_hash.buckets[b];
-    while (*slot) slot = &(*slot)->next;
-    *slot = node.get();
+    SoftNativeHashNode* n = node.get();
+    SoftNativeHashNode*& head = g_soft_native_hash.buckets[b];
+    if (!head) {
+      // PE empty bucket @ 0x416D2C..0x416DDA: primary hash | NativeRec** | next=0.
+      head = n;
+    } else {
+      // PE occupied @ 0x416C70..0x416D1F: overflow node prepended after primary.
+      n->next = head->next;
+      head->next = n;
+    }
     g_soft_native_hash.owned.push_back(std::move(node));
   }
   g_soft_native_hash.built = true;

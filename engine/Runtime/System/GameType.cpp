@@ -852,6 +852,9 @@ InvObject* engine_load_game_init_attach_gametype(void* gi,
   // Host stand-in: tree_host_new(FQN) + vmthread_init THRD-CREATE +
   // <init>(I)V with local_rid; Native.ptr = truncated GI addr; side-map
   // gi→script (no GI+0x50 pointer write — PE slot is 32-bit RID/script*).
+  // PE GameTypeCtor_vtbl14_callUpdate @ 0x429C02 reads *(mid+0x50) before
+  // CallNamedMethod("update") @ 0x429C13 — Soft uses this side-map via
+  // engine_gametype_call_named_update_for_gi.
   if (!gi || !script_fqn || !script_fqn[0]) return nullptr;
 
   Jvm* j = jvm_active();
@@ -900,6 +903,61 @@ InvObject* engine_load_game_init_script(void* gi) {
   std::lock_guard<std::mutex> lock(g_mu);
   auto it = g_lgi_scripts.find(gi);
   return it == g_lgi_scripts.end() ? nullptr : it->second;
+}
+
+// Soft PE GameTypeCtor_vtbl14_callUpdate @ 0x00429BC0 size 0x5f
+// (GameTypeCtor_vtbl+0x14 / .rdata @ 0x5F09F4..):
+//   owner=*(block+0xC); type!=1 → vtbl+0x14(0); PrepareLod(0xA0000000);
+//   mid=vtbl+0xC(1.0f); *(mid+0x50)!=0 →
+//   Engine_CallNamedMethod(mid, "update", sync=0, 79) @ 0x429C13.
+// PrepareLod / getEmbeddedMid Soft already in Resources
+// host_gametype_vtbl14_call_update (gate). This Soft is the CNM site only:
+// packArgs sees a4=79 immediately → empty argVec → pushCallFrame;
+// Object_callMethod(*(mid+0x50), thr, "update") → Thread_callMethod.
+// Host: InvObject* script (GI+0x50 32-bit / mid+0x50 RH gate OOS) —
+// caller uses engine_load_game_init_script(owner). No invent RH/PrepareLod.
+// Returns 0 like PE sync==0 leave / empty popOperand path (int_field).
+int engine_gametype_call_named_update(InvObject* script) {
+  if (!script) return 0;
+  Jvm* j = jvm_active();
+  const char* cn = tree_host_class(script);
+  if (!j || !cn || !cn[0]) return 0;
+
+  // PE packArgs sentinel 79='O' (int_convert); same tag as handleEvent Soft.
+  constexpr int kUpdateSentinelO = 79;
+  static_assert(kUpdateSentinelO == 79, "PE CallNamedMethod update a4='O'");
+  static_assert(kVmThreadBlobSize == 56, "PE malloc(56) VMThread");
+  (void)kUpdateSentinelO;
+
+  // PE @ 0x425665: "THRD-RUNVMI "+getResNameCstr(mid+0x38)+"."+"update".
+  // Host: no mid+0x38 ResHandle name → empty res (same as handleEvent Soft).
+  char thr_name[64];
+  std::snprintf(thr_name, sizeof(thr_name), "THRD-RUNVMI .update");
+  constexpr int32_t kSync = 0;  // PE @ 0x429C0B push 0
+  VmThread* thr =
+      vmthread_init(j, /*priority=*/10, /*sync_flags=*/kSync, thr_name);
+  if (!thr) return 0;
+
+  // PE packArgs @ 0x425263: first tag==79 → empty vec + pushCallFrame.
+  vmthread_push_call_frame(thr);
+  // PE Object_callMethod @ 0x408A30 → Thread_callMethod @ 0x4207C0.
+  const int inv =
+      vmthread_thread_call_method(thr, script, cn, "update");
+  // PE @ 0x42570F: invoke ret==0 → VMThread_run(0.0).
+  if (inv == 0) vmthread_run(thr, /*budget_ms=*/0.f);
+  // PE @ 0x42571B: sync!=0 || ret!=0 → requestStop + dtor; else leave
+  // green-thread for Jvm_PumpFrame (sync==0 && Java queued).
+  if (kSync != 0 || inv != 0) {
+    vmthread_request_stop(thr);
+    vmthread_destroy(thr);
+  }
+  return 0;
+}
+
+// Soft PE @ 0x429C02..0x429C13: mid+0x50 script → CallNamedMethod update.
+// Host GI+0x50 cannot hold InvObject* — side-map via attach_gametype.
+int engine_gametype_call_named_update_for_gi(void* gi) {
+  return engine_gametype_call_named_update(engine_load_game_init_script(gi));
 }
 
 }  // namespace inv

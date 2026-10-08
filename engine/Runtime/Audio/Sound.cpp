@@ -96,10 +96,10 @@ static_assert(sizeof(float) == 4);
 // + UpdateVoices + InitVoiceTable). Fields used by qsort/pass1:
 //   +0x00 state (0 free / 1 pending / 2 playing / 3 update)
 //   +0x04 type  (dword_768A6C)
-//   +0x08 handle / +0x0C instance (pass2/Alloc OOS this ticket)
-//   +0x10 ds_voice (Sfx_DS* OOS; Soft IsFinished stand-in)
+//   +0x08 handle / +0x0C instance
+//   +0x10 ds_voice (Soft packed (type<<16)|1; PE bank OOS)
 //   +0x14 priority float (Sfx_voicePriority @ 0x768A7C)
-//   +0x18 payload[17] (flags @ [0] pass2 bit0 OOS)
+//   +0x18 payload[17] (flags @ [0] pass2 bit0)
 struct SfxVoiceSlot {
   int32_t state;
   int32_t type;
@@ -185,9 +185,36 @@ int32_t soft_sfx_ds_voice_is_finished(int32_t ds_voice) {
   return ds_voice != 0 ? 1 : 0;
 }
 
+// Soft PE Sfx_DSStopVoice @ 0x0055C1D0 — IDirectSoundBuffer::Stop OOS.
+void soft_sfx_ds_stop_voice(int32_t /*ds_voice*/) {}
+
+// Soft PE Sfx_DSAllocVoice @ 0x0055B9A0 size 0x17d (int_convert 381).
+// PE: !Sound_dsReady@0x784CAC | type>=0x80 → -1; scan Sound_dsVoiceBank
+// @ 0x782C88 / Sound_dsVoiceTypeMax @ 0x77E088; return (type<<16)|slot.
+// Soft: no bank/InitDS — packed Soft handle with low16=1 so Soft
+// IsFinished(nonzero) keeps state2 (PE type0/slot0 packs to 0 — GAP).
+int32_t soft_sfx_ds_alloc_voice(uint32_t type, const int32_t* /*payload*/) {
+  if (type >= static_cast<uint32_t>(kSfxVoiceTypeCount)) return -1;
+  return (static_cast<int32_t>(type) << 16) | 1;
+}
+
+// Soft PE Sfx_DSUpdateVoice @ 0x0055C120 size 0xac (int_convert 172).
+// PE: decode handle → bank apply (sub_55BB20) + Play/Stop. Soft: no-op
+// return ds_voice (payload already copied by AllocOrUpdate).
+int32_t soft_sfx_ds_update_voice(int32_t ds_voice, const int32_t* /*payload*/) {
+  return ds_voice;
+}
+
+// Soft PE Sfx_CommitListenerDS @ 0x0055B440 size 0x50 (int_convert 80).
+// PE: !Sound_dsReady || ctx!=0 → -1; threaded→ReleaseSemaphore else
+// IDirectSound3DListener::CommitDeferredSettings. Soft: no DS ctx —
+// always -1 (dsReady stand-in 0). Caller UpdateVoices discards ret.
+int32_t soft_sfx_commit_listener_ds(int32_t /*ctx*/) { return -1; }
+
 void soft_sfx_free_voice_slot(SfxVoiceSlot& s) {
   s.state = 0;
   s.type = 0;
+  s.ds_voice = 0;
   s.priority = kSfxFreePrioritySentinel;
 }
 
@@ -225,8 +252,41 @@ void soft_sfx_update_voices_pass1(int32_t budget) {
     }
     // state 2 (still active) or state 3
     if (soft_sfx_pass1_try_keep(s, budget, kept)) continue;
-    // PE Sfx_DSStopVoice @ 0x55C1D0 — Soft no-op (no DS buffers).
+    // Soft PE Sfx_DSStopVoice @ 0x55C1D0
+    soft_sfx_ds_stop_voice(s.ds_voice);
     soft_sfx_free_voice_slot(s);
+  }
+}
+
+// Soft PE UpdateVoices pass2 @ 0x550A86..0x550AF4 (IDA Sfx_UpdateVoices):
+// state1 → Sfx_DSAllocVoice @ 0x55B9A0 → state2 (fail → free);
+// state2 & payload.flags bit0 → DSStopVoice @ 0x55C1D0 + free;
+// state3 → Sfx_DSUpdateVoice @ 0x55C120 → state2.
+void soft_sfx_update_voices_pass2() {
+  for (int32_t i = 0; i < kSfxVoiceSortCount; ++i) {
+    SfxVoiceSlot& s = g_sfx_voice_table[g_sfx_voice_sort_idx[i]];
+    if (s.state == 1) {
+      const int32_t dv =
+          soft_sfx_ds_alloc_voice(static_cast<uint32_t>(s.type), s.payload);
+      s.ds_voice = dv;
+      if (dv < 0) {
+        soft_sfx_free_voice_slot(s);
+      } else {
+        s.state = 2;  // Soft PE @ 0x550B24
+      }
+      continue;
+    }
+    if (s.state == 2) {
+      // Soft PE @ 0x550AC9: (payload[0] & 1) == 0 → keep
+      if ((s.payload[0] & 1) == 0) continue;
+      soft_sfx_ds_stop_voice(s.ds_voice);
+      soft_sfx_free_voice_slot(s);
+      continue;
+    }
+    if (s.state == 3) {
+      soft_sfx_ds_update_voice(s.ds_voice, s.payload);  // @ 0x55C120
+      s.state = 2;  // Soft PE @ 0x550ABE
+    }
   }
 }
 
@@ -368,7 +428,7 @@ void soft_sfx_copy_voice_payload(SfxVoiceSlot& s, const SoftSfxPlayParams& p) {
 // flags&4 (2D): priority=0. instance==0 → first free state1; else match
 // handle+instance (state1 refresh / state2|3→state3) or first free.
 // PE returns 0/-1; Soft returns slot+1 / -1 (host smoke voice>0) — GAP.
-// DS alloc/update OOS (pass2).
+// Soft: pass2 DSAlloc promotes state1→2 (packed Soft handle).
 int32_t soft_sfx_alloc_or_update_voice(int32_t type, int32_t instance,
                                       int32_t handle,
                                       const SoftSfxPlayParams& params) {
@@ -452,7 +512,8 @@ int32_t soft_sfx_alloc_or_update_voice(int32_t type, int32_t instance,
     SfxVoiceSlot& s = g_sfx_voice_table[i];
     if (s.state <= 0 || s.state > 3) continue;
     if (s.handle != handle || s.instance != instance) continue;
-    // PE Sfx_DSStopVoice @ 0x55C1D0 — Soft no-op
+    // Soft PE Sfx_DSStopVoice @ 0x55C1D0
+    soft_sfx_ds_stop_voice(s.ds_voice);
     soft_sfx_free_voice_slot(s);
     return 0;
   }
@@ -524,8 +585,11 @@ void sfx_listener_set_pos(float x, float y, float z) {
 }
 
 // PE @ 0x00550980 size 0x1AC (428) — Sfx_UpdateVoices. Sole MainLoop xref
-// @ 0x00428CBE immediately after Sfx_ListenerSetPose. Soft PE W35-15:
-// budget + qsort + typeUse memset + pass1 keep/drop; pass2/DS/Commit OOS.
+// @ 0x00428CBE immediately after Sfx_ListenerSetPose. Soft PE sound_host:
+// budget + qsort + typeUse memset + pass1 keep/drop + pass2 Soft DS*
+// stand-ins + CommitListenerDS (-1). Ticket seed VA 0x00480800 was mid
+// PhysicsRef_create @ 0x4807F0 — Soft gate retargeted to this MainLoop
+// audio stage (java.sound.* already Soft; nplay @ 0x480D40 Soft).
 // PE body (IDA renames):
 //   1) budget = Sfx_HwVoiceBudget @ 0x550985
 //   2) qsort Sfx_voiceSortIdx[64] @ 0x768968 via Sfx_VoiceSortByPriority
@@ -539,9 +603,9 @@ void sfx_listener_set_pos(float x, float y, float z) {
 //   5) pass2 @ 0x550A86..0x550AF4: state1 → Sfx_DSAllocVoice @ 0x55B9A0
 //      → state 2 (fail → free); state2 & flags.bit0 → stop+free;
 //      state3 → Sfx_DSUpdateVoice @ 0x55C120 → state 2
-//   6) Sfx_CommitListenerDS(Sfx_dsContext) @ 0x55B440; return 0
-// Host Soft: voice table BSS + InitVoiceTable once (sort idx 0..63);
-// type max/hasBuffers stand-in (no dword_77E088 / 782C88); DS* no-op.
+//   6) Sfx_CommitListenerDS(Sfx_dsContext @ 0x768764) @ 0x55B440; return 0
+// Host Soft: voice table BSS + InitVoiceTable; type max/hasBuffers
+// stand-in; Soft packed DSAlloc (no bank); Commit → -1.
 // Cull still uses listener xyz only. Cluster sfx_3d_cull OK.
 void sfx_update_voices() {
   if (!g_sfx_voice_table_inited) soft_sfx_init_voice_table();
@@ -554,7 +618,10 @@ void sfx_update_voices() {
   std::memset(g_sfx_voice_type_use_count, 0, sizeof(g_sfx_voice_type_use_count));
   // Soft PE @ 0x5509B2..0x550A80 — pass1 keep/drop
   soft_sfx_update_voices_pass1(g_sfx_voice_hw_budget);
-  // pass2 @ 0x550A86 + CommitListenerDS @ 0x550AFD — OOS (no DS mixer).
+  // Soft PE @ 0x550A86..0x550AF4 — pass2 DSAlloc/Update/Stop
+  soft_sfx_update_voices_pass2();
+  // Soft PE @ 0x550AFD — Sfx_CommitListenerDS(Sfx_dsContext); ret discarded
+  soft_sfx_commit_listener_ds(0);  // Soft ctx stand-in 0; dsReady→-1
 }
 // PE @ 0x00550560 size 0x7a — IDA Sfx_3DListenerCull (renamed from
 // sub_550560). Callees: none. Xrefs: Sfx_PlayWithListenerCull @ 0x48CFC6

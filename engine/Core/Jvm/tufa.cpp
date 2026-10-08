@@ -280,6 +280,11 @@ bool tufa_parse(const uint8_t* data, size_t size, JvmClass* out, std::string* er
   out->trees.clear();
   out->field_inits.clear();
 
+  // PE Soft gate (ticket VA 0x417000 is mid JVM_RegisterNative_dup — not TUFA):
+  //   JVM_compileSource @ 0x004165A0 checks header LE dwords via ReadBE32@0x559690:
+  //     magic==0x41465554 ('TUFA'), size==4, version==0x11AE1 (cmp @ 0x004166F4).
+  //   JVM_addClass_fromChunks @ 0x00411B20 walks tag+size chunks (same LE assemble).
+  // Soft skips the leading TUFA chunk (12 bytes = tag+size+4-byte version payload).
   if (size < 12 || std::memcmp(data, "TUFA", 4) != 0) {
     if (err) *err = "not TUFA";
     return false;
@@ -297,6 +302,8 @@ bool tufa_parse(const uint8_t* data, size_t size, JvmClass* out, std::string* er
     std::memcpy(s.tag, data + pos, 4);
     // Invictus packs several public classes into one .class file as
     // concatenated TUFA blobs — stop before the next magic.
+    // PE tags (int_convert): CONS=0x534E4F43 CLSS=0x53534C43 TREE=0x45455254
+    // MTHD=0x4448544D FILD=0x444C4946 — switch in JVM_addClass_fromChunks.
     if (std::memcmp(s.tag, "TUFA", 4) == 0) break;
     uint32_t sz = 0;
     std::memcpy(&sz, data + pos + 4, 4);
@@ -371,6 +378,8 @@ bool tufa_parse(const uint8_t* data, size_t size, JvmClass* out, std::string* er
   }
 
   if (const Section* clss = find_sec("CLSS")) {
+    // PE @ 0x00411D70 CLSS: five LE u32 then optional iface idxs; class/super
+    // const idxs at payload+8/+12 → ConstantPool_getClass/getUtf8.
     if (clss->size >= 16) {
       uint32_t words[5]{};
       const size_t n = (std::min)(clss->size / 4, size_t{5});
@@ -396,9 +405,12 @@ bool tufa_parse(const uint8_t* data, size_t size, JvmClass* out, std::string* er
   }
 
   if (const Section* tree = find_sec("TREE")) {
-    // SLRR: u32 tree_count; per tree: u32 node_count; then node_count nodes.
-    // Node is 3 bytes (op:u8, slot:u16) or 7 bytes (+ imm:u32) when
-    // (kTreeOpFlags[op] >> 12) in {1,2,4} — matches TREE_readNode/TREE_nodeBytes.
+    // PE @ 0x00411BF8 TREE case in JVM_addClass_fromChunks: u32 tree_count;
+    // per tree u32 node_count; then TREE_readNode @ 0x0041A5F0 /
+    // TREE_nodeBytes @ 0x0041A5C0. Node is 3 bytes (op:u8, slot:u16 via
+    // ReadU16_le @ 0x0054F690) or 7 bytes (+ imm via ReadBE32@0x559690 LE
+    // assemble) when (TreeOpFlags[op] @ 0x005F0914 & 0xF000) in
+    // {0x1000,0x2000,0x4000} — Soft: (kTreeOpFlags[op] >> 12) in {1,2,4}.
     auto node_bytes = [](uint8_t op) -> size_t {
       if (op >= 48) return 3;
       const uint16_t f = kTreeOpFlags[op];
@@ -544,6 +556,41 @@ bool tufa_parse(const uint8_t* data, size_t size, JvmClass* out, std::string* er
       fi.name = std::move(fname);
       fi.tree_index = static_cast<int>(w3);
       out->field_inits.push_back(std::move(fi));
+    }
+
+    // PE layout (JVM_addClass_fromChunks @ 0x00411BA1): FILD holds two
+    // back-to-back vectors read by 0x00419D00 -- count:u32 then count 16-byte
+    // records (0x00419250). The first vector is the STATIC one (class+0x54),
+    // the second the instance one (class+0x4C). Slot order inside each vector
+    // is what Class_findFieldSlot @ 0x00405690 indexes, so keep it verbatim.
+    auto read_vec = [&](size_t& o, std::vector<JvmFieldDecl>* dst) -> bool {
+      if (o + 4 > psz) return false;
+      uint32_t n = 0;
+      std::memcpy(&n, p + o, 4);
+      o += 4;
+      if (n > 0x10000 || o + size_t{16} * n > psz) return false;
+      dst->reserve(n);
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+        std::memcpy(&w0, p + o, 4);
+        std::memcpy(&w1, p + o + 4, 4);
+        std::memcpy(&w2, p + o + 8, 4);
+        std::memcpy(&w3, p + o + 12, 4);
+        o += 16;
+        JvmFieldDecl fd;
+        fd.name = pool.get_str(w1);
+        fd.type = pool.get_str(w2);
+        fd.w0 = w0;
+        fd.tree_index = (w3 == 0xFFFFFFFFu) ? -1 : static_cast<int>(w3);
+        dst->push_back(std::move(fd));
+      }
+      return true;
+    };
+    size_t vo = 0;
+    std::vector<JvmFieldDecl> statics, insts;
+    if (read_vec(vo, &statics) && read_vec(vo, &insts)) {
+      out->static_fields = std::move(statics);
+      out->instance_fields = std::move(insts);
     }
   }
 

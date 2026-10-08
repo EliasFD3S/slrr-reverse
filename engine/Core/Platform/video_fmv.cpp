@@ -57,7 +57,8 @@ namespace {
 IGraphBuilder* g_graph = nullptr;
 IMediaControl* g_control = nullptr;
 IMediaSeeking* g_seeking = nullptr;
-IMediaEvent* g_event = nullptr;
+// Soft PE Open QI @ 0x4F91DE stores IMediaEventEx (not bare IMediaEvent).
+IMediaEventEx* g_event = nullptr;
 IVideoWindow* g_vwin = nullptr;
 IBasicVideo* g_bvideo = nullptr;
 ISampleGrabber* g_grabber = nullptr;
@@ -95,12 +96,7 @@ struct FmvUpdateQuad {
 void set_notify_window(HWND hwnd, long msg) {
   // Soft PE Open @ 0x4F9209 / Close @ 0x4F9370: IMediaEventEx::SetNotifyWindow.
   if (!g_event) return;
-  IMediaEventEx* evx = nullptr;
-  if (SUCCEEDED(g_event->QueryInterface(IID_IMediaEventEx, reinterpret_cast<void**>(&evx))) &&
-      evx) {
-    evx->SetNotifyWindow(reinterpret_cast<OAHWND>(hwnd), msg, 0);
-    evx->Release();
-  }
+  g_event->SetNotifyWindow(reinterpret_cast<OAHWND>(hwnd), msg, 0);
 }
 
 void release_graph() {
@@ -134,6 +130,8 @@ void release_graph() {
     g_grabber = nullptr;
   }
   // Soft PE Close release order @ 0x4F939B..0x4F9428 (skip unnamed 64A370/36C).
+  // Soft residual OOS: FMV_videoVB Release @ 0x4F942E + GfxDevice_RestoreTextureAndStream
+  // @ 0x4BAFD0 (SetTexture/SetStreamSource) — host DrawPrimitiveUP / no prior stream.
   if (g_seeking) {
     g_seeking->Release();
     g_seeking = nullptr;
@@ -220,7 +218,7 @@ HRESULT find_pin_named(IBaseFilter* filter, const wchar_t* name, IPin** out) {
   return get_pin(filter, PINDIR_OUTPUT, out);
 }
 
-// Soft PE Open @ 0x4F9180: QI IMediaControl, IMediaSeeking, IMediaEvent,
+// Soft PE Open @ 0x4F91DE: QI IMediaControl, IMediaSeeking, IMediaEventEx,
 // IVideoWindow, IBasicVideo — stock any fail → Close + E_FAIL.
 // Soft residual TextureRenderer stand-in (SampleGrabber+Null): NullRenderer
 // often lacks IVideoWindow/IBasicVideo — require those only for exclusive.
@@ -234,7 +232,7 @@ bool qi_open_interfaces(bool require_video_ifaces) {
                                      reinterpret_cast<void**>(&g_seeking))) ||
       !g_seeking)
     return false;
-  if (FAILED(g_graph->QueryInterface(IID_IMediaEvent,
+  if (FAILED(g_graph->QueryInterface(IID_IMediaEventEx,
                                      reinterpret_cast<void**>(&g_event))) ||
       !g_event)
     return false;
@@ -247,13 +245,7 @@ bool qi_open_interfaces(bool require_video_ifaces) {
 HRESULT set_notify_window_hr(HWND hwnd, long msg) {
   // Soft PE Open @ 0x4F9209: IMediaEventEx::SetNotifyWindow — HRESULT kept.
   if (!g_event) return E_NOINTERFACE;
-  IMediaEventEx* evx = nullptr;
-  HRESULT hr =
-      g_event->QueryInterface(IID_IMediaEventEx, reinterpret_cast<void**>(&evx));
-  if (FAILED(hr) || !evx) return FAILED(hr) ? hr : E_NOINTERFACE;
-  hr = evx->SetNotifyWindow(reinterpret_cast<OAHWND>(hwnd), msg, 0);
-  evx->Release();
-  return hr;
+  return g_event->SetNotifyWindow(reinterpret_cast<OAHWND>(hwnd), msg, 0);
 }
 
 // Soft PE TextureRenderer branch @ 0x4F8E56 (expects g_graph already created):
@@ -624,9 +616,12 @@ void upload_and_draw() {
 }  // namespace
 
 int32_t video_fmv_open(const char* path, int32_t non_exclusive, int32_t loop) {
-  // Soft PE of GfxEngine.openVideo @ 0x47C330 → FMV_DirectShow_Open @ 0x4F8DD0.
+  // Soft PE of GfxEngine.openVideo @ 0x47C330 (size 0x47) →
+  // FMV_DirectShow_Open @ 0x4F8DD0 (size 0x549).
   // PATH-TO-WORLD: Engine_boot exclusive intros → close → MainMenu
   // openVideo("data\\fmv\\prime.avi", 1, 1) (Java MainMenu.show).
+  // Done-gate Soft: open/close/isPlaying + AltPresentGate hosted; OOS residuals
+  // below do not block openVideo catalog done.
 #ifdef _WIN32
   // Soft PE openVideo @ 0x47C357: path null → -1 (empty string enters Open).
   if (!path) return -1;
@@ -669,8 +664,8 @@ int32_t video_fmv_open(const char* path, int32_t non_exclusive, int32_t loop) {
     return static_cast<int32_t>(hr);
   }
 
-  // Soft PE @ 0x4F9180: QI×5 — exclusive requires VideoWindow+BasicVideo;
-  // Soft TextureRenderer stand-in: Control/Seeking/Event hard, VW/BV soft.
+  // Soft PE @ 0x4F91DE: QI×5 — exclusive requires VideoWindow+BasicVideo;
+  // Soft TextureRenderer stand-in: Control/Seeking/EventEx hard, VW/BV soft.
   if (!qi_open_interfaces(/*require_video_ifaces=*/!g_non_exclusive)) {
     release_graph();
     return kFmvEFail;
@@ -699,6 +694,8 @@ int32_t video_fmv_open(const char* path, int32_t non_exclusive, int32_t loop) {
     g_playing = true;
     // Soft PE @ 0x4F92FA: non_exclusive → TextureRenderer_UpdateQuad after Run
     // (menu prime.avi path; exclusive boot skips UpdateQuad).
+    // Soft residual: stock UpdateQuad CreateVertexBuffer→FMV_videoVB @ 0x4F8C53;
+    // host caches letterbox/UV and DrawPrimitiveUP (AltPresent VB OOS).
     if (g_non_exclusive) texture_renderer_update_quad();
   } else {
     g_playing = false;
@@ -745,7 +742,10 @@ int32_t video_fmv_is_non_exclusive() {
 int32_t video_fmv_alt_present_gate() {
   // Soft PE GfxEngine_AltPresentGate @ 0x4F9760 size 0x1b:
   // return FMV_playing != 0 && FMV_nonExclusive == 0.
-  // Sole MainLoop xref @ 0x428CE8 → AltPresent else PresentFrame.
+  // Sole MainLoop xref @ 0x428CE8 → AltPresent @ 0x4F9550 else PresentFrame.
+  // Exclusive: AltPresent often no-ops (FMV_videoTexA==0) → skip Present while
+  // HWND video shows. Soft residual: stock AltPresent SetStreamSource(FMV_videoVB)
+  // + DrawPrimitive when texA set — host DrawPrimitiveUP on non_excl present.
   return (video_fmv_is_playing() != 0 && video_fmv_is_non_exclusive() == 0) ? 1
                                                                             : 0;
 }

@@ -134,14 +134,19 @@ void anim_push(InvObject* self, int32_t op, float arg) {
 
 void java_util_resource_Animation_init(InvObject* self, InvObject* render,
                                        InvObject* type) {
-  // PE @ 0x0047EA10 size 0x186 (390). UnboxArg (LRenderRef;LResourceRef;)V:
-  // this, render (v11), type/ResourceRef (v12), + two floats (v13/v14 from
-  // Unbox — often 0). Walk render inner=[+0xC]: vtbl+0x14 if +0x4C!=1,
-  // sub_5447D0(0x80000000), vtbl+0xC → mesh; sub_541400 gate →
-  // sub_541600(type) clip handle; sub_541810/541860/5417F0 wire floats.
-  // Always JVM_vm_set_int_field(this, dword_62E008, clip) — 0 on fail.
-  // Then link RenderRef field "obj" Native.ptr list (+0x48/+0x50) to
-  // render's inner. Host: g_anims + anim_clip≈clip; tree "obj"/"type".
+  // PE @ 0x0047EA10 size 0x186 (390). UnboxArg sig
+  // (Ljava.util.resource.RenderRef;Ljava.util.resource.ResourceRef;) —
+  // this + render + type; two extra stack outs fed to clipSet* (uninit /
+  // often 0 — not in JNI sig). Walk render inner=[+0xC]: vtbl+0x14 if
+  // +0x4C!=1, ResHandle_PrepareLod @ 0x5447D0 (0x80000000), vtbl+0xC →
+  // mesh; sub_541400 gate → Animation_createLinkedHandle @ 0x541600
+  // (malloc 0xA8 + Animation_handleCtor @ 0x540440); then
+  // Animation_clipSetSpeed @ 0x541810 / Animation_clipSetFade @ 0x541860 /
+  // Animation_clipSetPos @ 0x5417F0. Always JVM_vm_set_int_field(this,
+  // Native_ptr_field_id @ 0x62E008, clip) — 0 on fail. Link field "obj"
+  // RenderRef Native.ptr dllist (+0x48/+0x50) to render inner. Soft:
+  // g_anims + anim_clip≈clip; tree "obj"/"type"; speed_cur=1 Soft stand-in
+  // (PE ctor zeros +0x20/+0x24/+0x28 then clipSetSpeed overwrites).
   if (!self) return;
   auto& a = AN(self);
   a = AnimState{};
@@ -187,7 +192,8 @@ void java_util_resource_Animation_setSpeed(InvObject* self, float speed) {
   // silent. Else fld/fstp speed RAW (no fmul/scale). edi=5; if
   // count[+0xA0]==cap[+0xA4]: cap+=0x20, realloc buf[+0x9C] via
   // Engine_realloc @ 0x54F580 size 8*cap. Write {5,speed} stride 8.
-  // Drain: Animation_drainQueue @ 0x53FEF0 case5 → +0x28/+0x24/+0x20.
+  // Drain: Animation_drainQueue @ 0x53FEF0 case5 → +0x28/+0x24/+0x20
+  // (same layout as Animation_clipSetSpeed @ 0x541810 when rampDt==0).
   // Soft: anim_render_dead (null obj allow); anim_push enqueue+drain.
   // NO esi==0 gate (unlike finalize @ 0x0047EBA0).
   if (anim_render_dead(self)) return;
@@ -266,9 +272,12 @@ float java_util_resource_Animation_getPos(InvObject* self) {
 
 void java_util_resource_GroundRef_setFog(InvObject* self, int32_t color, float near, float far) {
   // PE @ 0x00486A20 size 0x88. UnboxArg (IFF)V. handle==0 silent (NO Mighty;
-  // contrast Camera_setFog @ 0x00486570). Alloc 16: byte0=1, +4/+8=near/far
-  // * flt_5E7334 (10.0), +0xC=color (no mask). thiscall sub_426470
-  // (ecx=dword_636338, handle, type 0x4A, pkt). Bind not mirrored.
+  // contrast Camera.setFog @ 0x00486570 Mighty + dual PrepareLod hop).
+  // Engine_malloc @ 0x54F560 size 16: byte0=1, +4/+8=near/far * 10.0
+  // (flt_5E7334), +0xC=color (no mask). Engine_queryGameRefChannel @
+  // 0x426470(handle, type 0x4A=74, pkt). Soft: TREE fog_* + D3D stand-in
+  // (channel bind / pkt lifetime OOS). Camera.setFog Soft lives in
+  // RenderNatives.cpp — distinct PE path, shared host D3D helper only.
   if (!self) return;
   const float n = near * 10.f;
   const float f = far * 10.f;
@@ -278,8 +287,6 @@ void java_util_resource_GroundRef_setFog(InvObject* self, int32_t color, float n
   tree_field_set_float(self, "fog_far", f);
   render_d3d9_set_fog(color & 0x00ffffff, n, f);
 }
-
-// VA 0x00486570 — Camera.setFog(IFF)V; host shares D3D fog path with GroundRef.
 
 namespace {
 
@@ -300,29 +307,23 @@ float resref_get_detail_impl(InvObject* self) {
 float java_util_resource_GameRef_getDetail(InvObject* self) {
   // PE @ 0x00480440 size 0xbb — shared with RenderRef.getDetail()F.
   // Unbox this (JVM_UnboxArg @ 0x0045D910). handle =
-  // JVM_vm_get_int_field(this, dword_62E008 @ 0x0042AB50). handle==0 →
-  // Mighty ERROR ("!" @ 0x61319C + "Mighty ERROR" @ 0x6131A0) + 0.0
-  // (flt_5E73CC). inner=[handle+0xC]; inner==0 OR [inner+0x4C]!=1
-  // INSTANCE_GAME AND !=3 INSTANCE_RENDER → Wrong ResourceType + 0.0.
-  // [handle+8]==0 → 0.0. Else return *(float*)(inner+0x6C) LOD detail bias.
-  // dword_62E008 / Engine_ErrorLogBuf not renamed. Host: ResourceRef_type/
-  // id gates; tree "detail" ≈ inner+0x6C; Mighty/WrongResourceType not
-  // mirrored.
+  // JVM_vm_get_int_field(this, Native_ptr_field_id @ 0x62E008). handle==0 →
+  // Engine_strcat_cap @ 0x551140 ("!" @ 0x61319C + "Mighty ERROR" @
+  // 0x6131A0) + Engine_ErrorLogMsgBox @ 0x5513B0 → 0.0. inner=[handle+0xC];
+  // inner==0 OR [inner+0x4C]!=1 INSTANCE_GAME AND !=3 INSTANCE_RENDER →
+  // Wrong ResourceType + 0.0. [handle+8]==0 → 0.0. Else *(float*)(inner+0x6C)
+  // LOD detail bias. Soft: ResourceRef_type/id gates; tree "detail" ≈
+  // inner+0x6C; Mighty/WrongResourceType not mirrored.
   return resref_get_detail_impl(self);
 }
 
 float java_util_resource_RenderRef_getDetail(InvObject* self) {
-  // PE @ 0x00480440 size 0xbb (187) — java.util.resource.RenderRef.getDetail()F;
-  // same entry as GameRef.getDetail()F (Natives_RegisterAll @ 0x487f20 data
-  // xrefs 0x4897bb / 0x489c17). Callees: JVM_UnboxArg @ 0x0045D910,
-  // JVM_vm_get_int_field @ 0x0042AB50 (dword_62E008 Native.ptr),
-  // CRT_strcat_n_thunk @ 0x00551140, Engine_ErrorLogPrintf @ 0x005513B0.
-  // Unbox this. handle==0 → Mighty ERROR ("!" @ 0x61319C + "Mighty ERROR"
-  // @ 0x6131A0) + flt_5E73CC (0.0). inner=[handle+0xC] (int_convert 0xC=12);
-  // inner==0 OR [inner+0x4C]!=1 AND !=3 → Wrong ResourceType ("!" @
-  // 0x613184 + string @ 0x613188) + 0.0. [handle+8]==0 → 0.0 silent.
-  // Else fld [inner+0x6C] ret (LOD detail bias). Host: ResourceRef_type/id
-  // gates; tree "detail" ≈ inner+0x6C; Mighty/WrongResourceType not mirrored.
+  // PE @ 0x00480440 size 0xbb (187) — same entry as GameRef.getDetail()F
+  // (Natives_RegisterAll data xrefs). Callees: JVM_UnboxArg @ 0x0045D910,
+  // JVM_vm_get_int_field @ 0x0042AB50 (Native_ptr_field_id),
+  // Engine_strcat_cap @ 0x00551140, Engine_ErrorLogMsgBox @ 0x005513B0.
+  // Gates/returns identical to GameRef path above. Soft: shared
+  // resref_get_detail_impl.
   return resref_get_detail_impl(self);
 }
 

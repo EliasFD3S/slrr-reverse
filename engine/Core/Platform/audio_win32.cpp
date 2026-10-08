@@ -109,6 +109,8 @@ struct Voice {
 };
 
 std::unordered_map<int32_t, Voice> g_voices;
+// Soft PE AsyncLoad_Type5 → Sound_RegisterVoiceType type id per res.
+std::unordered_map<int32_t, int32_t> g_res_to_voice_type;
 
 float clamp01(float v) {
   if (v < 0.f) return 0.f;
@@ -255,6 +257,7 @@ void soft_init_ds_clear_voice_banks() {
   std::memset(g_ds_voice_type_max, 0, sizeof(g_ds_voice_type_max));
   std::memset(g_ds_voice_slot_flags, 0, sizeof(g_ds_voice_slot_flags));
   std::memset(g_ds_voice_type_is3d, 0, sizeof(g_ds_voice_type_is3d));
+  g_res_to_voice_type.clear();
 }
 
 // Soft PE InitDS primary CTRL3D + QI @ 0x0055999D..0x00559A95.
@@ -462,7 +465,7 @@ int32_t soft_sfx_voice_type_has_buffers(uint32_t type) {
   return (type < 0x80u && g_ds_voice_bank[type][0] != nullptr) ? 1 : 0;
 }
 
-// Soft PE sub_55BB20 @ 0x55BB20 — 3D pan/volume apply onto buffer.
+// Soft PE Sfx_DSApplyVoiceParams @ 0x0055BB20 — 3D pan/volume onto buffer.
 // Soft: buffer live → 1 (params OOS); else 0. DSAlloc/Update gate only.
 int32_t soft_sfx_ds_apply_voice_params(uint32_t type, uint32_t slot,
                                        const int32_t* /*payload*/) {
@@ -470,11 +473,98 @@ int32_t soft_sfx_ds_apply_voice_params(uint32_t type, uint32_t slot,
   return g_ds_voice_bank[type][slot] != nullptr ? 1 : 0;
 }
 
+// Soft PE Sound_FillSecondaryBuffer @ 0x0055B7F0 — Lock/copy/Unlock.
+bool soft_sound_fill_secondary_buffer(IDirectSoundBuffer* buf,
+                                      const uint8_t* data, uint32_t size) {
+  if (!buf || !data || size == 0) return false;
+  void* p1 = nullptr;
+  void* p2 = nullptr;
+  DWORD s1 = 0, s2 = 0;
+  if (FAILED(buf->Lock(0, size, &p1, &s1, &p2, &s2, 0)) || !p1) return false;
+  std::memcpy(p1, data, s1);
+  if (p2 && s2) std::memcpy(p2, data + s1, s2);
+  buf->Unlock(p1, s1, p2, s2);
+  return true;
+}
+
+// Soft PE Sfx_DSPlayBuffer @ 0x0055BFC0 — Play flag select only.
+// PE: (!hwMix || flags&4) → flags&1; else (flags&1)|0x10 (TERMINATEBY_DISTANCE).
+// LOSTBUFFER restore / WAV refill path OOS.
+HRESULT soft_sfx_ds_play_buffer(IDirectSoundBuffer* buf, int32_t flags) {
+  if (!buf) return E_POINTER;
+  DWORD play = static_cast<DWORD>(flags & 1);
+  if (g_sound_hwmix_capable != 0 && (flags & 4) == 0)
+    play |= DSBPLAY_TERMINATEBY_DISTANCE;  // PE | 0x10
+  return buf->Play(0, 0, play);
+}
+
+// Soft PE Sound_RegisterVoiceType @ 0x0055B490 (AsyncLoad_Type5 @ 0x53BB90).
+// PE: free type row; CreateSoundBuffer (PE dwFlags 0xE8/0x400E0/0x200B8/0x600B0);
+// FillSecondaryBuffer; QI 3D OOS Soft; DuplicateSoundBuffer for slots 1..max-1;
+// typeMax/is3d. Returns type, -1 (full/!dsReady), or -2 (create/fill fail).
+int32_t soft_sfx_register_voice_type(const WavInfo& wav, int32_t max_voices,
+                                     bool is3d) {
+  if (!g_sound_ds_ready || !g_ds || !wav.data || wav.data_size == 0) return -1;
+  int32_t type = 0;
+  for (; type < 0x80; ++type) {
+    if (g_ds_voice_bank[type][0] == nullptr) break;
+  }
+  if (type >= 0x80) return -1;
+  int32_t max_n = max_voices;
+  if (max_n > 8) max_n = 8;
+  if (max_n <= 0) max_n = 1;
+
+  DWORD caps = 0;
+  if (is3d && g_sound_hw3d_capable != 0) {
+    // PE @ 0x55B56E: hwMix ? 0x600B0 : 0x200B8
+    caps = g_sound_hwmix_capable != 0 ? 0x600B0u : 0x200B8u;
+  } else {
+    // PE @ 0x55B5C8: hwMix ? 0x400E0 : 0xE8
+    caps = g_sound_hwmix_capable != 0 ? 0x400E0u : 0xE8u;
+  }
+  DSBUFFERDESC desc{};
+  desc.dwSize = 36;  // PE v29[0]=36
+  desc.dwFlags = caps;
+  desc.dwBufferBytes = wav.data_size;
+  desc.lpwfxFormat = const_cast<WAVEFORMATEX*>(&wav.fmt);
+  IDirectSoundBuffer* buf = nullptr;
+  if (FAILED(g_ds->CreateSoundBuffer(&desc, &buf, nullptr)) || !buf) return -2;
+  if (!soft_sound_fill_secondary_buffer(buf, wav.data, wav.data_size)) {
+    buf->Release();
+    return -2;
+  }
+  g_ds_voice_bank[type][0] = buf;
+  // Soft PE QI IDirectSound3DBuffer @ 0x55B66F — OOS (no Soft 3D iface bank).
+  g_ds_voice_type_is3d[type] =
+      (is3d && g_sound_hw3d_capable != 0) ? static_cast<uint8_t>(1) : 0;
+  g_ds_voice_type_max[type] = max_n;
+  for (int32_t slot = 1; slot < max_n; ++slot) {
+    IDirectSoundBuffer* dup = nullptr;
+    if (FAILED(g_ds->DuplicateSoundBuffer(buf, &dup)) || !dup) {
+      g_ds_voice_bank[type][slot] = nullptr;
+    } else {
+      g_ds_voice_bank[type][slot] = dup;
+    }
+  }
+  // Soft PE GetFrequency → dword_77E288[type] — used by ApplyVoiceParams OOS.
+  return type;
+}
+
+// Soft stand-in: first play of res_id → RegisterVoiceType (max=2 Soft).
+int32_t soft_sfx_ensure_voice_type(int32_t res_id, const WavInfo& wav,
+                                   bool is3d) {
+  auto it = g_res_to_voice_type.find(res_id);
+  if (it != g_res_to_voice_type.end()) return it->second;
+  const int32_t type = soft_sfx_register_voice_type(wav, 2, is3d);
+  if (type >= 0) g_res_to_voice_type[res_id] = type;
+  return type;
+}
+
 // Soft PE Sfx_DSAllocVoice @ 0x0055B9A0.
 // PE: !dsReady|type>=0x80 → -1; scan bank[type][0..max) for free/not-playing
 // slot (reuse non-looping playing as last resort); store flags; Stop if
 // playing; SetCurrentPosition(0); apply params; Play; return (type<<16)|slot.
-// Soft empty bank → -1 (InitDS zeros bank until type register).
+// Soft empty bank → -1 (InitDS zeros bank until RegisterVoiceType).
 int32_t soft_sfx_ds_alloc_voice(uint32_t type, const int32_t* payload) {
   if (!g_sound_ds_ready || type >= 0x80u || !payload) return -1;
   const int32_t max_n = g_ds_voice_type_max[type];
@@ -505,17 +595,17 @@ int32_t soft_sfx_ds_alloc_voice(uint32_t type, const int32_t* payload) {
   if (SUCCEEDED(buf->GetStatus(&status)) && (status & DSBSTATUS_PLAYING) != 0)
     buf->Stop();
   buf->SetCurrentPosition(0);
-  // Soft PE sub_55BB20 apply + sub_55BFC0 Play — pan/vol OOS; bit0=LOOPING.
+  // Soft PE Sfx_DSApplyVoiceParams + Sfx_DSPlayBuffer — pan/vol OOS.
   if (soft_sfx_ds_apply_voice_params(type, static_cast<uint32_t>(slot),
                                      payload) != 0) {
-    buf->Play(0, 0, (flags & 1) != 0 ? DSBPLAY_LOOPING : 0);
+    soft_sfx_ds_play_buffer(buf, flags);
   }
   return (static_cast<int32_t>(type) << 16) | (slot & 0xFFFF);
 }
 
 // Soft PE Sfx_DSUpdateVoice @ 0x0055C120.
 // PE: decode handle; bank buf; apply params; if apply!=0 && !playing →
-// SetCurrentPosition+Play(sub_55BFC0); else Stop. Soft: apply stub + return.
+// SetCurrentPosition+Play(Sfx_DSPlayBuffer); else Stop. Soft: apply stub.
 int32_t soft_sfx_ds_update_voice(int32_t ds_voice, const int32_t* payload) {
   if (!g_sound_ds_ready || !payload) return -1;
   const int32_t type = ds_voice >> 16;
@@ -531,7 +621,7 @@ int32_t soft_sfx_ds_update_voice(int32_t ds_voice, const int32_t* payload) {
         (status & DSBSTATUS_PLAYING) == 0) {
       buf->SetCurrentPosition(0);
       const int32_t flags = g_ds_voice_slot_flags[type][slot];
-      buf->Play(0, 0, (flags & 1) != 0 ? DSBPLAY_LOOPING : 0);
+      soft_sfx_ds_play_buffer(buf, flags);
     }
   } else {
     buf->Stop();
@@ -638,8 +728,11 @@ void soft_sfx_update_voices_pass2() {
   }
 }
 
-// Soft PE Sfx_UpdateVoices @ 0x00550980 size 0x1AC.
-// budget + qsort + memset typeUse + pass1 + pass2 + CommitListenerDS.
+// Soft PE Sfx_UpdateVoices @ 0x00550980 size 0x1AC (int_convert 428).
+// Sole MainLoop xref @ 0x00428CBE. PE: HwVoiceBudget @ 0x559DD0 +
+// CRT_qsort @ 0x5D765D (VoiceSortByPriority @ 0x550B30) + memset typeUse +
+// pass1 @ 0x5509B2..0x550A80 + pass2 @ 0x550A86..0x550AF4 +
+// CommitListenerDS @ 0x55B440. Free priority sentinel PE 0x501502F9 = 1e10.
 int32_t soft_sfx_update_voices() {
   if (!g_sfx_voice_table_inited) soft_sfx_init_voice_table();
   const int32_t budget = soft_sfx_hw_voice_budget();
@@ -1033,6 +1126,10 @@ int32_t audio_sfx_play(int32_t res_id, float pitch, float volume, int32_t flags,
     std::vector<uint8_t> file;
     WavInfo wav;
     if (load_file(path_buf, &file) && parse_wav(file, &wav)) {
+      // Soft PE AsyncLoad_Type5 @ 0x53BB90 → Sound_RegisterVoiceType
+      // @ 0x55B490 — bank fill so UpdateVoices HasBuffers/DSAlloc can run.
+      // PE 2D gate flags&4; Soft is3d = !(flags&4).
+      (void)soft_sfx_ensure_voice_type(res_id, wav, (flags & 4) == 0);
       IDirectSoundBuffer* buf = ds_create_buffer(wav, eff);
       if (buf && ds_play(buf, loop)) {
         v.ds = true;

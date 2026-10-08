@@ -220,12 +220,63 @@ int32_t java_game_parts_Part_getMesh(InvObject* self) {
   return self ? tree_field_get_int(self, "part_mesh") : 0;
 }
 
+// Soft PE Chassis_getMin@0x43d78a / getMax@0x43da3a mesh AABB gate.
+// Ticket seed VA 0x00449000 lands mid Chassis_camBindBones@448f20 — AABB
+// entry is getMin@43d600 / getMax@43d8b0 (size 0x2a9 twins).
+// PE after Veh_ensureSceneBound@48AEA0 + parent walk: mesh =
+// *(*(FINAL_node+0x5C)+0x78); count@+0x20 verts@+0x24 stride 0xC;
+// AABB accumulators init 0; getMin takes vert when <= (Z: accum>=vert);
+// getMax takes when >= (Z: accum<=vert). Pad ±flt_5F08E8(0.1) stays in
+// Chassis natives. Soft: sample TREE visual_mesh|mesh|body_mesh positions
+// with the same init-0 rules → aabb_min_* / aabb_max_* + aabb_mesh_set
+// for Chassis_aabb_origin_mesh. Veh_ensureSceneBound / raw mesh blob
+// *(node+0x5C)+0x78 / Bind type=5 OOS — no invent.
+static void part_soft_refresh_aabb_mesh(InvObject* self) {
+  if (!self) return;
+  InvObject* mesh = tree_field_get_obj(self, "visual_mesh");
+  if (!mesh) mesh = tree_field_get_obj(self, "mesh");
+  if (!mesh) mesh = tree_field_get_obj(self, "body_mesh");
+  float mn[3] = {0.f, 0.f, 0.f};
+  float mx[3] = {0.f, 0.f, 0.f};
+  bool have = false;
+  if (mesh && render_d3d9_mesh_ready(mesh)) {
+    float sample[3 * 256];
+    const int32_t n = render_d3d9_mesh_copy_positions(mesh, sample, 256);
+    for (int32_t i = 0; i < n; ++i) {
+      const float vx = sample[i * 3 + 0];
+      const float vy = sample[i * 3 + 1];
+      const float vz = sample[i * 3 + 2];
+      // PE getMin@43d7b2 / getMax@43da* — init-0, not first-vert seed.
+      if (vx <= mn[0]) mn[0] = vx;
+      if (vy <= mn[1]) mn[1] = vy;
+      if (vz <= mn[2]) mn[2] = vz;
+      if (vx >= mx[0]) mx[0] = vx;
+      if (vy >= mx[1]) mx[1] = vy;
+      if (vz >= mx[2]) mx[2] = vz;
+      have = true;
+    }
+  }
+  if (!have) {
+    tree_field_set_int(self, "aabb_mesh_set", 0);
+    return;
+  }
+  tree_field_set_float(self, "aabb_min_x", mn[0]);
+  tree_field_set_float(self, "aabb_min_y", mn[1]);
+  tree_field_set_float(self, "aabb_min_z", mn[2]);
+  tree_field_set_float(self, "aabb_max_x", mx[0]);
+  tree_field_set_float(self, "aabb_max_y", mx[1]);
+  tree_field_set_float(self, "aabb_max_z", mx[2]);
+  tree_field_set_int(self, "aabb_mesh_set", 1);
+}
+
 // PE @ 0x00469D90 size 0x13f — IDA Part_setMesh. Unbox this+I. Dual Res
 // walk as setTexture @ 0x00469B80. ResHandle_Bind(&slot, ID, type=5, 0).
 // If [block+0x94]!=0 → Part_rebindMeshRes@467D30. ALWAYS eax=1 (even
 // walk fail). NO Mighty.
 // Soft W35-09: Native.ptr live + dual fail → return 1 (no store);
 // Bind/rebind OOS → TREE part_mesh; return 1 (not prev).
+// Soft aabb_mesh_host: refresh TREE aabb_* from live mesh (PE getMin
+// mesh walk) after part_mesh store.
 int32_t java_game_parts_Part_setMesh(InvObject* self, int32_t ID) {
   // PE @ 0x00469D90 size 0x13f (319). Unbox this+I; dual walk; Bind type=5;
   // ALWAYS eax=1. Host TREE part_mesh (Bind/rebind OOS).
@@ -233,6 +284,7 @@ int32_t java_game_parts_Part_setMesh(InvObject* self, int32_t ID) {
   if (native_ptr_get(self) && !part_soft_phys_mid(self, /*dual=*/true))
     return 1;
   tree_field_set_int(self, "part_mesh", ID);
+  part_soft_refresh_aabb_mesh(self);  // PE @ 0x0043D78A / 0x0043DA3A
   return 1;
 }
 
@@ -447,6 +499,10 @@ InvObject* java_game_parts_Part_install_OK(InvObject* self, InvObject* dest, int
   if (child && child != parent)
     part_soft_accumulate_mesh_drag(child, /*mode=*/0, /*depth=*/0);
   part_soft_refresh_drag_install_remove(parent);
+  // Soft aabb_mesh_host: PE getMin reads FINAL walk node mesh after
+  // install graph settles — refresh child TREE aabb_* (Bind OOS).
+  if (child) part_soft_refresh_aabb_mesh(child);
+  if (parent && parent != child) part_soft_refresh_aabb_mesh(parent);
   // Stock returns int[2] = {parentSlot, childSlot}; host: length-2 vector.
   InvObject* out = tree_vector_new();
   InvObject* a = gameref_new();

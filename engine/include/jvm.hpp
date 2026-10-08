@@ -66,6 +66,15 @@ struct JvmFieldInit {
   int tree_index = -1;
 };
 
+// One FILD record (PE reader @ 0x00419250, 16 bytes after the vtbl slot):
+// +4 w0, +8 name CP index, +0xC type CP index, +0x10 init tree (-1 = none).
+struct JvmFieldDecl {
+  std::string name;
+  std::string type;
+  uint32_t w0 = 0;
+  int tree_index = -1;
+};
+
 struct JvmClass {
   std::string name;
   std::string super_name;
@@ -73,6 +82,11 @@ struct JvmClass {
   std::vector<JvmMethod> methods;
   std::vector<TreeBody> trees;
   std::vector<JvmFieldInit> field_inits;
+  // FILD ships two ordered vectors (PE JVM_addClass_fromChunks @ 0x00411BA1):
+  // statics land at class+0x54, instance fields at class+0x4C. The order is
+  // the slot order Class_findFieldSlot @ 0x00405690 scans, so it must be kept.
+  std::vector<JvmFieldDecl> static_fields;
+  std::vector<JvmFieldDecl> instance_fields;
   // Const pool (parallel arrays). Strings for Utf8; mref_name[i] set when
   // entry i is an mref resolving to a field/method name.
   std::vector<std::string> const_strings;
@@ -180,10 +194,35 @@ struct VmCallFramePe {
 };
 static_assert(sizeof(VmCallFramePe) == kCallFrameBlobSize, "PE CallFrame 64B");
 
+// PE ValueField_ctor @ 0x00423EC0: a Value {vtbl, typeDesc, payload} with a
+// name at +0xC, re-pointed at ValueField_vtbl @ 0x005E7344 whose slot 0 is
+// ValueField_getType @ 0x00405030 (returns 2) rather than Value_getType.
+// Everything VMThread_run calls "a variable on the stack" is this handle:
+// op 0x1001 @ 0x00421714 pushes locals[i], op 0x101B @ 0x004234B4 pushes a
+// field, op 0x1011 @ 0x00422E98 pushes a resolved name path, and
+// Value_assignOp @ 0x0041ACB0 refuses anything else ("stack access: value on
+// top (instead of variable)") because it needs somewhere to write.
+//
+// The host operand stack holds JvmValue by value and is shared with natives
+// and tree_eval, so widening it is not an option. Instead each operand slot
+// carries a parallel descriptor naming where the value came from; pure
+// r-values leave it None, matching a plain Value on the PE stack.
+enum class VmRefKind : uint8_t { None, Local, Field, Static };
+
+struct VmValueRef {
+  VmRefKind kind = VmRefKind::None;
+  uint32_t local_index = 0;        // Local: index into VmCallFrame::locals
+  InvObject* obj = nullptr;        // Field: receiver
+  const JvmClass* owner = nullptr; // Static: class owning the Instance @ +0x1D0
+  std::string name;                // Field / Static: field name
+};
+
 struct VmCallFrame {
   VmCallFramePe pe;
   std::vector<JvmValue> locals;
   std::vector<JvmValue> operand;
+  // Parallel to `operand`, same size; see VmValueRef above.
+  std::vector<VmValueRef> operand_ref;
   VmCallFrame* dllist_prev = nullptr;
   VmCallFrame* dllist_next = nullptr;
 };
@@ -281,7 +320,8 @@ int vmthread_op36_invoke(VmThread* thr, InvObject* self, const char* class_fqn,
 //     (vmthread_op34_call_method_init); 35 Object_callInitIf DONE soft
 //     (vmthread_op35_call_init_if); 36 DONE soft via vmthread_op36_invoke
 //     (Thread_callMethod@0x4207C0)
-//   data: 29 field-get; 32 JT_ARRAYACCESS; 41 pool alloc
+//   data: 29 field-get; 32 JT_ARRAYACCESS; 41 pool alloc DONE soft
+//     (vmthread_op41_pool_alloc @ 0x421583)
 //   illegal: 0/19/66/72 + 'J'/'M' → fatal script error
 //   hi>0x4A @0x4216D5: 0x1001..0x1027+ literals(0x1007×47)/ops/
 //     fields(JT_FIELD_REF)/calls — residual, no host handlers

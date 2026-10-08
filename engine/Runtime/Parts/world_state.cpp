@@ -431,12 +431,33 @@ float arcade_clamp_py_to_support(float py, float support_y) {
   return (py < support_y) ? support_y : py;
 }
 
-// PE Physics_Step @ 0x4A5190: if (world+4 accum + dt) < 1e-4 return 0.
-bool arcade_integrate_dt_ok(float dt) { return dt >= kArcadeIntegrateDtMin; }
+// Soft PE Physics_Step @ 0x004A5190 (ecx=physWorld, a2=dt).
+// Callers: Engine_SimulateFrame @ 0x42859A / Engine_SimulateControlFrame
+// @ 0x42892B. MarkStepReset @ 0x4A5180 sets Physics_stepResetPending.
+//
+// Gate (disasm @ 0x4A5197..0x4A51AE):
+//   v3 = a2 + *(world+4); *(world+4)=v3; fst arg;
+//   fcomp flt_5F09D4@0x5F09D4 (bytes 17 b7 d1 38 ≈ 1e-4);
+//   C0 set → return 0 (leave residue).
+// After take @ 0x4A51FD: *(world+4) -= v22 (Soft clear → residue≡0).
+// Soft `dt` = taken-step candidate with residue already folded/cleared
+// (System SimulateFrame Soft) → gate ≡ !(dt < kArcadeIntegrateDtMin).
+//
+// OOS body (no Soft dllist / solver): MarkStepReset wipe +0x118 nodes
+// (+0xA0/+0xA4/+0xA8) @ 0x4A51BF; bodyApplyForces@0x4A3F90; cull+0x9C;
+// TickDriveList@0x426F60; bodyIntegrate@0x4A3BC0; cull+0xB8;
+// solver≤20 (prep@0x4A3900/resolve@0x4A2D10; iter19 drain/flush/dispatch);
+// expireDeferred@0x4A2B90; bodyCommitSlot@0x4A4ED0; clock+=v22 @ 0x4A548E;
+// solverIterEma @ 0x4A54A6.
+bool arcade_integrate_dt_ok(float dt) {
+  // Soft PE fcomp C0: pass when !(accum < eps). Soft residue≡0 → accum=dt.
+  return !(dt < kArcadeIntegrateDtMin);
+}
 
 // Soft PE motion gate for physics_drive / physics_integrate early-out.
-// Stock Physics_Step @ 0x4A5190 OOS — asleep Soft from suspend/wakeup
-// (GameRef voidEvent strcmp @ 0x459E75 / 0x459ED1).
+// Soft stand-in for Physics_Step body-list walks (+0x84 apply/integrate,
+// +0x9C cull, +0xB8 live) — not PE vtbl+12/+24. Asleep Soft from
+// GameRef suspend/wakeup voidEvent strcmp @ 0x459E75 / 0x459ED1.
 bool arcade_motion_allowed(int32_t shape, bool is_static, bool asleep) {
   return shape != 0 && !is_static && !asleep;
 }

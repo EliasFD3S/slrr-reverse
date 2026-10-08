@@ -96,7 +96,8 @@ constexpr int kInputDiMaxSoft = 2;
 constexpr int kInputDiStateDwords = 68;  // joy GetDeviceState 272; kb 256 B
 constexpr int kInputDiAxisFloatMax = 16;
 constexpr int kInputMouseAxisCountSoft = 10;  // PE initDevices mouse n_axes
-constexpr float kInputMouseAccumScale = 0.015625f;  // PE * 0.015625 (=1/64)
+// PE Input_kMouseAccumScale @ 0x005F3AC8 — IDB u32 0x3C800000 = 0.015625f (1/64).
+constexpr float kInputMouseAccumScale = 0.015625f;
 constexpr float kInputMouseAbsScale = 0.005f;       // PE raw/qpcDtMs * 0.005
 constexpr float kInputMouseSensStep = 0.01f;        // PE (-1-axis)*0.01
 // PE button physId window: v13 >= 0x1000 && v13 < i[13]+4096.
@@ -105,8 +106,14 @@ constexpr uint32_t kInputMouseBtnPhysBase = 4096u;  // 0x1000
 constexpr uint32_t kInputMousePhysAbsX = 32770u;  // 0x8002
 constexpr uint32_t kInputMousePhysAbsY = 32772u;  // 0x8004
 constexpr uint32_t kInputMousePhysAbsZ = 32776u;  // 0x8008
+// PE DIERR_INPUTLOST @ pollDevices joy Acquire retry @ 0x00556C5C.
+constexpr long kDiErrInputLost = static_cast<long>(0x8007001EL);
 
 struct InputDiSlotSoft {
+#ifdef _WIN32
+  IDirectInputDevice8A* device = nullptr;  // PE i[0]
+  IDirectInputEffect* ffb_fx[3]{};         // PE i[486..488] @ +0x798/+0x79C/+0x7A0
+#endif
   int32_t type = 0;         // i[12] — 1=kb, 2=mouse, 3=joy
   int32_t button_base = 0;  // i[13] — mouse next-button counter (ends at 4)
   int32_t n_axes = 0;       // i[14]
@@ -117,11 +124,14 @@ struct InputDiSlotSoft {
 
 int32_t g_input_di_count = 0;  // Input_diDeviceCount @ 0x00777434
 float g_input_mouse_axis_scale = 0.5f;  // Input_mouseSensScale @ 0x00777438
+// Soft PE Input_forceFeedbackEnabled @ 0x00777448 (IDB default 0).
+int32_t g_input_force_feedback_enabled = 0;
 InputDiSlotSoft g_input_di_slots[kInputDiMaxSoft]{};
 
 void input_di_table_reset_soft() {
   g_input_di_count = 0;
   g_input_mouse_axis_scale = 0.5f;
+  g_input_force_feedback_enabled = 0;
   for (int i = 0; i < kInputDiMaxSoft; ++i) g_input_di_slots[i] = InputDiSlotSoft{};
 }
 
@@ -133,14 +143,23 @@ void input_di_add_named_axis_soft(InputDiSlotSoft& slot, int32_t phys_id) {
   ++slot.n_axes;
 }
 
+#ifdef _WIN32
+void input_di_bind_devices_soft();  // after g_di_kb / g_di_mouse
+#endif
+
 // Soft stand-in for keyboard+mouse registration inside Input_initDevices
 // @ 0x00556150 (joy EnumDevices OOS).
 void input_di_table_ensure_soft() {
-  if (g_input_di_count > 0) return;
+  if (g_input_di_count > 0) {
+#ifdef _WIN32
+    input_di_bind_devices_soft();
+#endif
+    return;
+  }
   InputDiSlotSoft& kb = g_input_di_slots[0];
   kb = InputDiSlotSoft{};
   kb.type = 1;
-  kb.n_axes = 256;  // PE dword_76F9E8 @ Input_initDevices
+  kb.n_axes = 256;  // PE Input_diDeviceAxisCount @ 0x0076F9E8
 
   InputDiSlotSoft& mouse = g_input_di_slots[1];
   mouse = InputDiSlotSoft{};
@@ -159,7 +178,10 @@ void input_di_table_ensure_soft() {
   input_di_add_named_axis_soft(mouse, 4);
   input_di_add_named_axis_soft(mouse, 8);
   g_input_di_count = 2;
-  g_input_mouse_axis_scale = 0.5f;  // PE flt_777438 after initDevices
+  g_input_mouse_axis_scale = 0.5f;  // PE Input_mouseSensScale @ 0x00777438
+#ifdef _WIN32
+  input_di_bind_devices_soft();
+#endif
 }
 
 // PE flt_64959C / flt_649598 — WndProc NDC (SysCursor path).
@@ -182,6 +204,14 @@ float g_mouse_rel_x = 0.f;
 float g_mouse_rel_y = 0.f;
 float g_mouse_rel_z = 0.f;
 
+// Soft PE i[0] bind — Input_initDevices stores CreateDevice ptrs in table slots.
+void input_di_bind_devices_soft() {
+  if (g_input_di_count <= 0) return;
+  if (g_input_di_slots[0].type == 1) g_input_di_slots[0].device = g_di_kb;
+  if (g_input_di_count > 1 && g_input_di_slots[1].type == 2)
+    g_input_di_slots[1].device = g_di_mouse;
+}
+
 void di8_shutdown() {
   if (g_di_mouse) {
     g_di_mouse->Unacquire();
@@ -199,6 +229,12 @@ void di8_shutdown() {
   }
   g_di_kb_ok = false;
   g_di_mouse_ok = false;
+  // Clear soft table device ptrs (PE releases via initDevices teardown OOS).
+  for (int i = 0; i < kInputDiMaxSoft; ++i) {
+    g_input_di_slots[i].device = nullptr;
+    g_input_di_slots[i].ffb_fx[0] = g_input_di_slots[i].ffb_fx[1] =
+        g_input_di_slots[i].ffb_fx[2] = nullptr;
+  }
 }
 
 HWND di_hwnd() {
@@ -660,55 +696,83 @@ void input_live_shutdown() {
 namespace {
 
 #ifdef _WIN32
-// Soft PE Input_pollDevices keyboard case 1 @ 0x00556C2F.
+// Soft PE Input_pollDevices keyboard case 1 @ 0x00556D98.
+// GetDeviceState(256, i+401); on fail Acquire (vt+28); Acquire fail →
+// memset 64 dwords; else retry GetDeviceState (PE does not check 2nd hr).
 void input_di_poll_keyboard_slot(InputDiSlotSoft& slot) {
-  std::memset(slot.state, 0, 256);
-  if (!g_di_kb) return;
-  HRESULT hr = g_di_kb->GetDeviceState(256, slot.state);
+  IDirectInputDevice8A* dev = slot.device ? slot.device : g_di_kb;
+  if (!dev) {
+    std::memset(slot.state, 0, 256);
+    return;
+  }
+  HRESULT hr = dev->GetDeviceState(256, slot.state);
   if (hr != 0) {
-    if (g_di_kb->Acquire() != 0) {
-      std::memset(slot.state, 0, 256);  // PE memset 64 dwords
+    if (dev->Acquire() != 0) {
+      // PE LABEL_43: ecx=0x40 → rep stosd 64 dwords @ state.
+      std::memset(slot.state, 0, 64 * sizeof(int32_t));
       return;
     }
-    g_di_kb->GetDeviceState(256, slot.state);
+    dev->GetDeviceState(256, slot.state);
   }
 }
 
-// Soft PE Input_pollDevices mouse case 2 @ 0x00556C2F.
-// PE GetDeviceState size 16 (DIMOUSESTATE); host may be DIMouse2 — use
-// poll_di_mouse which tries both.
+// Soft PE Input_pollDevices mouse case 2 @ 0x00556CD5.
+// PE GetDeviceState size 16 (DIMOUSESTATE @ i+401); Soft may have created
+// DIMouse2 — try 16 first (stock), then sizeof(DIMOUSESTATE2).
+bool input_di_mouse_get_state_soft(IDirectInputDevice8A* dev,
+                                   InputDiSlotSoft& slot) {
+  if (!dev) return false;
+  HRESULT hr = dev->GetDeviceState(16, slot.state);
+  if (hr == 0) return true;
+  if (dev->Acquire() == 0) {
+    hr = dev->GetDeviceState(16, slot.state);
+    if (hr == 0) return true;
+  }
+  // Soft DIMouse2 path (host init prefers c_dfDIMouse2).
+  DIMOUSESTATE2 st2{};
+  hr = dev->GetDeviceState(sizeof(DIMOUSESTATE2), &st2);
+  if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+    if (dev->Acquire() != 0) return false;
+    hr = dev->GetDeviceState(sizeof(DIMOUSESTATE2), &st2);
+  }
+  if (hr != 0) return false;
+  slot.state[0] = static_cast<int32_t>(st2.lX);
+  slot.state[1] = static_cast<int32_t>(st2.lY);
+  slot.state[2] = static_cast<int32_t>(st2.lZ);
+  std::memcpy(&slot.state[3], st2.rgbButtons, 4);
+  return true;
+}
+
 void input_di_poll_mouse_slot(InputDiSlotSoft& slot) {
-  DIMOUSESTATE2 st{};
-  const bool ok = poll_di_mouse(&st);
-  if (!ok) {
-    // PE: zero state[401..404] (lX/lY/lZ/buttons).
+  IDirectInputDevice8A* dev = slot.device ? slot.device : g_di_mouse;
+  if (!input_di_mouse_get_state_soft(dev, slot)) {
+    // PE @ 0x00556CFF: zero state dwords 401..404 (lX/lY/lZ/buttons).
     slot.state[0] = slot.state[1] = slot.state[2] = slot.state[3] = 0;
     g_mouse_rel_x = g_mouse_rel_y = g_mouse_rel_z = 0.f;
     return;
   }
-  slot.state[0] = static_cast<int32_t>(st.lX);
-  slot.state[1] = static_cast<int32_t>(st.lY);
-  slot.state[2] = static_cast<int32_t>(st.lZ);
-  std::memcpy(&slot.state[3], st.rgbButtons, 4);
 
-  // PE: for each axis, switch obj type 2/4/8 → accum * mouseScale * 0.015625.
+  // PE @ 0x00556D11: for each axis, obj type 2/4/8 → accum * sens * 0.015625.
   for (int a = 0; a < slot.n_axes && a < kInputDiAxisFloatMax; ++a) {
     double raw = 0.0;
+    bool accum = false;
     switch (slot.axis_obj[a]) {
       case 2:
         raw = static_cast<double>(slot.state[0]);
+        accum = true;
         break;
       case 4:
         raw = static_cast<double>(slot.state[1]);
+        accum = true;
         break;
       case 8:
         raw = static_cast<double>(slot.state[2]);
+        accum = true;
         break;
       default:
         break;
     }
-    if (slot.axis_obj[a] == 2 || slot.axis_obj[a] == 4 ||
-        slot.axis_obj[a] == 8) {
+    if (accum) {
       float v = static_cast<float>(
           raw * static_cast<double>(g_input_mouse_axis_scale) *
               static_cast<double>(kInputMouseAccumScale) +
@@ -717,6 +781,7 @@ void input_di_poll_mouse_slot(InputDiSlotSoft& slot) {
       if (v < -1.f) v = -1.f;
       slot.axis_f[a] = v;
     } else {
+      // PE LABEL_33: clamp only (abs/button floats stay).
       float v = slot.axis_f[a];
       if (v > 1.f) v = 1.f;
       if (v < -1.f) v = -1.f;
@@ -725,15 +790,48 @@ void input_di_poll_mouse_slot(InputDiSlotSoft& slot) {
   }
 
   // Host relative burst (normalized) for overlays — PE keeps accum in table.
-  g_mouse_rel_x = static_cast<float>(st.lX) / 64.f;
-  g_mouse_rel_y = -static_cast<float>(st.lY) / 64.f;
-  g_mouse_rel_z = static_cast<float>(st.lZ) / 120.f;
+  g_mouse_rel_x = static_cast<float>(slot.state[0]) / 64.f;
+  g_mouse_rel_y = -static_cast<float>(slot.state[1]) / 64.f;
+  g_mouse_rel_z = static_cast<float>(slot.state[2]) / 120.f;
   if (g_mouse_rel_x > 1.f) g_mouse_rel_x = 1.f;
   if (g_mouse_rel_x < -1.f) g_mouse_rel_x = -1.f;
   if (g_mouse_rel_y > 1.f) g_mouse_rel_y = 1.f;
   if (g_mouse_rel_y < -1.f) g_mouse_rel_y = -1.f;
   if (g_mouse_rel_z > 1.f) g_mouse_rel_z = 1.f;
   if (g_mouse_rel_z < -1.f) g_mouse_rel_z = -1.f;
+}
+
+// Soft PE Input_pollDevices joy case 3 @ 0x00556C43.
+// Poll → Acquire retry (≤10× DIERR_INPUTLOST) → optional FFB Start →
+// GetDeviceState(272). Soft registers no type-3 slots (EnumDevices OOS).
+void input_di_poll_joy_slot(InputDiSlotSoft& slot) {
+  IDirectInputDevice8A* dev = slot.device;
+  if (!dev) return;
+
+  // PE: IDirectInputDevice8::Poll (vt+100 / +0x64).
+  if (dev->Poll() < 0) {
+    int tries = 1;
+    HRESULT acq = 0;
+    while (true) {
+      acq = dev->Acquire();
+      if (acq != kDiErrInputLost) break;
+      if (tries++ > 10) {
+        // PE ecx=0x44 → memset 68 dwords (272 B joy state).
+        std::memset(slot.state, 0, 68 * sizeof(int32_t));
+        return;
+      }
+    }
+    if (acq < 0) return;  // PE @ 0x00556C77 break
+
+    // PE @ 0x00556C7D: if Input_forceFeedbackEnabled → Effect::Start(1,0).
+    if (g_input_force_feedback_enabled != 0) {
+      for (IDirectInputEffect* fx : slot.ffb_fx) {
+        if (fx) fx->Start(1, 0);
+      }
+    }
+  }
+  // PE @ 0x00556CC2: GetDeviceState(272, i+401) even when Poll succeeded.
+  dev->GetDeviceState(272, slot.state);
 }
 
 // Soft PE Input_readPhysicalAxis @ 0x00557430 — type 1/2 only; joy OOS→0.
@@ -835,16 +933,22 @@ void input_publish_phys_from_di_soft() {
   poll_mouse_axes();  // overlays phys 0/1 with client NDC for OSD
 #endif
 }
-// Soft PE Input_pollDevices @ 0x00556BC0.
-// QPC delta ms (pollQpcDtMs) + walk soft DI table types 1/2. Joy type 3 OOS.
+// Soft PE Input_pollDevices @ 0x00556BC0 size 0x23c.
+// QPF+QPC → Input_qpcDtMs @ 0x0076F9A0; walk Input_diDevices stride 490
+// dwords (Soft: kInputDiMaxSoft slots); cases 1/2/3 @ 0x00556C2F.
 float input_poll_devices_soft() {
 #ifdef _WIN32
-  if (g_live) input_di_table_ensure_soft();
+  if (g_live) {
+    di8_init();
+    input_di_table_ensure_soft();  // also rebinds i[0] device ptrs
+  }
 
   LARGE_INTEGER now{};
   // PE always QueryPerformanceFrequency each call (Input_qpcFrequency).
   QueryPerformanceFrequency(&g_input_qpc_freq);
   QueryPerformanceCounter(&now);
+  // PE always subtracts Input_qpcLast (seeded by initDevices @ 0x00556521).
+  // Soft zeros first sample only when QPC was never seeded.
   if (!g_input_qpc_inited) {
     g_input_qpc_last = now;
     g_input_qpc_inited = true;
@@ -870,7 +974,7 @@ float input_poll_devices_soft() {
         input_di_poll_mouse_slot(slot);
         break;
       case 3:
-        // Joy Poll+GetDeviceState(272) + FFB Acquire — DI joy OOS.
+        input_di_poll_joy_slot(slot);  // EnumDevices type-3 slots OOS
         break;
       default:
         break;
@@ -947,7 +1051,8 @@ int input_di_device_get_type_soft(int di_index) {
 int input_di_device_set_feedback_soft(int di_index, int /*mode*/, float /*force*/,
                                       float /*magnitude*/) {
   if (di_index < 0 || di_index >= g_input_di_count) return -1;
-  // Input_forceFeedbackEnabled @ 0x00777448 + sub_555AC0 — joy OOS.
+  // Soft g_input_force_feedback_enabled mirrors @ 0x00777448; joy FFB
+  // Start lives in pollDevices case 3 @ 0x00556C7D (initEffects OOS).
   return 0;
 }
 

@@ -50,6 +50,19 @@ void* native_ptr_attach_block(InvObject* self);
 int32_t res_handle_or_payload_flags(InvObject* self, int32_t flags);
 int32_t res_handle_and_not_payload_flags(InvObject* self, int32_t flags);
 int32_t res_handle_get_payload_flags(InvObject* self);
+// PE RenderRef_applyLight @ 0x0048C9D0 / applyFlare @ 0x0048CB40 — Soft TREE
+// unit floats / flare stamp (getPayload tag 0x80000001 mid poke OOS).
+void render_ref_apply_light_soft(InvObject* self, int32_t diffuse,
+                                 int32_t ambient, int32_t specular);
+void render_ref_apply_flare_soft(InvObject* self, InvObject* glowtexture,
+                                 int32_t glowColor, float glowMinSize,
+                                 float glowMaxSize, int32_t flareCount,
+                                 int32_t rayCount);
+// PE Text_createRText2Inst @ 0x0048C670 — type "r_text2" (malloc owned buf).
+// Soft: D3D text + TREE kind=2; charset null → false (PE a5+8==0).
+bool text_create_rtext2_inst_soft(InvObject* self, InvObject* parent,
+                                  InvObject* charset, float x, float z,
+                                  int32_t color, int32_t align, float scale);
 // PE RenderRef_applyBoneId @ 0x0048BD30 — after RenderRef_bindBone @ 0x48BC40
 // (host getBoneId). add_linked/rem_linked bone00/01 path.
 int32_t render_ref_apply_bone_id(InvObject* self, int32_t bone_id);

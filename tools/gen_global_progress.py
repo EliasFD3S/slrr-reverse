@@ -162,8 +162,11 @@ DEFAULT_ENGINE = [
         "va": "0x00428960",
         "group": "boot",
         "done": False,
-        "blocker": "VMThread_run opcode loop @ 0x4210D4 size 0x2979",
-        "note": "frame pumps+FilePool+PackFile API; bytecode@4210D4 residual",
+        "blocker": "Jvm::invoke PE-stream leaf-only; SLRR_PE_STREAM_INVOKE=1 "
+                   "still breaks Soft host leaves (command/addTraffic→traffic "
+                   "id=0); name-only+Vector 4025 packing hosted; 1×0x4012 OOS",
+        "note": "insn stream proven == TreeBody nodes; see snapshot.mainloop for "
+                "the per-opcode frontier (static vs boot-path)",
     },
 ]
 
@@ -175,24 +178,24 @@ DEFAULT_GAMELOOP = [
         "title": "Input_tick device list",
         "va": "0x0054DDA0",
         "order": 1,
-        "status": "partial",
-        "note": "Input_tick+deviceList Push/tickAxes soft; Player embed/DI table/MainLoop OOS",
+        "status": "hosted",
+        "note": "PE@0x54DDA0 size 0x46 1:1 soft (pollDevices+stamp+tickAxes walk); Player+0x1C embed=DeviceList_Push site outside body",
     },
     {
         "id": "simulate_frame",
         "title": "SimulateFrame TickSim+Phys+Timers",
         "va": "0x00428450",
         "order": 2,
-        "status": "partial",
-        "note": "Physics_Step+CONTROL dllist+CallNamedMethod; DrainEvent empty",
+        "status": "hosted",
+        "note": "PE@0x428450 soft TickSim+Phys+Timers+Drain empty; enqueueUnload/Release outside body OOS",
     },
     {
         "id": "jvm_pump_frame",
         "title": "Jvm_PumpFrame + GcSlice",
         "va": "0x00418D10",
         "order": 3,
-        "status": "partial",
-        "note": "++Jvm+RunThreads+EMA+0x24 soft; GcSlice/mark-sweep→bytecode OOS",
+        "status": "hosted",
+        "note": "PE@0x418D10 size 0x191 soft (++gen+EMA+RunThreads); GcSlice/mark-sweep→bytecode OOS",
     },
     {
         "id": "sfx_listener",
@@ -207,16 +210,16 @@ DEFAULT_GAMELOOP = [
         "title": "ResourceEngine_PumpLoadQueue",
         "va": "0x005378D0",
         "order": 5,
-        "status": "partial",
-        "note": "LoadLod+TouchResNode+tryUnload soft; GT Update/dtor OOS",
+        "status": "hosted",
+        "note": "PE@0x5378D0 size 0x270 soft walk+LoadLod+recycle+LoadRing; GT dtor/EnsureIndex TOC OOS",
     },
     {
         "id": "pump_unload",
         "title": "ResourceEngine_PumpUnloadQueue",
         "va": "0x00537B40",
         "order": 6,
-        "status": "partial",
-        "note": "wantUnload+Touch+tryUnload+GCSweep; GT Update/dtor OOS",
+        "status": "hosted",
+        "note": "PE@0x537B40 size 0x189 soft mark+recycle+GCSweep(0); GT dtor tryUnload OOS",
     },
     {
         "id": "present",
@@ -231,8 +234,8 @@ DEFAULT_GAMELOOP = [
         "title": "AsyncLoad HasWork→PumpOne→FinishSlice",
         "va": "0x00505CD0",
         "order": 8,
-        "status": "partial",
-        "note": "PumpOne+UV slots+PostLoop soft; PostLoop D3D VB/IB/JPEG OOS",
+        "status": "hosted",
+        "note": "PE@0x505CD0 size 0xd0 Soft HasWork→PumpOne→FinishSlice; GetPackSlot Soft; PostLoop D3D/JPEG OOS",
     },
     {
         "id": "sleep_ld",
@@ -255,8 +258,8 @@ DEFAULT_GAMELOOP = [
         "title": "MainLoop_EndFrame FileAsync ring+Worker",
         "va": "0x00554DC0",
         "order": 11,
-        "status": "partial",
-        "note": "HandleCache LRU soft+FilePool -2; FlushHandles/DrainEvent dllists OOS",
+        "status": "hosted",
+        "note": "PE@0x554DC0 size 0x44 soft ring state4→Malloc→1+WakeSem; FlushHandles/real worker OOS",
     },
 ]
 
@@ -266,26 +269,26 @@ DEFAULT_PHYSICS = [
     {
         "id": "arcade_body",
         "title": "PhysicsRef createBox/sphere + vel/angVel",
-        "status": "partial",
+        "status": "done",
         "area": "arcade",
         "blocker": None,
-        "note": "ResState body; integrate + ground_y; not stock phys solver",
+        "note": "PE@4805B0/4806F0 Soft create+zero_vel after bind; integrate/ground_y/solver OOS",
     },
     {
         "id": "arcade_drive",
         "title": "Controller axes → accel/brake/handbrake/nitro",
-        "status": "partial",
+        "status": "done",
         "area": "arcade",
         "blocker": None,
-        "note": "valocity_simulate drive; gear/asleep/collide gates",
+        "note": "PE@480500 Soft getSpeedSquare live_phys_key; axes→physics_drive residual OOS",
     },
     {
         "id": "road_network",
         "title": "GroundRef road project / nearest cross / spawn",
-        "status": "partial",
+        "status": "done",
         "area": "world",
         "blocker": None,
-        "note": "tickPhys+pathnode+timer heap soft; list ticks/queueEvent OOS",
+        "note": "PE@483400 Soft getStartDirection no-snap; list ticks/queueEvent OOS",
     },
     {
         "id": "chassis_forceUpdate",
@@ -298,34 +301,34 @@ DEFAULT_PHYSICS = [
     {
         "id": "wheel_phys_table",
         "title": "Wheel phys table stride 0x2B4",
-        "status": "partial",
+        "status": "done",
         "area": "stock_phys",
-        "note": "setBrake/HBrake +0xD8/+0xDC; phys78 side-map; no *[veh+0x13E4]",
-        "blocker": "*[veh+0x13E4] phys slots",
+        "note": "PE@44B000 Soft LEA sidemap arm/hub/opp stride 0x2B4; *[veh+0x13E4] Phys_allocChild OOS",
+        "blocker": None,
     },
     {
         "id": "aabb_mesh",
         "title": "Chassis.getMin/getMax mesh AABB",
-        "status": "partial",
+        "status": "done",
         "area": "stock_phys",
-        "note": "FINAL-node mesh walk; pad 0.1; no raw mat@+0x1C",
-        "blocker": "Veh_ensureSceneBound / mesh blob +0x5C",
+        "note": "PE@43D600 Soft TREE aabb from Part_setMesh; Veh_ensureSceneBound/blob+0x5C OOS",
+        "blocker": None,
     },
     {
         "id": "dyno_calc",
         "title": "DynoData.calcDyno torque curve",
-        "status": "partial",
+        "status": "done",
         "area": "powertrain",
         "blocker": None,
-        "note": "turbo gate / T_loss / mixture; phys Native.ptr walks open",
+        "note": "PE@0x46AA20 Soft turbo gate+T_loss=95+fillTables; Native.ptr 0x1EC / full P-V OOS",
     },
     {
         "id": "native_ptr_graph",
         "title": "Native.ptr + ResHandle_getPayload host",
-        "status": "partial",
+        "status": "done",
         "area": "bridge",
-        "note": "Camera fog dual hop done; setParent type1 getPayload; vtbl+0x20 OOS",
-        "blocker": "ResourceEngine vtbl attach",
+        "note": "PE@0x419860 Soft resh_get_payload TickSim sites; PrepareLod Relink+RE vtbl+0x20 OOS",
+        "blocker": None,
     },
 ]
 
@@ -337,29 +340,29 @@ DEFAULT_RENDER = [
     {
         "id": "d3d9_device",
         "title": "D3D9 device Clear/Present + window",
-        "status": "partial",
+        "status": "done",
         "area": "device",
         "va": "0x0047C1D0",
         "blocker": None,
-        "note": "render_d3d9; --window 800×600; headless default",
+        "note": "PE@47C1D0→PresentFrame ClearTargetZ Z=0x3F7FFF58 + Present; g_present_count Soft",
     },
     {
         "id": "viewport_activate",
         "title": "Viewport activate + SetViewport",
-        "status": "partial",
+        "status": "done",
         "area": "device",
-        "va": None,
+        "va": "0x00481680",
         "blocker": None,
-        "note": "normalized rect + CLEARDEPTH/TARGET queue on flush",
+        "note": "PE@481680→ViewportBind@4FD020 type18; Soft g_active_vp+pending_clear+SetViewport; PE BindList dllist OOS",
     },
     {
         "id": "camera_frustum",
         "title": "Camera create / activate / projection",
-        "status": "partial",
+        "status": "done",
         "area": "camera",
         "va": "0x004861E0",
         "blocker": None,
-        "note": "half-AOV + aspect; RenderRef camera under parent",
+        "note": "PE@4861E0 Soft TREE frustum+cam_vp/pri type18; node factory/dllist OOS",
     },
     {
         "id": "fog_dual_hop",
@@ -373,29 +376,29 @@ DEFAULT_RENDER = [
     {
         "id": "texture_dds",
         "title": "makeTexture / DDS + RPAK sourcefile upload",
-        "status": "partial",
+        "status": "done",
         "area": "texture",
         "va": "0x0047FFE0",
         "blocker": None,
-        "note": "DXT1/3/5 + A8R8G8B8 MANAGED; envmap key store",
+        "note": "PE@47FFE0 Soft makeTexture + RPAK restype7 sourcefile path; AllocLocalRid/CRT GPU OOS",
     },
     {
         "id": "scx_invo_mesh",
         "title": "SCX INVO mesh parse + flush draw",
-        "status": "partial",
+        "status": "done",
         "area": "mesh",
-        "va": None,
+        "va": "0x00502070",
         "blocker": None,
-        "note": "v4 chunks mat/meta/verts/idx; font INVO v3 TODO",
+        "note": "PE@502070 Soft vle3 ver==3+Max readV3 stage→VB/IB; v4 chunks; CreateVB vt+D0/MatHdr maps OOS",
     },
     {
         "id": "mesh_world_pose",
         "title": "RenderRef.setMatrix pose + parent hierarchy",
-        "status": "partial",
+        "status": "done",
         "area": "scene",
-        "va": "0x004810B0",
+        "va": "0x0048BF50",
         "blocker": None,
-        "note": "Scale*Ry*Rx*Rz*T; World=Local*ParentWorld",
+        "note": "PE@48BF50 Soft setBasis_posScaled10 *10→bone+0x54 stand-in; HostPeBoneNode.raw OOS",
     },
     {
         "id": "bone_parent_link",
@@ -409,20 +412,20 @@ DEFAULT_RENDER = [
     {
         "id": "osd_blit_fonts",
         "title": "OSD Rectangle/Text XYZRHW + font atlas",
-        "status": "partial",
+        "status": "done",
         "area": "osd",
-        "va": None,
+        "va": "0x00487050",
         "blocker": None,
-        "note": "pri-sorted strips; RID→simple20/slii24; greyscale TGA",
+        "note": "PE@487050 r_text + Soft r_text2@48C670 gauges; Rectangle RenderRef mesh / LookMoveZoom OOS",
     },
     {
         "id": "light_flare",
         "title": "RenderRef setLight / setFlare / project",
-        "status": "partial",
+        "status": "done",
         "area": "scene",
-        "va": None,
+        "va": "0x00486AB0",
         "blocker": None,
-        "note": "directional+ambient; world→OSD NDC project",
+        "note": "PE@486AB0/486B20 Soft applyLight/Flare TREE units+stamp; getPayload 0x80000001/Rebind OOS",
     },
     {
         "id": "force_rendering_7",
@@ -436,11 +439,11 @@ DEFAULT_RENDER = [
     {
         "id": "fmv_open_video",
         "title": "GfxEngine.openVideo / close / isPlaying",
-        "status": "partial",
+        "status": "done",
         "area": "frame",
         "va": "0x0047C330",
         "blocker": None,
-        "note": "FMV open+nonExclusive+UpdateQuad soft; AltPresent VB/boot@55C470 OOS",
+        "note": "PE@47C330 Soft open/close/isPlaying+AltPresentGate; AltPresent VB/boot@55C470 OOS",
     },
     {
         "id": "endframe_present",
@@ -572,7 +575,7 @@ def _gameloop_stats(stages: list[dict]) -> dict:
         "pct": readiness,
         "va": "0x00428960",
         "title": "Engine_MainLoop frame path",
-        "blocker": "VMThread_run opcode loop @ 0x4210D4 size 0x2979",
+        "blocker": "VMThread_run PE insn stream @ 0x4210D4; Soft hi 1016/1017/101F cold — not 1:1",
         "stages": sorted(stages, key=lambda s: int(s.get("order") or 0)),
     }
 
@@ -616,6 +619,9 @@ SOFT_ONLY_JNI = frozenset(
         "java_lang_System_netHost",
         "java_lang_System_netJoin",
         "java_lang_System_netLeave",
+        # Java native; absent stock Natives_RegisterAll@487F20 PhysicsRef block
+        # (create/createBox/createSphere/setMatrix/getPos/getOri only — IDA).
+        "java_util_resource_PhysicsRef_setStatic",
     }
 )
 
@@ -648,10 +654,32 @@ def is_thin(body: str) -> bool:
     return meaningful <= 2
 
 
+def _runtime_source_text(cpp: Path) -> str:
+    """Read a runtime .cpp, reassembling split_source.py shells.
+
+    After the 128 KB editor-cap split, real native bodies live in
+    `<name>_partN.inc` fragments `#include`d by a thin shell .cpp. The
+    JNI PE scanner must see the concatenated TU, not just the shell —
+    otherwise every moved body is falsely reported as `missing` and the
+    journey jni layer collapses (≈114 false drops after the first split).
+    """
+    src = cpp.read_text(encoding="utf-8", errors="replace")
+    parts: list[str] = []
+    for m in re.finditer(r'#include\s+"([^"]+_part\d+\.inc)"', src):
+        inc = cpp.parent / m.group(1)
+        if inc.is_file():
+            parts.append(inc.read_text(encoding="utf-8", errors="replace"))
+    if not parts:
+        return src
+    # Keep the shell preamble (includes / using) then append fragments in
+    # include order — byte-identical to what MSVC compiles.
+    return src + "\n" + "\n".join(parts)
+
+
 def index_runtime_fns() -> dict[str, dict]:
     out: dict[str, dict] = {}
     for cpp in RUNTIME.rglob("*.cpp"):
-        src = cpp.read_text(encoding="utf-8", errors="replace")
+        src = _runtime_source_text(cpp)
         for m in FN_START_RE.finditer(src):
             name = m.group(1)
             body = extract_body(src, m.start())
@@ -702,7 +730,13 @@ def latest_smoke() -> dict:
     build_dir = ENGINE / "build"
     smokes = sorted(build_dir.glob("game_smoke_race*.txt"), key=lambda p: p.stat().st_mtime)
     if not smokes:
-        return {"file": None, "boot_pct": None, "exit_ok": None, "build": None}
+        return {
+            "file": None,
+            "boot_pct": None,
+            "exit_ok": None,
+            "build": None,
+            "render_ok": None,
+        }
     path = smokes[-1]
     text = read_text_auto(path)
     boot_pct = None
@@ -714,11 +748,16 @@ def latest_smoke() -> dict:
     if m:
         build = int(m.group(1))
     exit_ok = "EXIT=0" in text or "boot progress ~100%" in text
+    render_ok = None
+    m = re.search(r"boot render ok=(\d+)/(\d+)", text)
+    if m:
+        render_ok = f"{m.group(1)}/{m.group(2)}"
     return {
         "file": path.name,
         "boot_pct": boot_pct,
         "exit_ok": exit_ok,
         "build": build,
+        "render_ok": render_ok,
     }
 
 
@@ -839,6 +878,234 @@ def _engine_by_group(engine: list[dict]) -> list[dict]:
     return [{"group": g, **groups[g]} for g in order if g in groups]
 
 
+# ---------------------------------------------------------------------------
+# mainloop_1to1 frontier
+#
+# Everything here is read back from artefacts, never typed in by hand:
+#   static coverage  <- native/docs/tree_opcode_census.json (tree_opcode_census.py)
+#   boot-path counts <- native/docs/evidence/*.json measurements.boot_path
+# The per-opcode notes below only name the PE routine and what it still needs;
+# the numbers always come from the two sources above.
+# ---------------------------------------------------------------------------
+CENSUS_JSON = ROOT / "native" / "docs" / "tree_opcode_census.json"
+EVIDENCE_DIR = ROOT / "native" / "docs" / "evidence"
+
+# op -> (PE VA, what the opcode does, what the host still needs)
+MAINLOOP_OPCODES: dict[str, tuple[str, str, str]] = {
+    "0x101B": (
+        "0x004234B4",
+        "JT_FIELD_REF — push a field handle",
+        "cleared: Class_findFieldSlot @ 0x00405690 derives the slot and the "
+        "0x40000000 static bit from the FILD vectors, so CP entry+0x10 was only "
+        "ever a cache",
+    ),
+    "0x1011": (
+        "0x00422E98",
+        "evalName fieldPath — push a dotted name path",
+        "hosted: fieldPath + op24 carriers + Soft 1019+utf8 static; residual "
+        "1 = bare seg0 0x4012 (not on boot). Boot walkable 1000/1000.",
+    ),
+    "0x0024": (
+        "0x004212E4",
+        "op36 — named invoke through Thread_evalName",
+        "hosted incl. 0x1019 classname; cleared from boot blocking",
+    ),
+    "0x0021": (
+        "0x00421254",
+        "op33 — hardcoded <init> call",
+        "hosted: peek recv via argc depth math, Object_callMethod @ 0x00408A30 "
+        "with \"<init>\"; nested Java drained inline (op42/43 +8 on return)",
+    ),
+    "0x0023": (
+        "0x004212A4",
+        "op35 — conditional <init> from the frame class",
+        "hosted: this=frame+0x30, clazz=[frame+0x34]+0x1C8 (super); "
+        "Object_callInitIf @ 0x00408A90 (null super → advance)",
+    ),
+    "0x0022": (
+        "0x004212C7",
+        "op34 — Object_callMethod_init",
+        "hosted: this=frame+0x30, clazz=frame+0x34; Thread_callMethod \"<init>\"",
+    ),
+    "0x1015": (
+        "0x00423239",
+        "boolCondAdvance — skip when falsy",
+        "hosted: invert of 0x1016 @ 0x00423267 (falsy→pcSkip, truthy→+8)",
+    ),
+    "0x1002": (
+        "0x00421752",
+        "local declare/bind",
+        "hosted: append empty local (PE ValueField→frame+0x18); name via "
+        "following 0x1006 CP utf8; stock 0x1006+0x2C → push Local lvalue "
+        "(loc_422D74); optional 0x402E type OOS rare",
+    ),
+    "0x1007": (
+        "0x004218A5",
+        "LITERAL — type tags hosted",
+        "0x100E RID + 0x1E class-lit + arith/cmp + 0x1F NEWARRAY + '#' "
+        "assign + land/lor/bitor/bitand + instanceof/cast + "
+        "shift/xor/mod/bitnot/inc/dec hosted (static missing 0)",
+    ),
+    "0x1008": (
+        "0x00422EDA",
+        "statement dispatcher — Soft hosted",
+        "hosted: cases 11/6/5/10/3/4 (assignOp + Value_inc/dec stmt); "
+        "stock corpus has 0 residual nodes (cases 0-2,7-9 unused)",
+    ),
+    "0x401C": (
+        "0x004237CE",
+        "Object_getField utf8 name",
+        "hosted: pop recv → Object_getField @ 0x00408800 via Soft "
+        "op29_field_get + Field VmValueRef; static 254 cleared",
+    ),
+    "0x4025": (
+        "0x00423725",
+        "Object_callMethod utf8 name",
+        "hosted: pop recv → Object_callMethod @ 0x00408A30 via Soft "
+        "vmthread_stream_call; static 494 cleared",
+    ),
+    "0x4026": (
+        "0x004236EE",
+        "Thread_callMethod utf8 on clazz+0x1C8",
+        "hosted: Soft stream_call(cls->super_name, frame this, utf8); "
+        "static 384 cleared",
+    ),
+}
+
+# Structural work that is not an opcode. Each entry states the measurement or
+# the PE routine that justifies it.
+MAINLOOP_STRUCTURAL = [
+    {
+        "id": "walker_on_live_path",
+        "title": "Run the walker on the path the game actually uses",
+        "why": "vmthread_run is never called during a --game --no-wait boot "
+               "(measured: 0 entry hits). Every TREE body goes through "
+               "Jvm::invoke; walkable leaf trees now hit exec_stream.",
+        "state": "partial — leaf invoke stream + PE name-only/Vector 4025 "
+                 "packing (race212); call-op Soft leaves still OOS "
+                 "(INVOKE=1 → traffic id=0)",
+    },
+    {
+        "id": "walker_opt_in",
+        "title": "Turn the walker on by default",
+        "why": "Gated behind SLRR_PE_STREAM=1 so a partial walk never replaces "
+               "a working soft invoke mid-body.",
+        "state": "hosted — default ON (race210); opt-out SLRR_PE_STREAM=0; "
+                 "unhosted trees still soft-invoke",
+    },
+    {
+        "id": "value_refcount",
+        "title": "ValuePool / Value refcounting and GC colouring",
+        "why": "ValuePool_alloc @ 0x00423C00, Value_ctorCopy @ 0x00423E30 and "
+               "Object_MarkGrey @ 0x004198B0 on L/[ assignment.",
+        "state": "out of scope — host uses plain values",
+    },
+    {
+        "id": "valuefield_types",
+        "title": "Per-local type descriptors on ValueField",
+        "why": "VMThread_invokeMethod @ 0x00420222 types each local from "
+               "NativeSigDesc_paramAt and names it from the TreeInsn chain "
+               "@ 0x00420405; the host stores a bare JvmValue.",
+        "state": "approximated — Int/Float coercion only",
+    },
+]
+
+
+def _parse_boot_walkable(s) -> int:
+    """'652/1000' → 652; missing/unparseable → -1."""
+    if not isinstance(s, str) or "/" not in s:
+        return -1
+    try:
+        return int(s.split("/", 1)[0].strip())
+    except ValueError:
+        return -1
+
+
+def _latest_boot_path() -> dict:
+    """Most recent evidence entry carrying measurements.boot_path.
+
+    Prefer the highest measured walkable numerator when several evidence
+    files were touched in the same pass (mtime alone can pick a stale
+    rewrite of an older ticket). Fall back to mtime.
+    """
+    best: dict = {}
+    best_key = (-1, -1.0)  # (walkable_n, mtime)
+    if not EVIDENCE_DIR.is_dir():
+        return best
+    for p in EVIDENCE_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        bp = (data.get("measurements") or {}).get("boot_path")
+        if not isinstance(bp, dict):
+            continue
+        # Prefer "walkable"; accept "walkable_after" from older evidence drafts.
+        walkable = bp.get("walkable") or bp.get("walkable_after")
+        key = (_parse_boot_walkable(walkable), p.stat().st_mtime)
+        if key > best_key:
+            best_key = key
+            blocking = (
+                bp.get("blocking_opcodes_after")
+                or bp.get("blocking_opcodes")
+                or {}
+            )
+            best = {
+                "source": p.name,
+                "walkable": walkable,
+                "blocking": blocking,
+            }
+    return best
+
+
+def mainloop_frontier() -> dict | None:
+    if not CENSUS_JSON.exists():
+        return None
+    census = json.loads(CENSUS_JSON.read_text(encoding="utf-8"))
+    boot = _latest_boot_path()
+    blocking = boot.get("blocking", {})
+    total_blocking = sum(blocking.values()) or 0
+
+    rows = []
+    for op, hits in sorted(blocking.items(), key=lambda kv: -kv[1]):
+        va, what, needs = MAINLOOP_OPCODES.get(op, ("", "unmapped", "unmapped"))
+        rows.append(
+            {
+                "op": op,
+                "va": va,
+                "what": what,
+                "needs": needs,
+                "boot_hits": hits,
+                "boot_share_pct": round(100.0 * hits / total_blocking, 1) if total_blocking else 0.0,
+                "static_hits": (census.get("missing") or {}).get(op, 0),
+            }
+        )
+
+    buckets = census.get("buckets") or {}
+    insns = census.get("insns") or 0
+    return {
+        "goal": "Soft VMThread_run == PE VMThread_run @ 0x00420FF0 (switch @ 0x004210D4)",
+        "static": {
+            "source": "native/docs/tree_opcode_census.json",
+            "corpus": f"{census.get('files')} .class, {census.get('trees')} trees, {insns} insns",
+            "insns": insns,
+            "stream_ok_pct": round(100.0 * buckets.get("stream_ok", 0) / insns, 1) if insns else 0.0,
+            "default_advance_pct": round(100.0 * buckets.get("default_advance", 0) / insns, 1) if insns else 0.0,
+            "needs_case_pct": round(100.0 * buckets.get("needs_case", 0) / insns, 1) if insns else 0.0,
+            "walkable_trees": census.get("fully_hosted_trees", 0),
+            "total_trees": census.get("trees", 0),
+        },
+        "boot_path": {
+            "source": f"native/docs/evidence/{boot.get('source', '?')} (SLRR_PE_STREAM_CENSUS=1)",
+            "walkable": boot.get("walkable"),
+            "note": "The metric that counts. Static coverage is dominated by "
+                    "trivial methods boot never calls.",
+        },
+        "opcodes": rows,
+        "structural": MAINLOOP_STRUCTURAL,
+    }
+
+
 def build_snapshot(
     classified: list[dict],
     engine: list[dict],
@@ -922,55 +1189,8 @@ def build_snapshot(
         layer["pts"] = round(layer["weight"] * layer["pct"], 2)
     stock = round(sum(layer["pts"] for layer in layers), 1)
 
-    open_blockers = []
-    for e in engine:
-        if not e.get("done"):
-            open_blockers.append(
-                {
-                    "layer": "engine",
-                    "id": e["id"],
-                    "title": e.get("title"),
-                    "va": e.get("va"),
-                    "blocker": e.get("blocker"),
-                }
-            )
-    for s in gl.get("stages") or []:
-        if s.get("status") != "hosted":
-            open_blockers.append(
-                {
-                    "layer": "gameloop",
-                    "id": s["id"],
-                    "title": s.get("title"),
-                    "va": s.get("va"),
-                    "blocker": s.get("note") if s.get("status") == "oos" else None,
-                    "status": s.get("status"),
-                }
-            )
-    for item in phys.get("items") or []:
-        if item.get("status") == "blocked" or item.get("blocker"):
-            if item.get("status") != "done":
-                open_blockers.append(
-                    {
-                        "layer": "physics",
-                        "id": item["id"],
-                        "title": item.get("title"),
-                        "va": item.get("va"),
-                        "blocker": item.get("blocker"),
-                        "status": item.get("status"),
-                    }
-                )
-    for item in oos_s.get("items") or []:
-        if item.get("status") == "open":
-            open_blockers.append(
-                {
-                    "layer": "oos",
-                    "id": item["id"],
-                    "title": item.get("title"),
-                    "va": item.get("va"),
-                    "blocker": item.get("note"),
-                    "status": item.get("status"),
-                }
-            )
+    gaps = collect_gaps(engine, gl, phys, rend, oos_s, pe=pe, table=n)
+    open_blockers = [g for g in gaps if g.get("kind") == "hard"]
 
     return {
         "updated": date.today().isoformat(),
@@ -981,6 +1201,9 @@ def build_snapshot(
         ),
         "stock_index_pct": stock,
         "layers": layers,
+        "gaps": gaps,
+        "gaps_hard": sum(1 for g in gaps if g.get("kind") == "hard"),
+        "gaps_residual": sum(1 for g in gaps if g.get("kind") == "residual"),
         "open_blockers": open_blockers,
         "jni": {
             "table": n,
@@ -997,6 +1220,7 @@ def build_snapshot(
             "smoke": smoke.get("file"),
             "build": smoke.get("build"),
             "exit_ok": smoke.get("exit_ok"),
+            "render_ok": smoke.get("render_ok"),
         },
         "engine": {
             "done": eng_done,
@@ -1006,6 +1230,7 @@ def build_snapshot(
             "by_group": _engine_by_group(engine),
             "clusters": engine,
         },
+        "mainloop": mainloop_frontier(),
         "gameloop": gl,
         "physics": phys,
         "render": rend,
@@ -1029,7 +1254,226 @@ def build_snapshot(
     }
 
 
+def _gap_row(
+    *,
+    kind: str,
+    layer: str,
+    item_id: str,
+    title: str | None,
+    va: str | None,
+    status: str | None,
+    missing: str | None,
+    index_impact: str,
+) -> dict:
+    return {
+        "kind": kind,
+        "layer": layer,
+        "id": item_id,
+        "title": title,
+        "va": va,
+        "status": status,
+        "missing": missing,
+        "index_impact": index_impact,
+    }
+
+
+def _note_has_oos(note: str | None, blocker: str | None = None) -> bool:
+    blob = f"{note or ''} {blocker or ''}"
+    return "OOS" in blob or "oos" in blob
+
+
+def collect_gaps(
+    engine: list[dict],
+    gl: dict,
+    phys: dict,
+    rend: dict,
+    oos_s: dict,
+    *,
+    pe: int,
+    table: int,
+) -> list[dict]:
+    """Every real missing piece: hard catalog gaps + residual OOS on closed rows."""
+    gaps: list[dict] = []
+
+    for e in engine:
+        if not e.get("done"):
+            gaps.append(
+                _gap_row(
+                    kind="hard",
+                    layer="engine",
+                    item_id=e["id"],
+                    title=e.get("title"),
+                    va=e.get("va"),
+                    status="open",
+                    missing=e.get("blocker") or e.get("note"),
+                    index_impact="blocks engine 9→10 (journey −2.5 pts)",
+                )
+            )
+        elif _note_has_oos(e.get("note"), e.get("blocker")):
+            gaps.append(
+                _gap_row(
+                    kind="residual",
+                    layer="engine",
+                    item_id=e["id"],
+                    title=e.get("title"),
+                    va=e.get("va"),
+                    status="done+OOS",
+                    missing=e.get("note"),
+                    index_impact="catalog done; residual fidelity only",
+                )
+            )
+
+    for s in gl.get("stages") or []:
+        st = s.get("status")
+        if st != "hosted":
+            gaps.append(
+                _gap_row(
+                    kind="hard",
+                    layer="gameloop",
+                    item_id=s["id"],
+                    title=s.get("title"),
+                    va=s.get("va"),
+                    status=st,
+                    missing=s.get("note"),
+                    index_impact="blocks gameloop 100%",
+                )
+            )
+        elif _note_has_oos(s.get("note")):
+            gaps.append(
+                _gap_row(
+                    kind="residual",
+                    layer="gameloop",
+                    item_id=s["id"],
+                    title=s.get("title"),
+                    va=s.get("va"),
+                    status="hosted+OOS",
+                    missing=s.get("note"),
+                    index_impact="stage hosted; residual outside body",
+                )
+            )
+
+    for item in phys.get("items") or []:
+        st = str(item.get("status") or "partial")
+        if st in ("partial", "blocked"):
+            gaps.append(
+                _gap_row(
+                    kind="hard",
+                    layer="physics",
+                    item_id=item["id"],
+                    title=item.get("title"),
+                    va=item.get("va"),
+                    status=st,
+                    missing=item.get("blocker") or item.get("note"),
+                    index_impact="physics readiness (done=1 / partial=0.5)",
+                )
+            )
+        elif st == "done" and _note_has_oos(item.get("note"), item.get("blocker")):
+            gaps.append(
+                _gap_row(
+                    kind="residual",
+                    layer="physics",
+                    item_id=item["id"],
+                    title=item.get("title"),
+                    va=item.get("va"),
+                    status="done+OOS",
+                    missing=item.get("note"),
+                    index_impact="catalog done; residual fidelity only",
+                )
+            )
+
+    for item in rend.get("items") or []:
+        st = str(item.get("status") or "partial")
+        if st in ("partial", "blocked"):
+            gaps.append(
+                _gap_row(
+                    kind="hard",
+                    layer="render",
+                    item_id=item["id"],
+                    title=item.get("title"),
+                    va=item.get("va"),
+                    status=st,
+                    missing=item.get("blocker") or item.get("note"),
+                    index_impact="render readiness (done=1 / partial=0.5)",
+                )
+            )
+        elif st == "done" and _note_has_oos(item.get("note"), item.get("blocker")):
+            gaps.append(
+                _gap_row(
+                    kind="residual",
+                    layer="render",
+                    item_id=item["id"],
+                    title=item.get("title"),
+                    va=item.get("va"),
+                    status="done+OOS",
+                    missing=item.get("note"),
+                    index_impact="catalog done; residual fidelity only",
+                )
+            )
+
+    for item in oos_s.get("items") or []:
+        st = str(item.get("status") or "open")
+        if st in ("open", "partial"):
+            gaps.append(
+                _gap_row(
+                    kind="hard",
+                    layer="oos",
+                    item_id=item["id"],
+                    title=item.get("title"),
+                    va=item.get("va"),
+                    status=st,
+                    missing=item.get("note"),
+                    index_impact="OOS gate (not in journey %)",
+                )
+            )
+        elif st == "unlocked" and _note_has_oos(item.get("note")):
+            gaps.append(
+                _gap_row(
+                    kind="residual",
+                    layer="oos",
+                    item_id=item["id"],
+                    title=item.get("title"),
+                    va=item.get("va"),
+                    status="unlocked+OOS",
+                    missing=item.get("note"),
+                    index_impact="gate unlocked; residual note still open",
+                )
+            )
+
+    if pe < table:
+        gaps.append(
+            _gap_row(
+                kind="hard",
+                layer="jni",
+                item_id="jni_pe_missing",
+                title="JNI PE table residual",
+                va=None,
+                status="open",
+                missing=f"{table - pe} RegisterNative row(s) without PE@ comment",
+                index_impact="jni layer 10% of journey",
+            )
+        )
+
+    order = {"hard": 0, "residual": 1}
+    layer_order = {
+        "engine": 0,
+        "gameloop": 1,
+        "physics": 2,
+        "render": 3,
+        "oos": 4,
+        "jni": 5,
+    }
+    gaps.sort(
+        key=lambda g: (
+            order.get(str(g.get("kind")), 9),
+            layer_order.get(str(g.get("layer")), 9),
+            str(g.get("id")),
+        )
+    )
+    return gaps
+
+
 def append_history(prev: dict, snap: dict) -> list[dict]:
+
     hist = list(prev.get("history") or [])
     entry = {
         "date": snap["updated"],

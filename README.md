@@ -16,13 +16,17 @@ No game install dump, no IDA session docs, no Cursor rules in this repo.
 
 ### Engine splits (current)
 
+Large `.cpp` bodies are split into `*_partN.inc` fragments included by a
+thin shell (128 KB editor buffer cap). CMake still lists the `.cpp` only.
+
 | Area | Files |
 |------|--------|
-| JVM | `jvm.cpp` / `jvm_register` / `jvm_load` / `jvm_vmthread` |
-| TREE | `tree_fields.cpp` / `tree_eval.cpp` |
-| GameRef | `GameRef.cpp` + `GameRef_core` / `GameRef_collision` |
+| JVM | `jvm.cpp` + `jvm_part*.inc` / `jvm_vmthread` + parts / register / load |
+| TREE | `tree_fields.cpp` / `tree_eval.cpp` + `tree_eval_part*.inc` |
+| GameRef | `GameRef.cpp` + `GameRef_part*.inc` / core / collision |
 | Ground / phys | `GroundRef_route` / `GroundRef_traffic` / `PhysicsRef` |
-| System | `System.cpp` + `System_natives.cpp` |
+| System | `System.cpp` + `System_part*.inc` / `System_natives.cpp` |
+| Platform | `render_d3d9.cpp` + `render_d3d9_part*.inc` |
 
 ## Build (MSVC Win32)
 

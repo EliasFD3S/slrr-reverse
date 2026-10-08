@@ -71,41 +71,6 @@ void viewport_soft_seed_native(InvObject* self, int32_t pri, float x, float y,
   tree_field_set_float(self, "vp_h", h);
 }
 
-// Soft PE RenderRef_applyLight @ 0x48C9D0: BYTE * (1/256) → unit float.
-// PE immediates use 0.00390625 (=1/256). Defaults in setLight@486AB0:
-// diffuse/specular 0xFFFFFF, ambient 0x404040. Tag getPayload 0x80000001.
-// Host mid layout ≠ light params — TREE unit floats only (no mid poke).
-constexpr float kLightByteToUnit = 1.f / 256.f;
-
-float light_byte_to_unit(int32_t packed, int shift) {
-  return static_cast<float>((packed >> shift) & 0xFF) * kLightByteToUnit;
-}
-
-void render_ref_apply_light_soft(InvObject* self, int32_t diffuse,
-                                 int32_t ambient, int32_t specular) {
-  // Soft PE mirror of RenderRef_applyLight RGB lanes (dir a5=null path).
-  // Payload[+0x10/+14/+18]=diff BGR units; [+0x20/+24/+28]=spec;
-  // [+0x30/+34/+38]=amb. setLight lives in Resources.cpp — soft TREE here
-  // for voidEvent / boot readers; D3D bind stays render_d3d9_set_light.
-  if (!self) return;
-  if (!native_ptr_get(self)) native_ptr_ensure(self);
-  // PE: node=*(handle+0xC); 0 → no-op (no Mighty).
-  if (!native_ptr_node(self)) return;
-  tree_field_set_int(self, "light_diffuse", diffuse);
-  tree_field_set_int(self, "light_ambient", ambient);
-  tree_field_set_int(self, "light_specular", specular);
-  // PE BYTE2=R (+16), BYTE1=G (+8), BYTE0=B (+0).
-  tree_field_set_float(self, "light_diff_r", light_byte_to_unit(diffuse, 16));
-  tree_field_set_float(self, "light_diff_g", light_byte_to_unit(diffuse, 8));
-  tree_field_set_float(self, "light_diff_b", light_byte_to_unit(diffuse, 0));
-  tree_field_set_float(self, "light_amb_r", light_byte_to_unit(ambient, 16));
-  tree_field_set_float(self, "light_amb_g", light_byte_to_unit(ambient, 8));
-  tree_field_set_float(self, "light_amb_b", light_byte_to_unit(ambient, 0));
-  tree_field_set_float(self, "light_spec_r", light_byte_to_unit(specular, 16));
-  tree_field_set_float(self, "light_spec_g", light_byte_to_unit(specular, 8));
-  tree_field_set_float(self, "light_spec_b", light_byte_to_unit(specular, 0));
-}
-
 // Soft PE mesh_world_pose / setMatrix hierarchy (PATH-TO-WORLD):
 //   RenderRef.setMatrix 4-arg @ 0x004810B0 → SetBoneMatrixParentLink
 //   @ 0x0048BF50 (Ypr_toMatrix + Mat3x4_setBasis_posScaled10 *flt_5F37A0=10
@@ -132,40 +97,121 @@ void render_ref_mesh_world_pose_soft_publish(InvObject* self) {
 
 }  // namespace
 
+// Soft PE RenderRef_applyLight @ 0x48C9D0: BYTE * 0.00390625 (1/256) → unit.
+// setLight@486AB0 defaults diff/spec=0xFFFFFF amb=0x404040; dir a5=null.
+// PE getPayload tag 0x80000001 → Payload[+0x10]diff/[+0x20]spec/[+0x30]amb.
+// Soft: TREE unit floats (host mid ≠ light layout; tag 0x80000001 OOS).
+namespace {
+constexpr float kLightByteToUnit = 1.f / 256.f;
+float light_byte_to_unit(int32_t packed, int shift) {
+  return static_cast<float>((packed >> shift) & 0xFF) * kLightByteToUnit;
+}
+}  // namespace
+
+void render_ref_apply_light_soft(InvObject* self, int32_t diffuse,
+                                 int32_t ambient, int32_t specular) {
+  if (!self) return;
+  if (!native_ptr_get(self)) native_ptr_ensure(self);
+  // PE: node=*(handle+0xC); 0 → no-op (no Mighty).
+  if (!native_ptr_node(self)) return;
+  tree_field_set_int(self, "light_diffuse", diffuse);
+  tree_field_set_int(self, "light_ambient", ambient);
+  tree_field_set_int(self, "light_specular", specular);
+  // PE BYTE2=R, BYTE1=G, BYTE0=B.
+  tree_field_set_float(self, "light_diff_r", light_byte_to_unit(diffuse, 16));
+  tree_field_set_float(self, "light_diff_g", light_byte_to_unit(diffuse, 8));
+  tree_field_set_float(self, "light_diff_b", light_byte_to_unit(diffuse, 0));
+  tree_field_set_float(self, "light_amb_r", light_byte_to_unit(ambient, 16));
+  tree_field_set_float(self, "light_amb_g", light_byte_to_unit(ambient, 8));
+  tree_field_set_float(self, "light_amb_b", light_byte_to_unit(ambient, 0));
+  tree_field_set_float(self, "light_spec_r", light_byte_to_unit(specular, 16));
+  tree_field_set_float(self, "light_spec_g", light_byte_to_unit(specular, 8));
+  tree_field_set_float(self, "light_spec_b", light_byte_to_unit(specular, 0));
+  tree_field_set_int(self, "light_applied", 1);
+}
+
+// Soft PE RenderRef_applyFlare @ 0x48CB40: getPayload → Rebind(+0xC4 glow RH)
+// → store +0xD4 min / +0xD8 max / +0xE0 color / +0xE4 rays / +0x100 count.
+// Soft: TREE stamp; ResHandle_ctorFromObj + Rebind dllist splice OOS.
+void render_ref_apply_flare_soft(InvObject* self, InvObject* glowtexture,
+                                 int32_t glowColor, float glowMinSize,
+                                 float glowMaxSize, int32_t flareCount,
+                                 int32_t rayCount) {
+  if (!self) return;
+  if (!native_ptr_get(self)) native_ptr_ensure(self);
+  if (!native_ptr_node(self)) return;
+  const int32_t tex_id =
+      glowtexture ? java_util_resource_ResourceRef_id(glowtexture) : 0;
+  tree_field_set_int(self, "flare_tex_id", tex_id);
+  tree_field_set_int(self, "flare_color", glowColor);
+  tree_field_set_float(self, "flare_min", glowMinSize);
+  tree_field_set_float(self, "flare_max", glowMaxSize);
+  tree_field_set_int(self, "flare_count", flareCount);
+  tree_field_set_int(self, "flare_rays", rayCount);
+  if (glowtexture) tree_field_set_obj(self, "flare_tex", glowtexture);
+  tree_field_set_int(self, "flare_applied", 1);
+}
+
 void java_render_Camera_create(InvObject* self, InvObject* parent, InvObject* vp, int32_t pri, float aov, float dmin, float dmax, float lodBias, float lodAmp, int32_t oc, int32_t pt) {
-  // PE @ 0x004861E0 size 0x243 (579). UnboxArg
+  // PE @ 0x004861E0 size 0x243 (int_convert 579). UnboxArg
   // (Ljava.util.resource.ResourceRef;Ljava.render.Viewport;IFFFFFII)V:
   // this, parent, vp, pri, aov, dmin, dmax, lodBias, lodAmp, oc, pt.
   // Camera.java ctor passes aov*0.5 (half-angle deg) into this native.
-  // handle = JVM_vm_get_int_field(this, dword_62E008). No Mighty ERROR.
-  // Default bone pos Vector3(0,0,3.0 @ 0x40400000) + Mtx3x4_identity.
-  // vpNode = GfxEngine_findByHandle(g_GfxEngine, vp);
-  // aspect = vpNode[+0x78]/vpNode[+0x74] (= 1/(w/h) via fdiv+fdivr 1.0).
-  // cam = ResourceEngine_type_rendertype_camera(&dword_636450, aspect, aov,
-  //   dmin, dmax, lodBias, lodAmp, oc);
-  // params = (*(cam->vtbl+0xC))(cam, 1.0f @ 0x3F800000); *(params+0x2C)=pt.
+  // handle = JVM_vm_get_int_field(this, Native_ptr_field_id @ 0x62E008).
+  // No Mighty ERROR. Default bone Vector3(0,0,3.0=0x40400000) +
+  // Mat3x4_setIdentity @ 0x54E1D0. vpNode =
+  // GfxEngine_findViewportByHandle @ 0x4FD220 (g_GfxEngine, vp).
+  // FPU: fld[+0x74]/fld[+0x78] → fdiv w/h → fdivr 1.0 → a2=h/w.
+  // ResourceEngine_type_rendertype_camera @ 0x539500 (&dword_636450,
+  //   a2=h/w, aov, dmin, dmax, lodBias, lodAmp, oc):
+  //   params+0xC = 1/a2 = w/h; +0x10=aov; +0x14/+0x18 = dmin/dmax*10;
+  //   +0x30=oc; +0x34=lodBias; +0x38=lodAmp.
+  // Then vtbl+0xC(cam,1.0f@0x3F800000); *(params+0x2C)=pt.
   // Temp list-stub on cam[+0x48/+0x50]; renderinst =
-  // ResourceEngine_type_renderinst(parent, stub, "s_renderref_camera", 0);
-  // Relink handle[+0/+4/+8/+0xC] onto renderinst list (+0x48/+0x50).
-  // RenderRef_bindBone("bone00") + RenderRef_setBoneXform @ 0x0048C0F0
-  // (handle, bone, 0, pos, mtx). GfxEngine_hookCameraViewport @ 0x004FCF10
-  // (g_GfxEngine, vp, handle); GfxEngine_registerCameraPri @ 0x004FD150
-  // (..., pri, -1). Unlink stub. Register Natives_RegisterAll @ 0x488CB6.
-  // Host gaps (not mirrored here): ResourceEngine camera factory + aspect,
-  // params+0x2C pt write, s_renderref_camera renderinst/list link,
-  // GfxEngine vp hook/pri register, dword_62E008 Native.ptr (blocks
-  // setFog dual hop @ 0x486570 — race125 still no host Native.ptr store).
-  // IDA: ResourceEngine_type_rendertype_camera @ 0x539500,
-  // GfxEngine_hookCameraViewport @ 0x4FCF10, GfxEngine_registerCameraPri
-  // @ 0x4FD150; bone00 default pos (0,0,3.0=0x40400000); params+0x2C=pt.
-  // Stand-in: RenderRef_create(parent) + render_d3d9_camera_create store;
-  // bone00@(0,0,3) + TREE pt; empty-vp seed host-only.
+  // ResourceEngine_type_renderinst @ 0x539880 (parent, stub,
+  // "s_renderref_camera", 0); relink handle onto renderinst list.
+  // RenderRef_bindBone("bone00") @ 0x48BC40 + setBoneLocal @ 0x48C0F0.
+  // GfxEngine_hookCameraViewport @ 0x4FCF10 → ViewportHookCamera
+  // @ 0x516760; GfxEngine_registerCameraPri @ 0x4FD150 →
+  // ViewportInsertCameraPri @ 0x516900 (pri, -1). Unlink stub.
+  // Register @ Natives_RegisterAll 0x488CB6.
+  // Soft: RenderRef_create + Native.ptr + TREE frustum (aspect/aov/
+  // dmin*10/dmax*10/lod/oc/pt/pri) + bone00@(0,0,3) + D3D store +
+  // type-18 vp gate for hook/register stand-in (pri list OOS).
+  // OOS: ResourceEngine factory node, s_renderref_camera list link,
+  // GfxEngine dllist hook/pri insert bodies.
+  if (vp) {
+    if (render_d3d9_viewport_get_width(vp) <= 0.f &&
+        render_d3d9_viewport_get_height(vp) <= 0.f) {
+      // Soft empty-vp seed before aspect (PE findViewportByHandle needs
+      // an existing type-18 vp; create does not call Viewport.create).
+      viewport_soft_seed_native(vp, 0, 0.f, 0.f, 1.f, 1.f);
+      render_d3d9_viewport_create(vp, 0, 0.f, 0.f, 1.f, 1.f);
+    }
+  }
+  // PE params+0xC = w/h after factory 1/(h/w). Soft from vp getters.
+  float aspect = 1.f;
+  if (vp) {
+    const float vw = render_d3d9_viewport_get_width(vp);
+    const float vh = render_d3d9_viewport_get_height(vp);
+    if (vh > 1e-6f) aspect = vw / vh;
+  }
   if (self) {
     java_util_resource_RenderRef_create(self, parent, nullptr, nullptr);
     // PE: Native.ptr already on ResourceRef; create relinks handle+0xC.
     // Host: allocate ResHandle box + camera/fog node chain (setFog dual hop).
     native_ptr_ensure(self);
-    tree_field_set_int(self, "pt", pt);  // PE params+0x2C
+    // Soft ≡ factory params write @ 0x5395DD.. + create pt @ 0x4862C5.
+    tree_field_set_float(self, "cam_aspect", aspect);       // +0xC
+    tree_field_set_float(self, "half_aov", aov);            // +0x10
+    tree_field_set_float(self, "dmin", dmin);
+    tree_field_set_float(self, "dmax", dmax);
+    tree_field_set_float(self, "dmin_x10", dmin * 10.f);    // +0x14
+    tree_field_set_float(self, "dmax_x10", dmax * 10.f);    // +0x18
+    tree_field_set_float(self, "lod_bias", lodBias);        // +0x34
+    tree_field_set_float(self, "lod_amp", lodAmp);          // +0x38
+    tree_field_set_int(self, "oc", oc);                     // +0x30
+    tree_field_set_int(self, "pt", pt);                     // +0x2C
     // PE RenderRef_bindBone("bone00") + setBoneLocal @ 0x48C0F0 (0,0,3) +
     // Mtx3x4_id — same matrix write path as SetBoneMatrixParentLink
     // @ 0x48BF50 (setMatrix @ 0x4810B0 / 2-arg @ 0x481240). RenderRef_create
@@ -180,13 +226,16 @@ void java_render_Camera_create(InvObject* self, InvObject* parent, InvObject* vp
   }
   render_d3d9_camera_create(self, parent, vp, pri, aov, dmin, dmax, lodBias,
                             lodAmp, oc, pt);
-  if (vp) {
-    if (render_d3d9_viewport_get_width(vp) <= 0.f &&
-        render_d3d9_viewport_get_height(vp) <= 0.f) {
-      // Soft PE empty-vp seed: type-18 Native.ptr + fullscreen rect
-      // (Camera.create does not call Viewport.create; PE finds existing vp).
-      viewport_soft_seed_native(vp, 0, 0.f, 0.f, 1.f, 1.f);
-      render_d3d9_viewport_create(vp, 0, 0.f, 0.f, 1.f, 1.f);
+  // Soft ≡ hookCameraViewport @ 0x4FCF10 + registerCameraPri @ 0x4FD150
+  // (type-18 gate; create does NOT set cam_active — that is orphan
+  // activate @ 0x486470). Pri dllist InsertCameraPri @ 0x516900 OOS.
+  if (self && vp && native_ptr_get(self) && native_ptr_get(vp)) {
+    if (void* node = native_ptr_node(vp)) {
+      if (*reinterpret_cast<int32_t*>(reinterpret_cast<char*>(node) + 0x4C) ==
+          kViewportNodeType) {
+        tree_field_set_obj(self, "cam_vp", vp);
+        tree_field_set_int(self, "cam_pri", pri);
+      }
     }
   }
 }
@@ -213,9 +262,10 @@ void java_render_Camera_activate(InvObject* self, InvObject* vp, int32_t pri) {
   // JVM_vm_get_int_field(this, dword_62E008). handle==0 → silent return
   // (no Mighty ERROR). Else GfxEngine_registerCameraPri @ 0x4FD150
   // (ecx=g_GfxEngine/off_6187B0, vp_handle, cam_handle, pri, -1).
-  // registerCameraPri: *(vp+0xC) && *(node+0x4C)==0x12 → sub_516900
-  // insert cam into vp pri list. Contrast create @ 0x4861E0 which also
-  // calls GfxEngine_hookCameraViewport @ 0x4FCF10 before register.
+  // registerCameraPri: *(vp+0xC) && *(node+0x4C)==0x12 →
+  // GfxEngine_ViewportInsertCameraPri @ 0x516900. Contrast create @
+  // 0x4861E0 which also calls GfxEngine_hookCameraViewport @ 0x4FCF10
+  // → GfxEngine_ViewportHookCamera @ 0x516760 before register.
   // Orphan body — NOT in Natives_RegisterAll (stock table only
   // create@4861E0 / destroy@4864C0 / setFog@486570); Java Camera.java
   // still declares native activate. Soft: Native.ptr + type-18 vp gate +
@@ -240,7 +290,8 @@ void java_render_Camera_deactivate(InvObject* self, InvObject* vp) {
   // (Ljava.render.Viewport;)V: this, vp. handle = Native.ptr dword_62E008.
   // handle==0 → silent return (no Mighty ERROR). Else
   // GfxEngine_unregisterCameraPri @ 0x4FD1A0 (ecx=g_GfxEngine, vp, handle):
-  // *(vp+0xC) && *(node+0x4C)==0x12 → sub_516A10 remove cam from vp list.
+  // *(vp+0xC) && *(node+0x4C)==0x12 → GfxEngine_ViewportRemoveCameraPri
+  // @ 0x516A10 remove cam from vp list.
   // Inverse of activate@486470 / registerCameraPri@4FD150. Orphan body —
   // NOT in Natives_RegisterAll. Soft: Native.ptr + type-18 vp gate + TREE
   // + D3D (list unlink OOS).
@@ -455,6 +506,7 @@ void java_render_Text_create(InvObject* self, InvObject* parent, InvObject* char
   }
   render_d3d9_text_create(self, charset, x, z);
   if (self) {
+    tree_field_set_int(self, "_text_kind", 1);  // PE type "r_text"
     tree_field_set_float(self, "_text_px", x);
     tree_field_set_float(self, "_text_py", z);
     tree_field_set_float(self, "_text_pz", 0.f);
@@ -474,6 +526,49 @@ void java_render_Text_create(InvObject* self, InvObject* parent, InvObject* char
     render_ref_mesh_world_pose_soft_publish(self);
   }
 }  // PE @ 0x00487050
+
+bool text_create_rtext2_inst_soft(InvObject* self, InvObject* parent,
+                                  InvObject* charset, float x, float z,
+                                  int32_t color, int32_t align, float scale) {
+  // Soft PE Text_createRText2Inst @ 0x0048C670:
+  //   ResourceEngine_type_renderinst(..., "r_text2", 0)
+  //   charset handle+8==0 → null; Engine_malloc(buf) owned @ params+0xC0
+  //   flags |=1 |0x8000; color@+0xCC align@+0xC4 scale@+0xC8
+  //   bone00 setBoneLocal + PrepareLod walk.
+  // Soft: D3D text stand-in + TREE kind=2; factory/PrepareLod/mid OOS.
+  if (!self || !charset) return false;
+  if (charset && !render_d3d9_font_ready(charset)) {
+    const int32_t rid = java_util_resource_ResourceRef_id(charset);
+    if (!render_d3d9_font_load_from_rid(charset, rid))
+      render_d3d9_font_load(charset, "simple20");
+  }
+  if (!render_d3d9_font_ready(charset)) return false;
+  (void)scale;
+  render_d3d9_text_create(self, charset, x, z);
+  tree_field_set_int(self, "_text_kind", 2);  // PE type "r_text2"
+  tree_field_set_obj(self, "_text_type", string_new("r_text2"));
+  tree_field_set_float(self, "_text_px", x);
+  tree_field_set_float(self, "_text_py", z);
+  tree_field_set_float(self, "_text_pz", 0.f);
+  tree_field_set_int(self, "_text_posed", 1);
+  tree_field_set_int(self, "_text_owned_buf", 1);  // PE malloc path
+  tree_field_set_int(self, "_text_color", color);
+  tree_field_set_int(self, "_text_align", align);
+  render_d3d9_text_set_color(self, static_cast<uint32_t>(color));
+  render_d3d9_text_set_align(self, align);
+  if (parent) {
+    render_d3d9_mesh_set_parent(self, parent);
+    const int32_t bone00 = render_d3d9_mesh_get_bone_id(parent, "bone00");
+    render_d3d9_mesh_set_attach_bone(self, bone00);
+  }
+  const int32_t bone = render_d3d9_mesh_get_bone_id(self, "bone00");
+  render_d3d9_mesh_set_bone_local(self, bone, x, z, 0.f, 0.f, 0.f, 0.f);
+  tree_field_set_int(self, "applied_bone_id", bone);
+  tree_field_set_int(self, "bone_link_flags",
+                     tree_field_get_int(self, "bone_link_flags") | 0x1800);
+  render_ref_mesh_world_pose_soft_publish(self);
+  return true;
+}
 
 void java_render_Text_setDefaultColor(int32_t color) {
   // PE @ 0x00487020 size 0x1f (int_convert 31). STATIC (I)V.
@@ -635,9 +730,10 @@ void java_render_Viewport_activate(InvObject* self, int32_t renderflags) {
   // handle==0 → silent return (no Mighty ERROR). Else
   // GfxEngine_ViewportBind(handle, -1, -1) @ 0x4FD020 (stdcall retn 0Ch);
   // ecx=off_6187B0 dead. Bind: *(handle+0xC) && *(node+0x4C)==0x12 →
-  // sub_4FD280 list. Unboxed renderflags NEVER consumed in this 0x3e.
-  // Java CLEARDEPTH=0x1 / CLEARTARGET=0x2 (host kViewportClear*). Soft:
-  // TREE flags + D3D pending_clear on flush (PE bind ignores flags).
+  // GfxEngine_ViewportBindList @ 0x4FD280. Unboxed renderflags NEVER
+  // consumed in this 0x3e. Java CLEARDEPTH=0x1 / CLEARTARGET=0x2 (host
+  // kViewportClear*). Soft: TREE flags + D3D pending_clear on flush (PE
+  // bind ignores flags). Catalog render viewport_activate DONE soft.
   if (!self) return;
   if (!native_ptr_get(self)) return;  // soft ≡ handle 0
   if (void* node = native_ptr_node(self)) {

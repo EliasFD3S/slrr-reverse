@@ -186,6 +186,13 @@ static float dyno_sample_table(int rpm_step, const std::vector<float>& table,
 //   (+0x34:=293.15 before nitro_cooling — drop 1st-pass intercool); soft VE
 //   = min*(1−duty)+max*duty (stepCombustion open→max / closed→min @ +0x44..
 //   +0x50); table_stepsize/torque Java writes temp-only (PE @ 0x46adf3).
+// W36-13 Soft gate (dyno_calc_host): turbo deadzone + T_loss closed behind
+//   already-unboxed calcDyno(F)F. Ticket VA 0x470000 is NOT this fn
+//   (Part_bindLodRenderSlots mid-body); real entry PE @ 0x0046AA20 size 0x6c3.
+//   T_loss: PE string absent (find_regex 0); resetDefaults +0x54=0x42be0000 (95);
+//   stepCombustion @ 0x4B764F fdiv dt(+0x84)/T_loss — Soft NEVER reads Java
+//   "T_loss". Turbo: calcDyno @ 0x46ac82 mov [esi+0E4h],0; prepCycle @ 0x4B6E91
+//   gate mul(+0xDC)>0 && range(+0xE8)>0. Native.ptr / 0x1EC P-V walks OOS.
 float java_game_parts_DynoData_calcDyno(InvObject* self, float tablesize) {
   if (!self) return 0.f;  // PE derefs Unbox this; host guard
 
@@ -285,17 +292,18 @@ float java_game_parts_DynoData_calcDyno(InvObject* self, float tablesize) {
   constexpr float kStockComp = 10.5f;
   if (compression > 1.f) peak_nm *= (compression / kStockComp);
   // PE DynoSim_prepCycle @ 0x4B6E91 turbo (per-RPM, applied in loop below):
-  //   gate: rpm_turbo_mul(+0xDC)>0 && rpm_turbo_range(+0xE8)>0
+  //   gate: rpm_turbo_mul(+0xDC)>0 && rpm_turbo_range(+0xE8)>0 (no P_max test)
   //   dist = |RPM*mul - opt(+0xE0)|; dead = +0xE4 (calcDyno @ 0x46ac82 := 0)
   //   if dist >= dead: fade = 1 - (dist-dead)/(range-dead); else fade = 1
-  //   clamp fade≥0; P = fade*P_max; if P≥waste → waste
-  //   dens*(P+1) @ +0x158; valve/ambient *sqrt(P+1) @ +0x15C/+0x160.
+  //   clamp fade≥0; P = fade*P_max(+0xEC); if P≥waste(+0xF0) → waste
+  //   dens(+0x158)*=(P+1); ambient(+0x15C)*=sqrt(P+1); cond(+0x160)*=sqrt.
+  //   Soft Nm: *(P+1)*sqrt (dens+one slot); P=0 → identity (PE same).
   const float rpm_turbo_mul = tree_field_get_float(self, "rpm_turbo_mul");
   const float rpm_turbo_opt = tree_field_get_float(self, "rpm_turbo_opt");
   const float rpm_turbo_range = tree_field_get_float(self, "rpm_turbo_range");
-  constexpr float kTurboDead = 0.f;  // PE +0xE4 hardcoded
-  const bool turbo_gate =
-      (rpm_turbo_mul > 0.f && rpm_turbo_range > 0.f && p_turbo > 0.f);
+  constexpr float kTurboDead = 0.f;  // PE +0xE4 hardcoded @ 0x46ac82
+  // PE gate @ 0x4B6E91: mul>0 && range>0 only (P_max may be 0 → no-op scale).
+  const bool turbo_gate = (rpm_turbo_mul > 0.f && rpm_turbo_range > 0.f);
   // PE dumps max_air_consumption→+0xFC, max_fuel_consumption→+0xF8
   // (Java 0 = unlimited). prepCycle @ 0x4B6F42 / 0x4B6F7E after turbo:
   //   if max>0 && meter>max → dens *= max/meter (fuel→+0x154, air→+0x158).
@@ -315,11 +323,12 @@ float java_game_parts_DynoData_calcDyno(InvObject* self, float tablesize) {
   const float time_burn = tree_field_get_float(self, "time_burn");
   const float time_burn_eff = time_burn > 0.f ? time_burn : 0.003f;
   peak_nm *= (time_burn_eff / 0.003f);
-  // PE T_loss @ +0x54 = resetDefaults 0x42be0000 (95). calcDyno NEVER dumps
-  // Java "T_loss" (string absent from PE) — always 95 on stock. Soft residual
-  // on Nm (PE applies to temp @ 0x4B764F). fillTables dt @ 0x4B794C:
-  //   (1/(rpm*0.0083333338)) * 0.0043290043.
-  constexpr float kTLoss = 95.f;
+  // PE T_loss @ +0x54 = resetDefaults dword 0x42be0000 (95.f). calcDyno NEVER
+  // dumps Java "T_loss" (PE string table: 0 hits) — Soft must ignore tree field
+  // even when CylinderHead writes dd.T_loss. PE heat @ 0x4B764F:
+  //   frac=min(1, dt(+0x84)/T_loss); ΔT heat on temp — Soft Nm residual only.
+  // fillTables dt @ 0x4B794C: period*(0.0043290043), period=1/(rpm*0.0083333338).
+  constexpr float kTLoss = 95.f;  // PE resetDefaults +0x54 — not Java T_loss
   // PE valve dump: in_min/max +0x44/+0x4C, out_min/max +0x48/+0x50
   // (resetDefaults 0.005/0.8). stepCombustion open window → max, else min.
   // Soft VE ≈ min*(1−duty)+max*duty (duty from time_* → +0xA8/+0xBC).
@@ -387,7 +396,7 @@ float java_game_parts_DynoData_calcDyno(InvObject* self, float tablesize) {
       float shape = std::sin(kPi * std::pow(x <= 0.f ? 0.f : x, 1.8f));
       if (shape < 0.f) shape = 0.f;
       float nm = peak * shape;
-      // Per-RPM turbo envelope (DynoSim_prepCycle @ 0x4B6E91) — PE deadzone.
+      // Per-RPM turbo envelope (DynoSim_prepCycle @ 0x4B6E91) — PE deadzone=0.
       float p_boost = 0.f;
       if (turbo_gate) {
         const float dist = std::fabs(rpm * rpm_turbo_mul - rpm_turbo_opt);
@@ -399,12 +408,12 @@ float java_game_parts_DynoData_calcDyno(InvObject* self, float tablesize) {
         } else {
           fade = 1.f;
         }
-        float p = fade * p_turbo;
-        if (p >= p_waste) p = p_waste;
+        float p = fade * p_turbo;  // PE +0xEC; 0 → identity dens/ambient
+        if (p >= p_waste) p = p_waste;  // PE +0xF0 waste clamp
         p_boost = p;
         const float sp1 = std::sqrt(1.f + p);
-        nm *= (sp1 * sp1);  // PE dens *= (sqrt(P+1))^2 = (P+1)
-        nm *= sp1;          // PE valve/ambient slots *= sqrt(P+1)
+        nm *= (sp1 * sp1);  // PE dens(+0x158) *= (P+1)
+        nm *= sp1;          // Soft one-slot for ambient(+0x15C)/cond(+0x160)
       }
       // Soft max_*_consumption (prepCycle @ 0x4B6F42 fuel / 0x4B6F7E air).
       if ((max_air_c > 0.f || max_fuel_c > 0.f) && displ_m3 > 0.f &&
@@ -437,11 +446,12 @@ float java_game_parts_DynoData_calcDyno(InvObject* self, float tablesize) {
         }
         if (spark_base > 0.f) nm *= (spark / spark_base);
       }
-      // T_loss residual @ 0x4B764F — soft per-bin.
+      // T_loss Soft residual: PE @ 0x4B764F heat on temp (dt/T_loss);
+      // Soft applies frac to Nm (no P-V temp state). kTLoss=95 PE-only.
       if (rpm > 0.f) {
-        const float period = 1.f / (rpm * kDtPeriod);
-        const float dt_step = period * kDtScale;
-        float loss_frac = dt_step / kTLoss;
+        const float period = 1.f / (rpm * kDtPeriod);  // PE +0x124 @ 0x4B791F
+        const float dt_step = period * kDtScale;         // PE +0x84 @ 0x4B794C
+        float loss_frac = dt_step / kTLoss;              // PE fdiv +0x54
         if (loss_frac > 1.f) loss_frac = 1.f;
         nm *= (1.f - loss_frac);
       }

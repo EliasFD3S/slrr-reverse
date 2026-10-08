@@ -81,6 +81,10 @@ std::string arg_type_from_decl(const std::string& decl) {
 
 }  // namespace
 
+// Soft ≡ NativeSigDesc_ctor @ 0x0041DC30 / getJni @ 0x0041DEF0 inventory path:
+// RegisterNative stores full "(..)X" (PE uses '.' inside L…; — not '/').
+// ctorFromOperands @ 0x0041DCB0 builds "("+operand Value types+")" only
+// (Thread_callMethod @ 0x004207C0); getJni returns that intern when +4 set.
 std::string java_sig_to_jni(const char* java_sig) {
   if (!java_sig || !*java_sig) return {};
   if (java_sig[0] == '(') return java_sig;
@@ -114,6 +118,10 @@ std::string java_sig_to_jni(const char* java_sig) {
   return out;
 }
 
+// Soft ≡ NativeSigDesc_buildCache @ 0x0041DFD0 type walk (I/F/L/[ /V) +
+// CallInfo.parseParameters inside JVM_UnboxArg @ 0x0045D910 (errors at
+// 0x61099C / 0x6109E8 / 0x610A1C). Soft also maps Z/B/C/S/J→Int, D→Float
+// for inventory Java forms.
 bool jni_parse(const char* signature, JvmTag* ret, std::vector<JvmTag>* args,
                std::string* err) {
   if (!signature || !ret || !args) {
@@ -153,8 +161,9 @@ bool call_native(const NativeEntry* entry, CallFrame* frame, std::string* err) {
 
   JvmTag ret = JvmTag::Void;
   std::vector<JvmTag> atypes;
-  // JVM_UnboxArg @ 0x0045D910: descriptor comes from the native method, not
-  // the boxed TREE tags (getAxis TREE packs (FF)F, registry is (II)F).
+  // Soft CallInfo → nativeImpl: JVM_UnboxArg @ 0x0045D910 reads registered
+  // NativeSigDesc_getJni @ 0x0041DEF0 (not TREE boxed tags). Same gate as
+  // NativeSigDesc_ctorFromOperands @ 0x0041DCB0 for Thread_callMethod lookup.
   std::string jni_owned;
   const char* jni = frame->jni_signature;
   if (entry->java_signature && entry->java_signature[0]) {
@@ -266,6 +275,11 @@ bool call_native(const NativeEntry* entry, CallFrame* frame, std::string* err) {
       using Fn = float (*)(int32_t);
       return finish_f(reinterpret_cast<Fn>(fn)(arg_i(0)));
     }
+    // Input.getDeviceName(I)Ljava/lang/String; @ 0x0047C9C0
+    if (atypes[0] == JvmTag::Int && ret == JvmTag::Obj) {
+      using Fn = InvObject* (*)(int32_t);
+      return finish_o(reinterpret_cast<Fn>(fn)(arg_i(0)));
+    }
   }
 
   if (st && atypes.size() == 2) {
@@ -274,16 +288,66 @@ bool call_native(const NativeEntry* entry, CallFrame* frame, std::string* err) {
       using Fn = float (*)(int32_t, int32_t);
       return finish_f(reinterpret_cast<Fn>(fn)(arg_i(0), arg_i(1)));
     }
+    // Input.axisName(II)Ljava/lang/String;
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Int &&
+        ret == JvmTag::Obj) {
+      using Fn = InvObject* (*)(int32_t, int32_t);
+      return finish_o(reinterpret_cast<Fn>(fn)(arg_i(0), arg_i(1)));
+    }
     if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Obj &&
         ret == JvmTag::Int) {
       using Fn = int32_t (*)(InvObject*, InvObject*);
       return finish_i(reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1)));
+    }
+    // Input.checkHotkeys(GameRef,Osd)V @ 0x0047CD40
+    if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Obj &&
+        ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, InvObject*);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1));
+      return finish_v();
+    }
+    if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Obj &&
+        ret == JvmTag::Float) {
+      using Fn = float (*)(InvObject*, InvObject*);
+      return finish_f(reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1)));
     }
     if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Int &&
         ret == JvmTag::Int) {
       using Fn = int32_t (*)(InvObject*, int32_t);
       return finish_i(reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1)));
     }
+    // Float.toString(F,String)String
+    if (atypes[0] == JvmTag::Float && atypes[1] == JvmTag::Obj &&
+        ret == JvmTag::Obj) {
+      using Fn = InvObject* (*)(float, InvObject*);
+      return finish_o(reinterpret_cast<Fn>(fn)(arg_f(0), arg_o(1)));
+    }
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Float &&
+        ret == JvmTag::Void) {
+      using Fn = void (*)(int32_t, float);
+      reinterpret_cast<Fn>(fn)(arg_i(0), arg_f(1));
+      return finish_v();
+    }
+  }
+
+  if (st && atypes.size() == 3) {
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Int &&
+        atypes[2] == JvmTag::Int && ret == JvmTag::Void) {
+      using Fn = void (*)(int32_t, int32_t, int32_t);
+      reinterpret_cast<Fn>(fn)(arg_i(0), arg_i(1), arg_i(2));
+      return finish_v();
+    }
+  }
+
+  // System.arraycopy(Object,I,Object,II)V
+  if (st && atypes.size() == 5 && atypes[0] == JvmTag::Obj &&
+      atypes[1] == JvmTag::Int && atypes[2] == JvmTag::Obj &&
+      atypes[3] == JvmTag::Int && atypes[4] == JvmTag::Int &&
+      ret == JvmTag::Void) {
+    using Fn = void (*)(InvObject*, int32_t, InvObject*, int32_t, int32_t);
+    reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_o(2), arg_i(3),
+                             arg_i(4));
+    return finish_v();
   }
 
   // Instance: argv[0]=this
@@ -312,10 +376,30 @@ bool call_native(const NativeEntry* entry, CallFrame* frame, std::string* err) {
       using Fn = int32_t (*)(InvObject*, int32_t);
       return finish_i(reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1)));
     }
+    // Chassis.getWheelPos(I)Vector3 @ 0x0043CE30 / getWheel @ 0x00440C80
+    if (atypes[0] == JvmTag::Int && ret == JvmTag::Obj) {
+      using Fn = InvObject* (*)(InvObject*, int32_t);
+      return finish_o(reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1)));
+    }
+    // Controller.user_GetAxisVal(I)F
+    if (atypes[0] == JvmTag::Int && ret == JvmTag::Float) {
+      using Fn = float (*)(InvObject*, int32_t);
+      return finish_f(reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1)));
+    }
     if (atypes[0] == JvmTag::Float && ret == JvmTag::Void) {
       using Fn = void (*)(InvObject*, float);
       reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1));
       return finish_v();
+    }
+    // DynoData.calcDyno(F)F @ 0x0046AA20 / Part.setWear(F)F @ 0x00469420
+    if (atypes[0] == JvmTag::Float && ret == JvmTag::Float) {
+      using Fn = float (*)(InvObject*, float);
+      return finish_f(reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1)));
+    }
+    // File.write(F)I
+    if (atypes[0] == JvmTag::Float && ret == JvmTag::Int) {
+      using Fn = int32_t (*)(InvObject*, float);
+      return finish_i(reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1)));
     }
     if (atypes[0] == JvmTag::Obj && ret == JvmTag::Void) {
       using Fn = void (*)(InvObject*, InvObject*);
@@ -329,6 +413,10 @@ bool call_native(const NativeEntry* entry, CallFrame* frame, std::string* err) {
     if (atypes[0] == JvmTag::Obj && ret == JvmTag::Obj) {
       using Fn = InvObject* (*)(InvObject*, InvObject*);
       return finish_o(reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1)));
+    }
+    if (atypes[0] == JvmTag::Obj && ret == JvmTag::Float) {
+      using Fn = float (*)(InvObject*, InvObject*);
+      return finish_f(reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1)));
     }
     if (atypes[0] == JvmTag::Int && ret == JvmTag::Void) {
       using Fn = void (*)(InvObject*, int32_t);
@@ -344,21 +432,90 @@ bool call_native(const NativeEntry* entry, CallFrame* frame, std::string* err) {
       reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_o(2));
       return finish_v();
     }
+    if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Obj &&
+        ret == JvmTag::Int) {
+      using Fn = int32_t (*)(InvObject*, InvObject*, InvObject*);
+      return finish_i(reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_o(2)));
+    }
+    if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Obj &&
+        ret == JvmTag::Float) {
+      using Fn = float (*)(InvObject*, InvObject*, InvObject*);
+      return finish_f(reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_o(2)));
+    }
     if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Int &&
         ret == JvmTag::Obj) {
       using Fn = InvObject* (*)(InvObject*, InvObject*, int32_t);
       return finish_o(reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_i(2)));
     }
+    // Navigator.updateNavigator(GameRef,I)V
+    if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Int &&
+        ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, InvObject*, int32_t);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_i(2));
+      return finish_v();
+    }
+    // Chassis.setNitroSFX(ResourceRef,F)V @ 0x0043DD70
+    if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Float &&
+        ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, InvObject*, float);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_f(2));
+      return finish_v();
+    }
+    // GameType.addTimer(F,I)V — keep separate from (II)V
     if (atypes[0] == JvmTag::Float && atypes[1] == JvmTag::Int &&
         ret == JvmTag::Void) {
       using Fn = void (*)(InvObject*, float, int32_t);
       reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1), arg_i(2));
       return finish_v();
     }
+    // Part.disableSlot(II)V @ 0x00469770 / setTrafficCarBehaviour @ 0x00487EC0
     if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Int &&
         ret == JvmTag::Void) {
-      using Fn = void (*)(InvObject*, float, int32_t);
-      reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1), arg_i(2));
+      using Fn = void (*)(InvObject*, int32_t, int32_t);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_i(2));
+      return finish_v();
+    }
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Int &&
+        ret == JvmTag::Int) {
+      using Fn = int32_t (*)(InvObject*, int32_t, int32_t);
+      return finish_i(reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_i(2)));
+    }
+    // Chassis.getTorque(FF)F @ 0x0043C7F0 / DynoData.getTorque @ 0x0046B0F0
+    if (atypes[0] == JvmTag::Float && atypes[1] == JvmTag::Float &&
+        ret == JvmTag::Float) {
+      using Fn = float (*)(InvObject*, float, float);
+      return finish_f(reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1), arg_f(2)));
+    }
+    // Chassis.setSteerWheel(FF)V @ 0x00440A50
+    if (atypes[0] == JvmTag::Float && atypes[1] == JvmTag::Float &&
+        ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, float, float);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1), arg_f(2));
+      return finish_v();
+    }
+    if (atypes[0] == JvmTag::Float && atypes[1] == JvmTag::Float &&
+        ret == JvmTag::Int) {
+      using Fn = int32_t (*)(InvObject*, float, float);
+      return finish_i(reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1), arg_f(2)));
+    }
+    // Chassis.setWheelDamage(I,String)V @ 0x0043D280
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Obj &&
+        ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, int32_t, InvObject*);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_o(2));
+      return finish_v();
+    }
+    // String.token(I,String)String
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Obj &&
+        ret == JvmTag::Obj) {
+      using Fn = InvObject* (*)(InvObject*, int32_t, InvObject*);
+      return finish_o(reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_o(2)));
+    }
+    // WheelRef.setPacejka(IF)V @ 0x00441210
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Float &&
+        ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, int32_t, float);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_f(2));
       return finish_v();
     }
   }
@@ -378,6 +535,67 @@ bool call_native(const NativeEntry* entry, CallFrame* frame, std::string* err) {
       reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_o(2), arg_o(3));
       return finish_v();
     }
+    // Chassis.setHornSFX(ResourceRef,F,I)V @ 0x0043DC00
+    if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Float &&
+        atypes[2] == JvmTag::Int && ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, InvObject*, float, int32_t);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_f(2), arg_i(3));
+      return finish_v();
+    }
+    // Chassis.setCooling(FFF)V @ 0x0043DEB0 / GroundRef.setWater / scaleMesh
+    if (atypes[0] == JvmTag::Float && atypes[1] == JvmTag::Float &&
+        atypes[2] == JvmTag::Float && ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, float, float, float);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_f(1), arg_f(2), arg_f(3));
+      return finish_v();
+    }
+    // Part.setSlotPos(I,Vector3,Ypr)V
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Obj &&
+        atypes[2] == JvmTag::Obj && ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, int32_t, InvObject*, InvObject*);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_o(2), arg_o(3));
+      return finish_v();
+    }
+    // Controller.user_SetAxisForce(IFF)V
+    if (atypes[0] == JvmTag::Int && atypes[1] == JvmTag::Float &&
+        atypes[2] == JvmTag::Float && ret == JvmTag::Void) {
+      using Fn = void (*)(InvObject*, int32_t, float, float);
+      reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_f(2), arg_f(3));
+      return finish_v();
+    }
+  }
+
+  // GameType.createNativeInstance(GameRef,I,String,String)V
+  if (!st && atypes.size() == 4 && atypes[0] == JvmTag::Obj &&
+      atypes[1] == JvmTag::Int && atypes[2] == JvmTag::Obj &&
+      atypes[3] == JvmTag::Obj && ret == JvmTag::Void) {
+    using Fn = void (*)(InvObject*, InvObject*, int32_t, InvObject*, InvObject*);
+    reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_i(2), arg_o(3), arg_o(4));
+    return finish_v();
+  }
+
+  // SfxTable.addItem(ResourceRef,FFFFF)V
+  if (!st && atypes.size() == 6 && atypes[0] == JvmTag::Obj &&
+      atypes[1] == JvmTag::Float && atypes[2] == JvmTag::Float &&
+      atypes[3] == JvmTag::Float && atypes[4] == JvmTag::Float &&
+      atypes[5] == JvmTag::Float && ret == JvmTag::Void) {
+    using Fn =
+        void (*)(InvObject*, InvObject*, float, float, float, float, float);
+    reinterpret_cast<Fn>(fn)(arg_o(0), arg_o(1), arg_f(2), arg_f(3), arg_f(4),
+                             arg_f(5), arg_f(6));
+    return finish_v();
+  }
+
+  // Chassis.setBuck(IIFFFF)V Soft inventory (PE registry (IIFFFF)I @ 0x0043E110)
+  if (!st && atypes.size() == 6 && atypes[0] == JvmTag::Int &&
+      atypes[1] == JvmTag::Int && atypes[2] == JvmTag::Float &&
+      atypes[3] == JvmTag::Float && atypes[4] == JvmTag::Float &&
+      atypes[5] == JvmTag::Float && ret == JvmTag::Void) {
+    using Fn =
+        void (*)(InvObject*, int32_t, int32_t, float, float, float, float);
+    reinterpret_cast<Fn>(fn)(arg_o(0), arg_i(1), arg_i(2), arg_f(3), arg_f(4),
+                             arg_f(5), arg_f(6));
+    return finish_v();
   }
   if (!st && atypes.size() == 4) {
     if (atypes[0] == JvmTag::Obj && atypes[1] == JvmTag::Int &&

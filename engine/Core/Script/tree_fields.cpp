@@ -19,11 +19,17 @@ namespace inv {
 std::unordered_map<InvObject*, TreeFieldMap> g_tree_fields;
 std::unordered_map<InvObject*, std::vector<InvObject*>> g_tree_vectors;
 std::unordered_map<InvObject*, std::string> g_tree_host_class;
+std::unordered_map<std::string, TreeStaticBag> g_tree_statics;
 
 JvmValue* tree_field_slot(InvObject* obj, const std::string& name, bool create) {
-  // PE Object_getField @ 0x408800 / Class_getFieldByName @ 0x404820: lookup only.
-  // Miss returns 0 — never allocate a slot. Soft get must use create=false so
+  // PE field lookup chain (VMThread_run op29 @ 0x4214BC / typed JNI helpers):
+  //   Object_getField @ 0x408800 → Class_getFieldByName @ 0x404820
+  //     → FieldTable_lookupByName @ 0x403840 (strcmp entry+0xC; miss→0)
+  //   fallback instance table: FieldTable_lookupByName(obj+0x10, name)
+  // Miss returns 0 — never allocate. Soft get must use create=false so
   // g_tree_fields[obj] operator[] does not invent an empty TreeFieldMap either.
+  // Soft put (create=true) invents a bag slot — PE put requires a pre-existing
+  // Value* (JVM_vm_set_int_field @ 0x42A9E0 / set_float @ 0x42A040).
   if (!obj || name.empty()) return nullptr;
   if (!create) {
     auto fit = g_tree_fields.find(obj);
@@ -37,6 +43,101 @@ JvmValue* tree_field_slot(InvObject* obj, const std::string& name, bool create) 
   if (it == m.end())
     it = m.emplace(name, JvmValue::make_int(0)).first;
   return &it->second;
+}
+
+namespace {
+
+// PE Class_ensureInitialized @ 0x004040CE builds every static ValueField with
+// payload 0 (@ 0x4040E7 v23[2] = 0) and the type descriptor interned from
+// Utf8(decl+0xC) (@ 0x4040E2). Thread_evalName_fieldPath @ 0x00420E06 reads
+// that descriptor's first byte and treats 'L' / '[' as the reference forms, so
+// the tag follows the same first byte here.
+JvmValue tree_static_zero(const JvmFieldDecl& fd) {
+  const char t = fd.type.empty() ? 'I' : fd.type[0];
+  if (t == 'F' || t == 'D') return JvmValue::make_float(0.f);
+  if (t == 'L' || t == '[') return JvmValue::make_obj(nullptr);
+  return JvmValue::make_int(0);
+}
+
+// Soft stand-in for the "<static field init>" CallFrame @ 0x004042D3: the PE
+// runs decl+0x10 (JvmFieldDecl::tree_index) on a THRD-CLASSVAR-INI VMThread
+// and Value_assignOp('#') the popped operand into the ValueField. Running a
+// tree from here is OOS, so only the static finals already recovered from the
+// stock sources are seeded; everything else keeps the payload-0 default.
+JvmValue tree_static_seed(const JvmFieldDecl& fd) {
+  const int32_t vs = tree_static_vs(fd.name);
+  if (vs >= 0) return JvmValue::make_int(vs);
+  const int32_t cc = tree_static_rid_carcolor(fd.name);
+  if (cc >= 0) return JvmValue::make_int(cc);
+  if (fd.name.rfind("qm_", 0) == 0)
+    return JvmValue::make_float(tree_static_qm(fd.name));
+  return tree_static_zero(fd);
+}
+
+}  // namespace
+
+// PE Class_ensureInitialized @ 0x00403E80. Guards on class+0x1D0: non-null →
+// return immediately, so the body runs once per Class. It mallocs a 20-byte
+// Instance (Instance_ctor @ 0x004036B0, PtrVec at instance+0xC) into
+// class+0x1D0, then walks the STATIC decl vector at classdesc+0x54 in order
+// and appends one ValueField per entry via Instance_addField @ 0x004038C0.
+// Soft: one bag per class FQN, seeded with the payload-0 / known-final value.
+// Supers keep their own bag — the PE recurses ensureInitialized on
+// class+0x1C8 but never copies inherited statics into the child Instance;
+// Class_findFieldSlot @ 0x00405690 walks the chain and names the owner.
+void tree_static_ensure_initialized(const JvmClass* owner) {
+  if (!owner || owner->name.empty()) return;
+  if (g_tree_statics.find(owner->name) != g_tree_statics.end())
+    return;  // PE class+0x1D0 != 0 @ 0x403E91
+  TreeStaticBag& bag = g_tree_statics[owner->name];
+  for (const JvmFieldDecl& fd : owner->static_fields) {
+    // PE Instance_addField returns 0 on a name already in the PtrVec and does
+    // NOT append (Class_ensureInitialized only logs "member redefinition"
+    // @ 0x404152), so the duplicate consumes no slot.
+    if (!fd.name.empty() && bag.by_name.count(fd.name) != 0) continue;
+    if (!fd.name.empty()) bag.by_name.emplace(fd.name, bag.slots.size());
+    bag.slots.push_back(tree_static_seed(fd));
+  }
+}
+
+// PE Class_getFieldAt @ 0x00404800 keyed by name instead of slot — the pair
+// Class_findFieldSlot @ 0x00405690 hands its callers (op 0x101B @ 0x0042352E,
+// Thread_evalName_fieldPath @ 0x00420F40) is (owner class, slot|0x40000000),
+// and the host resolves that slot back through the field name.
+// Mirrors tree_field_slot: get never invents a slot, put may. Unlike the
+// instance bag, a get on a *declared* static does materialise the bag —
+// that is Class_ensureInitialized, not an invention.
+JvmValue* tree_static_slot(const JvmClass* owner, const std::string& name,
+                           bool create) {
+  if (!owner || name.empty()) return nullptr;
+  tree_static_ensure_initialized(owner);  // PE @ 0x404803
+  auto bit = g_tree_statics.find(owner->name);
+  if (bit == g_tree_statics.end()) return nullptr;
+  TreeStaticBag& bag = bit->second;
+  auto it = bag.by_name.find(name);
+  if (it != bag.by_name.end()) return &bag.slots[it->second];
+  if (!create) return nullptr;  // PE Instance_getFieldAt out-of-range → 0
+  // Undeclared static on a put: the PE has no ValueField to assign into, so
+  // this slot is a Soft invention kept symmetric with tree_field_slot.
+  bag.by_name.emplace(name, bag.slots.size());
+  bag.slots.push_back(JvmValue::make_int(0));
+  return &bag.slots.back();
+}
+
+// PE Class_getFieldAt @ 0x00404800 → Instance_getFieldAt @ 0x00403820:
+// slot < 0 → 0 @ 0x403826, slot past the PtrVec count → 0 @ 0x403838, else
+// PtrVec[slot]. Callers strip the static bit with 0xBFFFFFFF (@ 0x00420F2D)
+// before calling, so a raw slot|0x40000000 is tolerated here too; the -1 miss
+// from Class_findFieldSlot stays negative and yields nullptr.
+JvmValue* tree_static_slot_at(const JvmClass* owner, int32_t slot) {
+  if (!owner || slot < 0) return nullptr;
+  tree_static_ensure_initialized(owner);
+  auto bit = g_tree_statics.find(owner->name);
+  if (bit == g_tree_statics.end()) return nullptr;
+  const uint32_t idx = static_cast<uint32_t>(slot) & 0xBFFFFFFFu;
+  TreeStaticBag& bag = bit->second;
+  if (idx >= bag.slots.size()) return nullptr;
+  return &bag.slots[idx];
 }
 
 std::string tree_strip_class_desc(const std::string& d) {
@@ -175,22 +276,37 @@ int32_t tree_resolve_rid_const(const JvmClass& cls, uint32_t imm) {
 }
 
 void tree_field_set_int(InvObject* obj, const char* name, int32_t v) {
+  // Soft ≡ PE JVM_vm_set_int_field @ 0x42A9E0 write of Value+8 when type 'I',
+  // but Soft invents the bag slot (PE requires Instance_getFieldAt hit).
   if (JvmValue* s = tree_field_slot(obj, name, true)) *s = JvmValue::make_int(v);
 }
 
 int32_t tree_field_get_int(InvObject* obj, const char* name) {
+  // Soft ≡ PE JVM_vm_get_int_field_by_name @ 0x42A430:
+  //   Object_getField → type desc 'I' → payload+8; miss/wrong type → 0
+  //   (soft skips Engine_ErrorLogMsgBox). Soft bag: Int hit; Float→i truncate
+  //   for TREE numeric sugar; Obj/other → 0 (never read pointer bits as int).
+  if (!obj || !name || !name[0]) return 0;
+  // Soft array/Vector.length (TREE sugar; PE array length is a real field).
+  if (std::strcmp(name, "length") == 0 && tree_vector_is(obj))
+    return tree_vector_size(obj);
   if (JvmValue* s = tree_field_slot(obj, name, false)) {
+    if (s->tag == JvmTag::Int) return s->v.i;
     if (s->tag == JvmTag::Float) return static_cast<int32_t>(s->v.f);
-    return s->v.i;
+    return 0;
   }
   return 0;
 }
 
 void tree_field_set_obj(InvObject* obj, const char* name, InvObject* v) {
+  // Soft ≡ PE JVM_vm_get_instance_field / Object_getField payload write path
+  // for L/[ types — Soft invents bag slot on put.
   if (JvmValue* s = tree_field_slot(obj, name, true)) *s = JvmValue::make_obj(v);
 }
 
 InvObject* tree_field_get_obj(InvObject* obj, const char* name) {
+  // Soft ≡ PE JVM_vm_get_instance_field @ 0x42A690 payload+8 on L/[ hit;
+  // miss / non-ref Soft tag → nullptr (PE ErrorLog → 0).
   if (JvmValue* s = tree_field_slot(obj, name, false)) {
     if (s->tag == JvmTag::Obj) return s->v.o;
   }
@@ -198,13 +314,19 @@ InvObject* tree_field_get_obj(InvObject* obj, const char* name) {
 }
 
 void tree_field_set_float(InvObject* obj, const char* name, float v) {
+  // Soft ≡ PE JVM_vm_set_float_field @ 0x42A040 (type 'F' → Value+8);
+  // Soft invents bag slot on put.
   if (JvmValue* s = tree_field_slot(obj, name, true)) *s = JvmValue::make_float(v);
 }
 
 float tree_field_get_float(InvObject* obj, const char* name) {
+  // Soft ≡ PE JVM_vm_get_float_field @ 0x42A560:
+  //   Object_getField → type 'F' → float(Value+8); miss/wrong type → 0.0
+  // Soft bag: Float hit; Int→f for TREE numeric sugar; Obj/other → 0.f.
   if (JvmValue* s = tree_field_slot(obj, name, false)) {
+    if (s->tag == JvmTag::Float) return s->v.f;
     if (s->tag == JvmTag::Int) return static_cast<float>(s->v.i);
-    return s->v.f;
+    return 0.f;
   }
   return 0.f;
 }

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "../Parts/world_state.hpp"
+#include "GameRef_internal.hpp"
 
 namespace inv {
 
@@ -1020,11 +1021,10 @@ void java_io_MouseCursor_tickSysCursor() {
 // (chassis PhysicsRef first). TREE / horn / crime keys stay prefer-self
 // when Vehicle Native.ptr (sethorn / zone clear stickiness).
 static InvObject* vehicle_soft_phys_key(InvObject* self) {
-  if (!self) return nullptr;
-  InvObject* ch = tree_field_get_obj(self, "chassis");
-  if (ch && physics_shape(ch) != 0) return ch;
-  if (physics_shape(self) != 0) return self;
-  return nullptr;
+  // Soft PE deepen arcade_drive: same chassis-first live PhysicsRef key as
+  // GameRef getVel/getPos Soft (GII_VEL=3 stand-in). Avoid drift vs
+  // gameref_live_phys_key when createCar splits Vehicle handle / chassis.
+  return gameref_live_phys_key(self);
 }
 
 static InvObject* vehicle_soft_tree_key(InvObject* self) {
@@ -1044,6 +1044,15 @@ float java_game_Vehicle_getSpeedSquare(InvObject* self) {
   // Else Engine_queryGameRefChannel(handle, GII_VEL=3, &xyz[3]) @
   // 0x00426470 (ecx=g_EngineState) — same channel as GameRef.getVel @
   // 0x0047DCE0. Return vx²+vy²+vz² (asm order y²+z²+x² ≡ same).
+  //
+  // arcade_drive Soft gate (Cars / ticket VA 0x00480A00):
+  //   PE ticket VA lands mid PhysicsRef.setMatrix @ 0x00480920 —
+  //   Veh_ensureSceneBound @ 0x00480A04 then ping-pong pos write,
+  //   Ypr_toMatrix @ 0x0054ECD0, Mat3_toQuat @ 0x0054FF20,
+  //   PhysBody_updateAabbFromPose @ 0x004986F0 (AABB only — no vel wipe).
+  //   Soft Controller axes → physics_drive (Resources) via
+  //   valocity_simulate; setMatrix Soft preserves vx/wx on pose sync.
+  //   Cars Soft = this |v|² feedback (City/Valocity/TestTrack poll).
   // Soft PE deepen PATH-TO-WORLD (createCar/enterCar world spawn): PE
   // one handle (Vehicle Native.ptr after set/create = chassis). Soft
   // live PhysicsRef prefers chassis first (≡ gameref_live_phys_key) so
@@ -1055,8 +1064,13 @@ float java_game_Vehicle_getSpeedSquare(InvObject* self) {
   // public GII_VEL=3 stand-in. Do not rename Engine_queryGameRefChannel
   // (164 xrefs).
   if (!self) return 0.f;
-  if (InvObject* phys = vehicle_soft_phys_key(self))
-    return physics_speed_square(phys);
+  if (InvObject* phys = vehicle_soft_phys_key(self)) {
+    // Soft arcade_drive: mirror Soft |v|² onto TREE speed_sq so host
+    // HUD / Valocity fields stay coherent with native poll after drive.
+    const float sq = physics_speed_square(phys);
+    tree_field_set_float(self, "speed_sq", sq);
+    return sq;
+  }
   InvObject* key = vehicle_soft_tree_key(self);
   // Soft: when Vehicle has Native.ptr, query self so GameRef_getVel Softs
   // chassis phys via gameref_live_phys_key; Soft chassis key only when
@@ -1066,7 +1080,9 @@ float java_game_Vehicle_getSpeedSquare(InvObject* self) {
   if (!vel) return 0.f;
   float vx = 0.f, vy = 0.f, vz = 0.f;
   vec3_get(vel, &vx, &vy, &vz);
-  return vx * vx + vy * vy + vz * vz;
+  const float sq = vx * vx + vy * vy + vz * vz;
+  tree_field_set_float(self, "speed_sq", sq);
+  return sq;
 }
 
 int32_t java_game_Vehicle_getHorn(InvObject* self) {
