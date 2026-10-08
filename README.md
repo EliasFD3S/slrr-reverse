@@ -1,6 +1,4 @@
-# slrr-reverse
-
-Reverse host for *Street Legal Racing: Redline* (Invictus `StreetLegal_Redline.exe`).
+# Reverse host for *Street Legal Racing: Redline* (Invictus `StreetLegal_Redline.exe`).
 
 C++ rewrite that boots stock / typical-mod Java via a TREE + VA-backed native
 table. 
